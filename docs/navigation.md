@@ -80,10 +80,22 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | Command | Action |
 |---------|--------|
 | `:q` | Quit |
-| `:w` | Write migration from pending edits |
-| `:w <desc>` | Write migration with description |
+| `:w` | Write migration with safety checks (dialog on destructive changes) |
+| `:w!` | Write migration without confirmation |
+| `:w <desc>` | Write migration with description (safety checks) |
+| `:w! <desc>` | Write migration with description (no confirmation) |
 | `:ai` | LLM edit prompt (optional) |
 | `:generate-down` | Generate down migration via LLM (optional) |
+
+### `:w` Safety Dialog
+
+When `:w` detects potentially destructive changes (e.g., adding NOT NULL to a column with existing NULL rows), it presents a dialog with options:
+
+- **Cancel** — Return to editing (e.g., to add a default value first)
+- **Accept** — Write the migration as-is (equivalent to `:w!`)
+- **Use AI** — Generate a data migration via LLM (only available if AI is configured)
+
+Migration generation is disabled when there are pending (unapplied) migrations. Apply pending migrations first (`sqlx migrate run`) before generating new ones.
 
 ## Implementation Notes
 

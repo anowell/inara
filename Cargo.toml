@@ -1,0 +1,10 @@
+[package]
+name = "inara"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal-native schema explorer and migration generator for sqlx + Postgres"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]

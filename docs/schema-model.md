@@ -47,7 +47,7 @@ Columns use `Vec` (not BTreeMap) because column order matters — it reflects th
 enum PgType {
     Boolean,
     SmallInt, Integer, BigInt,
-    Real, DoublePrecision, Numeric,
+    Real, DoublePrecision, Numeric(Option<(u32, u32)>),
     Text, Varchar(Option<u32>), Char(Option<u32>),
     Bytea,
     Uuid,
@@ -93,6 +93,8 @@ enum Constraint {
 }
 ```
 
+All constraint variants include `name: Option<String>` because Postgres assigns names to constraints (e.g., `users_pkey`), and we need them for `DropConstraint` and migration generation. The name is `Option` because constraints can also be anonymous (inline column constraints without explicit naming).
+
 This keeps all constraints in a single list on the table, matching how Postgres reports them.
 
 ### Precomputed Relation Maps
@@ -122,17 +124,40 @@ enum Change {
     DropTable(String),
     AddColumn { table: String, column: Column },
     DropColumn { table: String, column: String },
-    AlterColumnType { table: String, column: String, from: PgType, to: PgType },
-    SetNotNull { table: String, column: String },
-    DropNotNull { table: String, column: String },
-    SetDefault { table: String, column: String, default: Expression },
-    DropDefault { table: String, column: String },
+    AlterColumn { table: String, column: String, changes: ColumnChanges },
     AddConstraint { table: String, constraint: Constraint },
     DropConstraint { table: String, name: String },
-    AddIndex(Index),
+    AddIndex { table: String, index: Index },
     DropIndex(String),
-    RenameColumn { table: String, from: String, to: String },
+}
+```
+
+### Bundled Column Changes
+
+Column-level modifications are bundled into a single `AlterColumn` variant via `ColumnChanges`. This groups related edits (rename + type change + nullability) into one change, enabling generation of a single `ALTER TABLE` statement per column.
+
+```rust
+struct ColumnChanges {
+    rename: Option<String>,              // new name
+    data_type: Option<(PgType, PgType)>, // (from, to)
+    nullable: Option<bool>,              // true = nullable, false = not null
+    default: Option<DefaultChange>,
+}
+
+enum DefaultChange {
+    Set(Expression),
+    Drop,
 }
 ```
 
 Rename is only produced when explicit rename metadata is provided. The diff engine never guesses renames from add+drop pairs.
+
+## Migration Generation
+
+Migration generation is disabled when there are pending (unapplied) migrations. Inara introspects the live database schema and generates migrations from the structural diff between the current schema and the user's edits. If pending migrations exist, the live schema does not reflect the intended state, so generating additional migrations could produce conflicts.
+
+### Write Commands
+
+- `:w` — Generate migration with safety checks. If the diff contains potentially destructive changes (e.g., adding NOT NULL to a column with NULL rows), a dialog presents options: cancel (to go back and add a default), accept (write as-is), or use AI to generate a data migration (if configured).
+- `:w!` — Generate migration without confirmation. Skips the safety dialog and writes immediately.
+- `:w <desc>` / `:w! <desc>` — Same as above, with a description for the migration filename.
