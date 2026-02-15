@@ -1,5 +1,6 @@
 pub mod diff;
 pub mod introspect;
+pub mod parse;
 pub mod relations;
 pub mod render;
 pub mod types;
