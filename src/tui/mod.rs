@@ -1,6 +1,7 @@
 pub mod app;
 pub mod edit;
 pub mod fuzzy;
+pub mod goto;
 pub mod hud;
 pub mod input;
 pub mod view;
@@ -134,6 +135,13 @@ fn run_event_loop(
                     state = state.with_hud_status(status);
                 }
             }
+        }
+
+        // Check pending key timeout (1 second)
+        if state.is_pending_key_expired(Duration::from_secs(1)) {
+            state = state
+                .with_pending_key(app::PendingKey::None)
+                .with_status("goto cancelled (timeout)");
         }
 
         terminal.draw(|frame| draw(frame, &state))?;
@@ -316,7 +324,15 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
 
     // Show pending key indicator
     if state.pending_key != app::PendingKey::None {
-        spans.push(Span::styled(" g", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(" g...", Style::default().fg(Color::Yellow)));
+    }
+
+    // Show transient status message
+    if let Some(ref msg) = state.status_message {
+        spans.push(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     // Show command buffer in command mode

@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::schema::Schema;
+use crate::tui::goto::GotoTarget;
 
 /// What category of symbols to search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub enum SearchFilter {
     Columns,
     /// Migrations (placeholder).
     Migrations,
+    /// Goto navigation picker (pre-populated candidates).
+    GotoPick,
 }
 
 impl SearchFilter {
@@ -29,6 +32,7 @@ impl SearchFilter {
             SearchFilter::Tables => "Find Table",
             SearchFilter::Columns => "Find Column",
             SearchFilter::Migrations => "Find Migration",
+            SearchFilter::GotoPick => "Goto",
         }
     }
 }
@@ -115,7 +119,7 @@ pub fn fuzzy_match(symbols: &[Symbol], query: &str, filter: SearchFilter) -> Vec
             SearchFilter::All => true,
             SearchFilter::Tables => s.kind == SymbolKind::Table,
             SearchFilter::Columns => s.kind == SymbolKind::Column,
-            SearchFilter::Migrations => false, // placeholder
+            SearchFilter::Migrations | SearchFilter::GotoPick => false, // placeholder / handled separately
         })
         .collect();
 
@@ -169,6 +173,8 @@ pub struct SearchState {
     pub results: Vec<SearchResult>,
     /// Index of the selected result (0-based).
     pub selected: usize,
+    /// Goto targets (only set when filter is GotoPick).
+    pub goto_targets: Vec<GotoTarget>,
 }
 
 impl SearchState {
@@ -182,12 +188,18 @@ impl SearchState {
             symbols,
             results,
             selected: 0,
+            goto_targets: Vec::new(),
         }
     }
 
     /// Update the query and recompute results.
     pub fn set_query(mut self, query: String) -> Self {
-        self.results = fuzzy_match(&self.symbols, &query, self.filter);
+        if self.filter == SearchFilter::GotoPick {
+            // For goto picker, filter the pre-built symbols using fuzzy match on All
+            self.results = fuzzy_match(&self.symbols, &query, SearchFilter::All);
+        } else {
+            self.results = fuzzy_match(&self.symbols, &query, self.filter);
+        }
         self.query = query;
         self.selected = 0;
         self
@@ -224,6 +236,49 @@ impl SearchState {
     /// Get the currently selected result.
     pub fn selected_result(&self) -> Option<&SearchResult> {
         self.results.get(self.selected)
+    }
+
+    /// Create a search state pre-populated with goto navigation targets.
+    ///
+    /// The picker shows the targets as selectable items. Fuzzy filtering
+    /// works on the target labels.
+    pub fn from_goto_targets(targets: Vec<GotoTarget>) -> Self {
+        let symbols: Vec<Symbol> = targets
+            .iter()
+            .map(|t| Symbol {
+                display: t.label.clone(),
+                kind: SymbolKind::Table, // kind is irrelevant for goto picker
+            })
+            .collect();
+
+        let results: Vec<SearchResult> = symbols
+            .iter()
+            .map(|s| SearchResult {
+                symbol: s.clone(),
+                score: 0,
+            })
+            .collect();
+
+        Self {
+            query: String::new(),
+            filter: SearchFilter::GotoPick,
+            symbols,
+            results,
+            selected: 0,
+            goto_targets: targets,
+        }
+    }
+
+    /// Get the selected goto target (only valid when filter is GotoPick).
+    pub fn selected_goto_target(&self) -> Option<&GotoTarget> {
+        if self.filter != SearchFilter::GotoPick {
+            return None;
+        }
+        // The selected result's label matches a goto target label
+        let selected = self.selected_result()?;
+        self.goto_targets
+            .iter()
+            .find(|t| t.label == selected.symbol.display)
     }
 }
 

@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use super::app::{AppState, FocusTarget, Mode, PendingKey};
 use super::edit;
 use super::fuzzy::SearchFilter;
+use super::goto::{self, GotoResult};
 use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
 
 /// Process a key event and return the new application state.
@@ -15,6 +16,9 @@ pub fn handle_key(
     key: KeyEvent,
     pool: &PgPool,
 ) -> (AppState, Option<HudResultHandle>) {
+    // Clear transient status message on any key press
+    let state = state.clear_status();
+
     // Ctrl-c always quits regardless of mode
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return (state.quit(), None);
@@ -84,8 +88,20 @@ fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
     let state = state.with_pending_key(PendingKey::None);
     match key.code {
         KeyCode::Char('g') => state.cursor_to(0), // gg -> first line
-        // Future: gr, go, gi, gm, gc, gt for goto navigation
-        _ => state, // Unknown g-sequence, just cancel
+        KeyCode::Char(ch) => {
+            let focus = match state.focus().cloned() {
+                Some(f) => f,
+                None => return state.with_status("goto not available here"),
+            };
+            let result = goto::dispatch(ch, &focus, &state.schema, &state.relation_map);
+            match result {
+                GotoResult::Jump(target) => state.clear_status().jump_to_goto(&target),
+                GotoResult::Pick(targets) => state.clear_status().enter_goto_picker(targets),
+                GotoResult::NoResults(msg) => state.with_status(msg),
+                GotoResult::NotAvailable(msg) => state.with_status(msg),
+            }
+        }
+        _ => state.with_status("unknown goto"), // non-char keys cancel
     }
 }
 
@@ -143,7 +159,16 @@ fn handle_search(state: AppState, key: KeyEvent) -> AppState {
     match key.code {
         KeyCode::Esc => state.with_mode(Mode::Normal),
         KeyCode::Enter => {
-            // Select the current result and jump to it
+            // Check if this is a goto picker
+            let goto_target = state
+                .search
+                .as_ref()
+                .and_then(|s| s.selected_goto_target().cloned());
+            if let Some(target) = goto_target {
+                let state = state.with_mode(Mode::Normal);
+                return state.jump_to_goto(&target);
+            }
+            // Standard search: select the current result and jump to it
             let symbol = state
                 .search
                 .as_ref()
@@ -367,6 +392,9 @@ mod tests {
 
     /// Inner handler for tests — dispatches without pool dependency.
     fn handle_key_inner(state: AppState, key: KeyEvent) -> AppState {
+        // Clear transient status message on any key press
+        let state = state.clear_status();
+
         // Ctrl-c always quits regardless of mode
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return state.quit();
@@ -553,12 +581,10 @@ mod tests {
     // --- Placeholder modes (Esc returns to Normal) ---
 
     #[test]
-    fn esc_exits_placeholder_modes() {
-        for mode in [Mode::HUD] {
-            let state = sample_state().with_mode(mode);
-            let state = handle_key_no_pool(state, key(KeyCode::Esc));
-            assert_eq!(state.mode, Mode::Normal, "Esc should exit {mode:?}");
-        }
+    fn esc_exits_hud_mode() {
+        let state = sample_state().with_mode(Mode::HUD);
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal, "Esc should exit HUD mode");
     }
 
     // --- Enter toggles expand/collapse ---
@@ -816,5 +842,307 @@ mod tests {
 
         let state = state.with_mode(Mode::Normal);
         assert!(state.hud.is_none());
+    }
+
+    // --- Goto navigation (g-prefix) ---
+
+    /// Create a state with FKs for goto testing.
+    fn goto_state() -> AppState {
+        use crate::schema::types::{ForeignKeyRef, PgType, ReferentialAction};
+        use crate::schema::{Column, Constraint, EnumType, Index};
+
+        let mut schema = Schema::new();
+
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        users.add_column(Column::new("role", PgType::Custom("user_role".into())));
+        users.add_constraint(Constraint::PrimaryKey {
+            name: Some("users_pkey".into()),
+            columns: vec!["id".into()],
+        });
+        users.add_index(Index {
+            name: "users_email_idx".into(),
+            columns: vec!["email".into()],
+            unique: true,
+            partial: None,
+        });
+        schema.add_table(users);
+
+        let mut posts = Table::new("posts");
+        posts.add_column(Column::new("id", PgType::Uuid));
+        posts.add_column(Column::new("author_id", PgType::Uuid));
+        posts.add_column(Column::new("title", PgType::Text));
+        posts.add_constraint(Constraint::PrimaryKey {
+            name: Some("posts_pkey".into()),
+            columns: vec!["id".into()],
+        });
+        posts.add_constraint(Constraint::ForeignKey {
+            name: Some("posts_author_fk".into()),
+            columns: vec!["author_id".into()],
+            references: ForeignKeyRef {
+                table: "users".into(),
+                columns: vec!["id".into()],
+            },
+            on_delete: Some(ReferentialAction::Cascade),
+            on_update: None,
+        });
+        posts.add_index(Index {
+            name: "posts_author_idx".into(),
+            columns: vec!["author_id".into()],
+            unique: false,
+            partial: None,
+        });
+        schema.add_table(posts);
+
+        schema.add_enum(EnumType {
+            name: "user_role".into(),
+            variants: vec!["admin".into(), "member".into()],
+        });
+
+        AppState::new(schema, "test".into()).with_viewport_height(30)
+    }
+
+    #[test]
+    fn g_enters_pending_state() {
+        let state = goto_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.pending_key, PendingKey::G);
+    }
+
+    #[test]
+    fn g_unknown_shows_status_message() {
+        let state = goto_state();
+        // Navigate to a table first (cursor 0 is on enum header)
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('x')));
+        assert_eq!(state.pending_key, PendingKey::None);
+        assert!(state.status_message.is_some());
+        assert!(state.status_message.as_ref().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn gr_on_table_with_incoming_fks_jumps() {
+        let state = goto_state();
+        // Navigate to "users" table (which has incoming FK from posts)
+        // users is the last table alphabetically with enum above it
+        // Doc: enum user_role header + admin + member + close + blank + posts + blank + users
+        let users_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("users".into()))
+            .unwrap();
+        let state = state.cursor_to(users_pos);
+
+        // g r should jump to incoming references
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('r')));
+        // users has only one incoming FK (from posts), so it should Jump directly
+        assert_eq!(state.pending_key, PendingKey::None);
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
+    }
+
+    #[test]
+    fn go_on_table_with_outgoing_fks_jumps() {
+        let state = goto_state();
+        // Navigate to "posts" table
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos);
+
+        // g o should jump to outgoing references
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('o')));
+        // posts has one outgoing FK (to users), so should Jump directly
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+    }
+
+    #[test]
+    fn go_on_table_no_outgoing_shows_no_results() {
+        let state = goto_state();
+        // Navigate to "users" table (no outgoing FKs)
+        let users_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("users".into()))
+            .unwrap();
+        let state = state.cursor_to(users_pos);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('o')));
+        assert!(state.status_message.is_some());
+        assert!(state.status_message.as_ref().unwrap().contains("no"));
+    }
+
+    #[test]
+    fn gc_on_table_jumps_to_first_column() {
+        let state = goto_state();
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos);
+
+        // g c should jump to first column (expanding the table)
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('c')));
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Column("posts".into(), "id".into()))
+        );
+        // Table should have been expanded
+        assert!(state.expanded.contains("posts"));
+    }
+
+    #[test]
+    fn gt_on_column_jumps_to_parent_table() {
+        let state = goto_state();
+        // Expand posts and navigate to a column
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos).toggle_expand();
+        // Find the author_id column
+        let col_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("posts".into(), "author_id".into()))
+            .unwrap();
+        let state = state.cursor_to(col_pos);
+
+        // g t should jump to parent table
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
+    }
+
+    #[test]
+    fn gd_on_fk_column_jumps_to_target() {
+        let state = goto_state();
+        // Expand posts and navigate to author_id column
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos).toggle_expand();
+        let col_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("posts".into(), "author_id".into()))
+            .unwrap();
+        let state = state.cursor_to(col_pos);
+
+        // g d should jump to FK target (users.id)
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Column("users".into(), "id".into()))
+        );
+        // users should have been expanded
+        assert!(state.expanded.contains("users"));
+    }
+
+    #[test]
+    fn gy_on_custom_type_column_jumps_to_enum() {
+        let state = goto_state();
+        // Expand users and navigate to role column (which is Custom("user_role"))
+        let users_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("users".into()))
+            .unwrap();
+        let state = state.cursor_to(users_pos).toggle_expand();
+        let col_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("users".into(), "role".into()))
+            .unwrap();
+        let state = state.cursor_to(col_pos);
+
+        // g y should jump to enum definition
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('y')));
+        assert_eq!(state.focus(), Some(&FocusTarget::Enum("user_role".into())));
+    }
+
+    #[test]
+    fn gy_on_non_custom_type_shows_no_results() {
+        let state = goto_state();
+        // Expand users and navigate to email column (text, not custom)
+        let users_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("users".into()))
+            .unwrap();
+        let state = state.cursor_to(users_pos).toggle_expand();
+        let col_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("users".into(), "email".into()))
+            .unwrap();
+        let state = state.cursor_to(col_pos);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('y')));
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn gm_shows_not_available() {
+        let state = goto_state();
+        // Navigate to a table first
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('m')));
+        assert!(state.status_message.is_some());
+        assert!(state.status_message.as_ref().unwrap().contains("not yet"));
+    }
+
+    #[test]
+    fn gi_on_table_with_indexes_jumps() {
+        let state = goto_state();
+        let users_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("users".into()))
+            .unwrap();
+        let state = state.cursor_to(users_pos);
+
+        // g i should jump to indexed column
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('i')));
+        // users has one index on email, should jump to email column
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Column("users".into(), "email".into()))
+        );
+    }
+
+    #[test]
+    fn status_message_clears_on_next_key() {
+        let state = goto_state().with_status("test message");
+        assert!(state.status_message.is_some());
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert!(state.status_message.is_none());
     }
 }

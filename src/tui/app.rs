@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use strum::Display;
 
 use super::fuzzy::SearchState;
+use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
+use crate::schema::relations::RelationMap;
 use crate::schema::Schema;
 
 /// The TUI application mode. Determines which input handler processes keys.
@@ -148,6 +151,12 @@ pub struct AppState {
     pub edited_tables: BTreeSet<String>,
     /// HUD overlay state (present when mode is HUD).
     pub hud: Option<HudState>,
+    /// Precomputed relation map for O(1) FK/index lookups.
+    pub relation_map: RelationMap,
+    /// Transient status message shown in the status bar (e.g., "no references found").
+    pub status_message: Option<String>,
+    /// When the pending key was set (for timeout).
+    pub pending_key_time: Option<Instant>,
 }
 
 impl AppState {
@@ -155,6 +164,7 @@ impl AppState {
     pub fn new(schema: Schema, connection_info: String) -> Self {
         let expanded = BTreeSet::new();
         let doc = build_document(&schema, &expanded);
+        let relation_map = RelationMap::build(&schema);
         Self {
             schema,
             original_schema: None,
@@ -179,6 +189,9 @@ impl AppState {
             renames: Vec::new(),
             edited_tables: BTreeSet::new(),
             hud: None,
+            relation_map,
+            status_message: None,
+            pending_key_time: None,
         }
     }
 
@@ -235,7 +248,94 @@ impl AppState {
 
     /// Set the pending key state.
     pub fn with_pending_key(mut self, key: PendingKey) -> Self {
+        self.pending_key_time = if key != PendingKey::None {
+            Some(Instant::now())
+        } else {
+            None
+        };
         self.pending_key = key;
+        self
+    }
+
+    /// Set a transient status message.
+    pub fn with_status(mut self, msg: impl Into<String>) -> Self {
+        self.status_message = Some(msg.into());
+        self
+    }
+
+    /// Clear the status message.
+    pub fn clear_status(mut self) -> Self {
+        self.status_message = None;
+        self
+    }
+
+    /// Check if the pending key has timed out.
+    pub fn is_pending_key_expired(&self, timeout: std::time::Duration) -> bool {
+        self.pending_key_time
+            .map(|t| t.elapsed() >= timeout)
+            .unwrap_or(false)
+    }
+
+    /// Jump focus to a goto target.
+    ///
+    /// Expands the parent table if needed, rebuilds the document,
+    /// and moves the cursor to the target element.
+    pub fn jump_to_goto(mut self, target: &GotoTarget) -> Self {
+        match &target.focus {
+            GotoFocus::Table(name) => {
+                if !self.expanded.contains(name) {
+                    self.expanded.insert(name.clone());
+                    self.rebuild_doc();
+                }
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Table(name.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+            GotoFocus::Column(table, col) => {
+                if !self.expanded.contains(table) {
+                    self.expanded.insert(table.clone());
+                    self.rebuild_doc();
+                }
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Column(table.clone(), col.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+            GotoFocus::Enum(name) => {
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Enum(name.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+            GotoFocus::Type(name) => {
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Type(name.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+        }
+        self.scroll_to_cursor()
+    }
+
+    /// Enter search mode pre-populated with goto picker results.
+    pub fn enter_goto_picker(mut self, targets: Vec<GotoTarget>) -> Self {
+        self.search = Some(super::fuzzy::SearchState::from_goto_targets(targets));
+        self.mode = Mode::Search;
+        self.pending_key = PendingKey::None;
+        self.pending_key_time = None;
         self
     }
 
@@ -404,6 +504,7 @@ impl AppState {
     pub fn rebuild_doc(&mut self) {
         let old_target = self.focus().cloned();
         self.doc = build_document(&self.schema, &self.expanded);
+        self.relation_map = RelationMap::build(&self.schema);
 
         // Try to find the same target in the new doc
         if let Some(ref target) = old_target {
