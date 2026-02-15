@@ -6,6 +6,7 @@ use strum::Display;
 use super::fuzzy::SearchState;
 use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
+use crate::migration::loader::MigrationIndex;
 use crate::schema::relations::RelationMap;
 use crate::schema::type_map::TypeMapper;
 use crate::schema::Schema;
@@ -169,12 +170,14 @@ pub struct AppState {
     pub hud: Option<HudState>,
     /// Precomputed relation map for O(1) FK/index lookups.
     pub relation_map: RelationMap,
+    /// Migration file index for migration-aware browsing.
+    pub migration_index: MigrationIndex,
+    /// Migration preview state (present when mode is MigrationPreview).
+    pub migration_preview: Option<MigrationPreviewState>,
     /// Transient status message shown in the status bar (e.g., "no references found").
     pub status_message: Option<String>,
     /// When the pending key was set (for timeout).
     pub pending_key_time: Option<Instant>,
-    /// Migration preview state (present when mode is MigrationPreview).
-    pub migration_preview: Option<MigrationPreviewState>,
     /// PG→Rust type mapper (feature-aware, with user overrides).
     pub type_mapper: TypeMapper,
     /// Whether to show Rust type annotations alongside PG types.
@@ -212,9 +215,10 @@ impl AppState {
             edited_tables: BTreeSet::new(),
             hud: None,
             relation_map,
+            migration_index: MigrationIndex::default(),
+            migration_preview: None,
             status_message: None,
             pending_key_time: None,
-            migration_preview: None,
             type_mapper: TypeMapper::new(),
             show_rust_types: false,
         }
@@ -256,9 +260,19 @@ impl AppState {
 
     /// Enter search mode with the given filter.
     pub fn enter_search(mut self, filter: super::fuzzy::SearchFilter) -> Self {
-        self.search = Some(SearchState::new(&self.schema, filter));
+        self.search = Some(SearchState::new(
+            &self.schema,
+            &self.migration_index,
+            filter,
+        ));
         self.mode = Mode::Search;
         self.pending_key = PendingKey::None;
+        self
+    }
+
+    /// Set the migration index.
+    pub fn with_migration_index(mut self, index: MigrationIndex) -> Self {
+        self.migration_index = index;
         self
     }
 
@@ -450,6 +464,9 @@ impl AppState {
                 {
                     self.cursor = pos;
                 }
+            }
+            SymbolKind::Migration => {
+                // Migrations are informational in search — no document position to jump to
             }
         }
 

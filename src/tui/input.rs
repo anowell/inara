@@ -135,7 +135,13 @@ fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
                 Some(f) => f,
                 None => return state.with_status("goto not available here"),
             };
-            let result = goto::dispatch(ch, &focus, &state.schema, &state.relation_map);
+            let result = goto::dispatch(
+                ch,
+                &focus,
+                &state.schema,
+                &state.relation_map,
+                &state.migration_index,
+            );
             match result {
                 GotoResult::Jump(target) => state.clear_status().jump_to_goto(&target),
                 GotoResult::Pick(targets) => state.clear_status().enter_goto_picker(targets),
@@ -1262,7 +1268,6 @@ mod tests {
     #[test]
     fn g_unknown_shows_status_message() {
         let state = goto_state();
-        // Navigate to a table first (cursor 0 is on enum header)
         let posts_pos = state
             .doc
             .iter()
@@ -1279,9 +1284,6 @@ mod tests {
     #[test]
     fn gr_on_table_with_incoming_fks_jumps() {
         let state = goto_state();
-        // Navigate to "users" table (which has incoming FK from posts)
-        // users is the last table alphabetically with enum above it
-        // Doc: enum user_role header + admin + member + close + blank + posts + blank + users
         let users_pos = state
             .doc
             .iter()
@@ -1289,10 +1291,8 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(users_pos);
 
-        // g r should jump to incoming references
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('r')));
-        // users has only one incoming FK (from posts), so it should Jump directly
         assert_eq!(state.pending_key, PendingKey::None);
         assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
     }
@@ -1300,7 +1300,6 @@ mod tests {
     #[test]
     fn go_on_table_with_outgoing_fks_jumps() {
         let state = goto_state();
-        // Navigate to "posts" table
         let posts_pos = state
             .doc
             .iter()
@@ -1308,17 +1307,14 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(posts_pos);
 
-        // g o should jump to outgoing references
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('o')));
-        // posts has one outgoing FK (to users), so should Jump directly
         assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
     }
 
     #[test]
     fn go_on_table_no_outgoing_shows_no_results() {
         let state = goto_state();
-        // Navigate to "users" table (no outgoing FKs)
         let users_pos = state
             .doc
             .iter()
@@ -1342,28 +1338,24 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(posts_pos);
 
-        // g c should jump to first column (expanding the table)
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('c')));
         assert_eq!(
             state.focus(),
             Some(&FocusTarget::Column("posts".into(), "id".into()))
         );
-        // Table should have been expanded
         assert!(state.expanded.contains("posts"));
     }
 
     #[test]
     fn gt_on_column_jumps_to_parent_table() {
         let state = goto_state();
-        // Expand posts and navigate to a column
         let posts_pos = state
             .doc
             .iter()
             .position(|l| l.target == FocusTarget::Table("posts".into()))
             .unwrap();
         let state = state.cursor_to(posts_pos).toggle_expand();
-        // Find the author_id column
         let col_pos = state
             .doc
             .iter()
@@ -1371,7 +1363,6 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(col_pos);
 
-        // g t should jump to parent table
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
         assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
@@ -1380,7 +1371,6 @@ mod tests {
     #[test]
     fn gd_on_fk_column_jumps_to_target() {
         let state = goto_state();
-        // Expand posts and navigate to author_id column
         let posts_pos = state
             .doc
             .iter()
@@ -1394,21 +1384,18 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(col_pos);
 
-        // g d should jump to FK target (users.id)
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
         assert_eq!(
             state.focus(),
             Some(&FocusTarget::Column("users".into(), "id".into()))
         );
-        // users should have been expanded
         assert!(state.expanded.contains("users"));
     }
 
     #[test]
     fn gy_on_custom_type_column_jumps_to_enum() {
         let state = goto_state();
-        // Expand users and navigate to role column (which is Custom("user_role"))
         let users_pos = state
             .doc
             .iter()
@@ -1422,7 +1409,6 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(col_pos);
 
-        // g y should jump to enum definition
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('y')));
         assert_eq!(state.focus(), Some(&FocusTarget::Enum("user_role".into())));
@@ -1431,7 +1417,6 @@ mod tests {
     #[test]
     fn gy_on_non_custom_type_shows_no_results() {
         let state = goto_state();
-        // Expand users and navigate to email column (text, not custom)
         let users_pos = state
             .doc
             .iter()
@@ -1451,9 +1436,8 @@ mod tests {
     }
 
     #[test]
-    fn gm_shows_not_available() {
+    fn gm_shows_no_migrations() {
         let state = goto_state();
-        // Navigate to a table first
         let posts_pos = state
             .doc
             .iter()
@@ -1463,7 +1447,11 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('m')));
         assert!(state.status_message.is_some());
-        assert!(state.status_message.as_ref().unwrap().contains("not yet"));
+        assert!(state
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("no migrations"));
     }
 
     #[test]
@@ -1476,10 +1464,8 @@ mod tests {
             .unwrap();
         let state = state.cursor_to(users_pos);
 
-        // g i should jump to indexed column
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('i')));
-        // users has one index on email, should jump to email column
         assert_eq!(
             state.focus(),
             Some(&FocusTarget::Column("users".into(), "email".into()))
@@ -1529,7 +1515,6 @@ mod tests {
     #[test]
     fn command_w_without_edits_shows_no_changes() {
         let state = sample_state().with_mode(Mode::Command);
-        // Type "w" and press Enter
         let state = handle_key_no_pool(state, key(KeyCode::Char('w')));
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
@@ -1614,8 +1599,11 @@ mod tests {
     }
 
     #[test]
-    fn migration_preview_confirm_writes_file() {
+    fn migration_preview_confirm_writes_file_and_clears_edit_state() {
         let state = edited_state();
+        assert!(state.original_schema.is_some());
+        assert!(!state.renames.is_empty() || !state.edited_tables.is_empty());
+
         let mut state = state.with_mode(Mode::Command);
         state.command_buf = "w test_migration".to_string();
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
@@ -1625,6 +1613,7 @@ mod tests {
         assert_eq!(state.mode, Mode::Normal);
 
         // Edit state should be cleared
+        assert!(state.original_schema.is_some());
         assert!(state.renames.is_empty());
         assert!(state.edited_tables.is_empty());
 
@@ -1634,26 +1623,6 @@ mod tests {
         assert!(msg.contains("test_migration"));
 
         // Cleanup: remove the migration file
-        let _ = std::fs::remove_dir_all("migrations");
-    }
-
-    #[test]
-    fn migration_preview_confirm_clears_edit_state() {
-        let state = edited_state();
-        assert!(state.original_schema.is_some());
-        assert!(!state.renames.is_empty() || !state.edited_tables.is_empty());
-
-        let mut state = state.with_mode(Mode::Command);
-        state.command_buf = "w clear_state_test".to_string();
-        let state = handle_key_no_pool(state, key(KeyCode::Enter));
-        let state = handle_key_no_pool(state, key(KeyCode::Enter));
-
-        // After confirm, original_schema should be updated to current
-        assert!(state.original_schema.is_some());
-        assert!(state.renames.is_empty());
-        assert!(state.edited_tables.is_empty());
-
-        // Cleanup
         let _ = std::fs::remove_dir_all("migrations");
     }
 

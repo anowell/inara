@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::migration::loader::MigrationIndex;
 use crate::schema::Schema;
 use crate::tui::goto::GotoTarget;
 
@@ -53,6 +54,7 @@ pub enum SymbolKind {
     Column,
     Enum,
     Type,
+    Migration,
 }
 
 impl SymbolKind {
@@ -62,6 +64,7 @@ impl SymbolKind {
             SymbolKind::Column => "column",
             SymbolKind::Enum => "enum",
             SymbolKind::Type => "type",
+            SymbolKind::Migration => "migration",
         }
     }
 }
@@ -119,7 +122,8 @@ pub fn fuzzy_match(symbols: &[Symbol], query: &str, filter: SearchFilter) -> Vec
             SearchFilter::All => true,
             SearchFilter::Tables => s.kind == SymbolKind::Table,
             SearchFilter::Columns => s.kind == SymbolKind::Column,
-            SearchFilter::Migrations | SearchFilter::GotoPick => false, // placeholder / handled separately
+            SearchFilter::Migrations => s.kind == SymbolKind::Migration,
+            SearchFilter::GotoPick => false, // handled separately
         })
         .collect();
 
@@ -179,8 +183,17 @@ pub struct SearchState {
 
 impl SearchState {
     /// Create a new search state for the given schema and filter.
-    pub fn new(schema: &Schema, filter: SearchFilter) -> Self {
-        let symbols = extract_symbols(schema);
+    pub fn new(schema: &Schema, migrations: &MigrationIndex, filter: SearchFilter) -> Self {
+        let mut symbols = extract_symbols(schema);
+        // Add migration symbols when searching migrations
+        if filter == SearchFilter::Migrations || filter == SearchFilter::All {
+            for migration in &migrations.migrations {
+                symbols.push(Symbol {
+                    display: format!("{} — {}", migration.timestamp, migration.description),
+                    kind: SymbolKind::Migration,
+                });
+            }
+        }
         let results = fuzzy_match(&symbols, "", filter);
         Self {
             query: String::new(),
@@ -550,7 +563,7 @@ mod tests {
     #[test]
     fn search_state_push_char_updates_results() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::All);
+        let state = SearchState::new(&schema, &MigrationIndex::default(), SearchFilter::All);
         assert_eq!(state.results.len(), 13); // all symbols
 
         let state = state.push_char('u');
@@ -564,7 +577,7 @@ mod tests {
     #[test]
     fn search_state_pop_char_widens_results() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::All);
+        let state = SearchState::new(&schema, &MigrationIndex::default(), SearchFilter::All);
         let state = state.push_char('u').push_char('s').push_char('e');
         let narrow_count = state.results.len();
 
@@ -578,7 +591,7 @@ mod tests {
     #[test]
     fn search_state_select_navigation() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::Tables);
+        let state = SearchState::new(&schema, &MigrationIndex::default(), SearchFilter::Tables);
         assert_eq!(state.selected, 0);
         assert_eq!(state.results.len(), 3);
 
@@ -602,7 +615,7 @@ mod tests {
     #[test]
     fn search_state_selected_result() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::Tables);
+        let state = SearchState::new(&schema, &MigrationIndex::default(), SearchFilter::Tables);
         let result = state.selected_result();
         assert!(result.is_some(), "should have selected result");
     }
@@ -610,14 +623,18 @@ mod tests {
     #[test]
     fn search_state_empty_results_selected() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::Migrations);
+        let state = SearchState::new(
+            &schema,
+            &MigrationIndex::default(),
+            SearchFilter::Migrations,
+        );
         assert!(state.selected_result().is_none());
     }
 
     #[test]
     fn search_state_typing_resets_selection() {
         let schema = sample_schema();
-        let state = SearchState::new(&schema, SearchFilter::Tables);
+        let state = SearchState::new(&schema, &MigrationIndex::default(), SearchFilter::Tables);
         let state = state.select_next().select_next();
         assert_eq!(state.selected, 2);
 

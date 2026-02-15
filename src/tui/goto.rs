@@ -1,3 +1,4 @@
+use crate::migration::loader::MigrationIndex;
 use crate::schema::relations::RelationMap;
 use crate::schema::types::PgType;
 use crate::schema::Schema;
@@ -48,30 +49,39 @@ pub fn dispatch(
     focus: &FocusTarget,
     schema: &Schema,
     relations: &RelationMap,
+    migrations: &MigrationIndex,
 ) -> GotoResult {
     match focus {
-        FocusTarget::Table(table) => dispatch_table(key, table, schema, relations),
+        FocusTarget::Table(table) => dispatch_table(key, table, schema, relations, migrations),
         FocusTarget::Column(table, column) => {
-            dispatch_column(key, table, column, schema, relations)
+            dispatch_column(key, table, column, schema, relations, migrations)
         }
         // For other table-related targets, delegate to table context
         FocusTarget::Separator(table)
         | FocusTarget::Constraint(table, _)
         | FocusTarget::Index(table, _)
-        | FocusTarget::TableClose(table) => dispatch_table(key, table, schema, relations),
+        | FocusTarget::TableClose(table) => {
+            dispatch_table(key, table, schema, relations, migrations)
+        }
         _ => GotoResult::NoResults("goto not available here"),
     }
 }
 
 /// Dispatch goto for table focus context.
-fn dispatch_table(key: char, table: &str, schema: &Schema, relations: &RelationMap) -> GotoResult {
+fn dispatch_table(
+    key: char,
+    table: &str,
+    schema: &Schema,
+    relations: &RelationMap,
+    migrations: &MigrationIndex,
+) -> GotoResult {
     match key {
         'r' => goto_incoming_fks_table(table, relations),
         'o' => goto_outgoing_fks_table(table, relations),
         'i' => goto_indexes_table(table, schema),
         'c' => goto_first_column(table, schema),
         't' => goto_types_used(table, schema),
-        'm' => GotoResult::NotAvailable("migrations not yet available"),
+        'm' => goto_migrations_for_table(table, migrations),
         _ => GotoResult::NoResults("unknown goto"),
     }
 }
@@ -83,6 +93,7 @@ fn dispatch_column(
     column: &str,
     schema: &Schema,
     relations: &RelationMap,
+    migrations: &MigrationIndex,
 ) -> GotoResult {
     match key {
         'r' => goto_incoming_fks_column(table, column, relations),
@@ -93,7 +104,7 @@ fn dispatch_column(
         }),
         'i' => goto_indexes_column(table, column, schema, relations),
         'y' => goto_type_definition(table, column, schema),
-        'm' => GotoResult::NotAvailable("migrations not yet available"),
+        'm' => goto_migrations_for_column(table, column, migrations),
         _ => GotoResult::NoResults("unknown goto"),
     }
 }
@@ -352,6 +363,55 @@ fn goto_type_definition(table: &str, column: &str, schema: &Schema) -> GotoResul
     }
 }
 
+/// Table context: migrations affecting this table.
+fn goto_migrations_for_table(table: &str, migrations: &MigrationIndex) -> GotoResult {
+    let refs = match migrations.tables.get(table) {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return GotoResult::NoResults("no migrations for this table"),
+    };
+
+    let targets: Vec<GotoTarget> = refs
+        .iter()
+        .map(|r| GotoTarget {
+            label: format!("{} — {}", r.timestamp, r.description),
+            focus: GotoFocus::Table(table.to_string()),
+        })
+        .collect();
+
+    if targets.len() == 1 {
+        GotoResult::Jump(targets.into_iter().next().expect("checked non-empty"))
+    } else {
+        GotoResult::Pick(targets)
+    }
+}
+
+/// Column context: migrations affecting this column.
+fn goto_migrations_for_column(
+    table: &str,
+    column: &str,
+    migrations: &MigrationIndex,
+) -> GotoResult {
+    let key = format!("{table}.{column}");
+    let refs = match migrations.columns.get(&key) {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return GotoResult::NoResults("no migrations for this column"),
+    };
+
+    let targets: Vec<GotoTarget> = refs
+        .iter()
+        .map(|r| GotoTarget {
+            label: format!("{} — {}", r.timestamp, r.description),
+            focus: GotoFocus::Column(table.to_string(), column.to_string()),
+        })
+        .collect();
+
+    if targets.len() == 1 {
+        GotoResult::Jump(targets.into_iter().next().expect("checked non-empty"))
+    } else {
+        GotoResult::Pick(targets)
+    }
+}
+
 /// Collect goto targets for custom types found in a PgType (including inside arrays).
 fn collect_custom_type_targets(
     pg_type: &PgType,
@@ -491,7 +551,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         // users has incoming from posts and comments
         match result {
             GotoResult::Pick(targets) => {
@@ -516,7 +576,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("posts".into());
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         // posts has incoming only from comments
         match result {
             GotoResult::Jump(target) => {
@@ -532,7 +592,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("comments".into());
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -544,7 +604,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("comments".into());
 
-        let result = dispatch('o', &focus, &schema, &relations);
+        let result = dispatch('o', &focus, &schema, &relations, &MigrationIndex::default());
         // comments has outgoing to posts and users
         match result {
             GotoResult::Pick(targets) => {
@@ -560,7 +620,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('o', &focus, &schema, &relations);
+        let result = dispatch('o', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -572,7 +632,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('i', &focus, &schema, &relations);
+        let result = dispatch('i', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert!(target.label.contains("users_email_idx"));
@@ -589,7 +649,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("empty".into());
 
-        let result = dispatch('i', &focus, &schema, &relations);
+        let result = dispatch('i', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -601,7 +661,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('c', &focus, &schema, &relations);
+        let result = dispatch('c', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert_eq!(target.focus, GotoFocus::Column("users".into(), "id".into()));
@@ -618,7 +678,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('t', &focus, &schema, &relations);
+        let result = dispatch('t', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert_eq!(target.focus, GotoFocus::Enum("user_role".into()));
@@ -633,20 +693,88 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("comments".into());
 
-        let result = dispatch('t', &focus, &schema, &relations);
+        let result = dispatch('t', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
     // --- Table context: migrations (g m) ---
 
     #[test]
-    fn table_goto_migrations_not_available() {
+    fn table_goto_migrations_empty_index() {
         let schema = test_schema();
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('m', &focus, &schema, &relations);
-        assert!(matches!(result, GotoResult::NotAvailable(_)));
+        let result = dispatch('m', &focus, &schema, &relations, &MigrationIndex::default());
+        assert!(matches!(result, GotoResult::NoResults(_)));
+    }
+
+    #[test]
+    fn table_goto_migrations_with_index() {
+        use crate::migration::loader::{MigrationIndex, MigrationRef};
+        use std::path::PathBuf;
+
+        let schema = test_schema();
+        let relations = RelationMap::build(&schema);
+        let focus = FocusTarget::Table("users".into());
+
+        let mut index = MigrationIndex::default();
+        index.tables.insert(
+            "users".into(),
+            vec![
+                MigrationRef {
+                    timestamp: "20260101000000".into(),
+                    description: "create users".into(),
+                    path: PathBuf::from("m.up.sql"),
+                    excerpt: "CREATE TABLE users (...)".into(),
+                },
+                MigrationRef {
+                    timestamp: "20260102000000".into(),
+                    description: "add bio".into(),
+                    path: PathBuf::from("m2.up.sql"),
+                    excerpt: "ALTER TABLE users ADD COLUMN bio text".into(),
+                },
+            ],
+        );
+
+        let result = dispatch('m', &focus, &schema, &relations, &index);
+        match result {
+            GotoResult::Pick(targets) => {
+                assert_eq!(targets.len(), 2);
+                assert!(targets[0].label.contains("create users"));
+                assert!(targets[1].label.contains("add bio"));
+            }
+            other => panic!("expected Pick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_goto_migrations_with_index() {
+        use crate::migration::loader::{MigrationIndex, MigrationRef};
+        use std::path::PathBuf;
+
+        let schema = test_schema();
+        let relations = RelationMap::build(&schema);
+        let focus = FocusTarget::Column("users".into(), "email".into());
+
+        let mut index = MigrationIndex::default();
+        index.columns.insert(
+            "users.email".into(),
+            vec![MigrationRef {
+                timestamp: "20260101000000".into(),
+                description: "create users".into(),
+                path: PathBuf::from("m.up.sql"),
+                excerpt: "CREATE TABLE users (...)".into(),
+            }],
+        );
+
+        let result = dispatch('m', &focus, &schema, &relations, &index);
+        match result {
+            GotoResult::Jump(target) => {
+                assert!(target.label.contains("create users"));
+            }
+            other => panic!("expected Jump, got {other:?}"),
+        }
     }
 
     // --- Column context: parent table (g t) ---
@@ -657,7 +785,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("posts".into(), "author_id".into());
 
-        let result = dispatch('t', &focus, &schema, &relations);
+        let result = dispatch('t', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert_eq!(target.focus, GotoFocus::Table("posts".into()));
@@ -674,7 +802,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("posts".into(), "author_id".into());
 
-        let result = dispatch('d', &focus, &schema, &relations);
+        let result = dispatch('d', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert_eq!(target.focus, GotoFocus::Column("users".into(), "id".into()));
@@ -689,7 +817,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("users".into(), "email".into());
 
-        let result = dispatch('d', &focus, &schema, &relations);
+        let result = dispatch('d', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -701,7 +829,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("users".into(), "id".into());
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         // users.id is referenced by posts.author_id and comments.author_id
         match result {
             GotoResult::Pick(targets) => {
@@ -719,7 +847,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("posts".into(), "author_id".into());
 
-        let result = dispatch('i', &focus, &schema, &relations);
+        let result = dispatch('i', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert!(target.label.contains("posts_author_idx"));
@@ -734,7 +862,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("posts".into(), "title".into());
 
-        let result = dispatch('i', &focus, &schema, &relations);
+        let result = dispatch('i', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -746,7 +874,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("users".into(), "role".into());
 
-        let result = dispatch('y', &focus, &schema, &relations);
+        let result = dispatch('y', &focus, &schema, &relations, &MigrationIndex::default());
         match result {
             GotoResult::Jump(target) => {
                 assert_eq!(target.focus, GotoFocus::Enum("user_role".into()));
@@ -761,7 +889,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Column("users".into(), "email".into());
 
-        let result = dispatch('y', &focus, &schema, &relations);
+        let result = dispatch('y', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -773,7 +901,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Table("users".into());
 
-        let result = dispatch('x', &focus, &schema, &relations);
+        let result = dispatch('x', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -785,7 +913,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Blank;
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         assert!(matches!(result, GotoResult::NoResults(_)));
     }
 
@@ -797,7 +925,7 @@ mod tests {
         let relations = RelationMap::build(&schema);
         let focus = FocusTarget::Constraint("posts".into(), 0);
 
-        let result = dispatch('r', &focus, &schema, &relations);
+        let result = dispatch('r', &focus, &schema, &relations, &MigrationIndex::default());
         // Should act as if table "posts" is focused
         match result {
             GotoResult::Jump(target) => {
