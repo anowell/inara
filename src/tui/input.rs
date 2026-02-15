@@ -76,6 +76,9 @@ fn handle_normal(
         // Mode transitions
         KeyCode::Char(':') => (state.with_mode(Mode::Command), None),
         KeyCode::Char(' ') => (state.with_mode(Mode::SpaceMenu), None),
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            (state.toggle_rust_types(), None)
+        }
         KeyCode::Char('e') => (edit::enter_edit_mode(state), None),
         KeyCode::Char('r') => (edit::enter_rename_mode(state), None),
         KeyCode::Char('q') => open_hud(state, pool),
@@ -657,6 +660,9 @@ mod tests {
             KeyCode::BackTab => state.prev_table(),
             KeyCode::Char(':') => state.with_mode(Mode::Command),
             KeyCode::Char(' ') => state.with_mode(Mode::SpaceMenu),
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.toggle_rust_types()
+            }
             KeyCode::Char('e') => edit::enter_edit_mode(state),
             KeyCode::Char('r') => edit::enter_rename_mode(state),
             _ => state,
@@ -860,6 +866,26 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Char('x'))); // unknown
         assert_eq!(state.pending_key, PendingKey::None);
         assert_eq!(state.cursor, 2); // unchanged
+    }
+
+    // --- Rust type toggle ---
+
+    #[test]
+    fn ctrl_t_toggles_rust_types() {
+        let state = sample_state();
+        assert!(!state.show_rust_types);
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(state.show_rust_types);
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(!state.show_rust_types);
     }
 
     // --- Space menu ---

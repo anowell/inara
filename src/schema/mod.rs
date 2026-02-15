@@ -3,6 +3,7 @@ pub mod introspect;
 pub mod parse;
 pub mod relations;
 pub mod render;
+pub mod type_map;
 pub mod types;
 
 use std::collections::BTreeMap;

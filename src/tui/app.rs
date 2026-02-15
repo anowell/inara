@@ -7,6 +7,7 @@ use super::fuzzy::SearchState;
 use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
 use crate::schema::relations::RelationMap;
+use crate::schema::type_map::TypeMapper;
 use crate::schema::Schema;
 
 /// The TUI application mode. Determines which input handler processes keys.
@@ -171,6 +172,10 @@ pub struct AppState {
     pub pending_key_time: Option<Instant>,
     /// Migration preview state (present when mode is MigrationPreview).
     pub migration_preview: Option<MigrationPreviewState>,
+    /// PG→Rust type mapper (feature-aware, with user overrides).
+    pub type_mapper: TypeMapper,
+    /// Whether to show Rust type annotations alongside PG types.
+    pub show_rust_types: bool,
 }
 
 impl AppState {
@@ -207,6 +212,8 @@ impl AppState {
             status_message: None,
             pending_key_time: None,
             migration_preview: None,
+            type_mapper: TypeMapper::new(),
+            show_rust_types: false,
         }
     }
 
@@ -489,6 +496,18 @@ impl AppState {
     /// Set a transient status message for the status bar (alias for `with_status`).
     pub fn with_status_message(self, msg: String) -> Self {
         self.with_status(msg)
+    }
+
+    /// Set the type mapper (e.g., after loading from Cargo.toml).
+    pub fn with_type_mapper(mut self, mapper: TypeMapper) -> Self {
+        self.type_mapper = mapper;
+        self
+    }
+
+    /// Toggle Rust type annotation display on/off.
+    pub fn toggle_rust_types(mut self) -> Self {
+        self.show_rust_types = !self.show_rust_types;
+        self
     }
 
     /// Toggle expand/collapse for the table under the cursor.

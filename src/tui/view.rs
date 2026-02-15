@@ -154,10 +154,15 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
     if let CustomTypeKind::Composite { fields } = &custom_type.kind {
         if let Some((field_name, pg_type)) = fields.get(idx) {
             let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-            return vec![
+            let mut spans = vec![
                 Span::styled(format!("    {field_name:<max_name_len$}  "), NAME_STYLE),
                 Span::styled(pg_type.to_string(), TYPE_STYLE),
             ];
+            if state.show_rust_types {
+                let rust_type = state.type_mapper.rust_type(pg_type);
+                spans.push(Span::styled(format!("  // {rust_type}"), DIM_STYLE));
+            }
+            return spans;
         }
     }
     vec![Span::raw("")]
@@ -251,6 +256,12 @@ fn render_column_line(state: &AppState, table_name: &str, col_name: &str) -> Vec
         Span::styled(format!("    {:<max_name_len$}  ", col.name), NAME_STYLE),
         Span::styled(padded_type, TYPE_STYLE),
     ];
+
+    // Rust type annotation (shown when toggled on)
+    if state.show_rust_types {
+        let rust_type = state.type_mapper.rust_type(&col.pg_type);
+        spans.push(Span::styled(format!("  // {rust_type}"), DIM_STYLE));
+    }
 
     if !col.nullable {
         spans.push(Span::styled("  NOT NULL", KEYWORD_STYLE));
@@ -625,5 +636,118 @@ mod tests {
         assert!(text.contains("table "));
         assert!(text.contains("empty"));
         assert!(text.contains("{ }"));
+    }
+
+    // --- Rust type annotation tests ---
+
+    #[test]
+    fn column_shows_rust_type_when_enabled() {
+        let state = simple_state()
+            .with_viewport_height(20)
+            .toggle_expand()
+            .toggle_rust_types();
+        assert!(state.show_rust_types);
+        let lines = render_document(&state);
+
+        let id_text = spans_to_string(&lines[1]);
+        assert!(id_text.contains("uuid"), "should show PG type");
+        assert!(
+            id_text.contains("// uuid::Uuid"),
+            "should show Rust type annotation, got: {id_text}"
+        );
+
+        let email_text = spans_to_string(&lines[2]);
+        assert!(email_text.contains("text"), "should show PG type");
+        assert!(
+            email_text.contains("// String"),
+            "should show Rust type annotation, got: {email_text}"
+        );
+    }
+
+    #[test]
+    fn column_hides_rust_type_when_disabled() {
+        let state = simple_state().with_viewport_height(20).toggle_expand();
+        assert!(!state.show_rust_types);
+        let lines = render_document(&state);
+
+        let id_text = spans_to_string(&lines[1]);
+        assert!(
+            !id_text.contains("//"),
+            "should NOT show Rust type annotation"
+        );
+    }
+
+    #[test]
+    fn rust_type_toggle_on_off() {
+        let state = simple_state()
+            .with_viewport_height(20)
+            .toggle_expand()
+            .toggle_rust_types();
+        assert!(state.show_rust_types);
+
+        let state = state.toggle_rust_types();
+        assert!(!state.show_rust_types);
+        let lines = render_document(&state);
+        let id_text = spans_to_string(&lines[1]);
+        assert!(!id_text.contains("//"), "after toggle off, no annotation");
+    }
+
+    #[test]
+    fn rust_type_with_chrono_feature() {
+        use crate::schema::type_map::{DetectedFeatures, TypeMapper};
+
+        let mut schema = Schema::new();
+        let mut table = Table::new("events");
+        table.add_column(Column::new("created_at", PgType::Timestamptz));
+        schema.add_table(table);
+
+        let mapper = TypeMapper::with_features(DetectedFeatures {
+            chrono: true,
+            time: false,
+            jiff: false,
+        });
+
+        let state = AppState::new(schema, String::new())
+            .with_type_mapper(mapper)
+            .with_viewport_height(20)
+            .toggle_expand()
+            .toggle_rust_types();
+
+        let lines = render_document(&state);
+        let text = spans_to_string(&lines[1]);
+        assert!(
+            text.contains("// chrono::DateTime<Utc>"),
+            "should show chrono type, got: {text}"
+        );
+    }
+
+    #[test]
+    fn composite_type_shows_rust_type() {
+        let mut schema = Schema::new();
+        schema.add_type(CustomType {
+            name: "address".into(),
+            kind: CustomTypeKind::Composite {
+                fields: vec![
+                    ("street".into(), PgType::Text),
+                    ("zip".into(), PgType::Integer),
+                ],
+            },
+        });
+        let state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_rust_types();
+        let lines = render_document(&state);
+
+        let street_text = spans_to_string(&lines[1]);
+        assert!(
+            street_text.contains("// String"),
+            "composite field should show Rust type, got: {street_text}"
+        );
+
+        let zip_text = spans_to_string(&lines[2]);
+        assert!(
+            zip_text.contains("// i32"),
+            "composite field should show Rust type, got: {zip_text}"
+        );
     }
 }

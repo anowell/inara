@@ -104,7 +104,26 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
 
     let mut terminal = init_terminal()?;
 
-    let state = AppState::new(schema, connection_info);
+    // Load PG→Rust type mapper from target project's Cargo.toml
+    let cargo_toml_path = std::path::Path::new("Cargo.toml");
+    let type_mapper = {
+        let mut mapper = crate::schema::type_map::TypeMapper::from_cargo_toml(cargo_toml_path);
+        let overrides = crate::schema::type_map::load_overrides(cargo_toml_path);
+        if !overrides.is_empty() {
+            tracing::info!("Loaded {} type override(s)", overrides.len());
+            mapper = mapper.with_overrides(overrides);
+        }
+        let features = mapper.features();
+        tracing::info!(
+            "Type mapper: chrono={}, time={}, jiff={}",
+            features.chrono,
+            features.time,
+            features.jiff
+        );
+        mapper
+    };
+
+    let state = AppState::new(schema, connection_info).with_type_mapper(type_mapper);
 
     let result = run_event_loop(&mut terminal, state, pool);
 
