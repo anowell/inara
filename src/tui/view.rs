@@ -163,10 +163,14 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
     vec![Span::raw("")]
 }
 
+/// Style for the edit indicator on modified tables.
+const EDITED_STYLE: Style = Style::new().fg(Color::Yellow);
+
 /// Render a table header line.
 ///
 /// Collapsed: `table name { ... N columns ... }`
 /// Expanded:  `table name {` (or `table name { }` if empty)
+/// Edited tables show a `~ ` prefix as a visual diff hint.
 fn render_table_header(state: &AppState, name: &str) -> Vec<Span<'static>> {
     let table = match state.schema.table(name) {
         Some(t) => t,
@@ -176,12 +180,17 @@ fn render_table_header(state: &AppState, name: &str) -> Vec<Span<'static>> {
     let is_expanded = state.expanded.contains(name);
     let is_empty =
         table.columns.is_empty() && table.constraints.is_empty() && table.indexes.is_empty();
+    let is_edited = state.edited_tables.contains(name);
 
-    let mut spans = vec![
-        Span::styled("table ", KEYWORD_STYLE),
-        Span::styled(name.to_string(), NAME_STYLE),
-        Span::styled(" {", NORMAL_STYLE),
-    ];
+    let mut spans = Vec::new();
+
+    if is_edited {
+        spans.push(Span::styled("~ ", EDITED_STYLE));
+    }
+
+    spans.push(Span::styled("table ", KEYWORD_STYLE));
+    spans.push(Span::styled(name.to_string(), NAME_STYLE));
+    spans.push(Span::styled(" {", NORMAL_STYLE));
 
     if is_expanded && is_empty {
         spans.push(Span::styled(" }", NORMAL_STYLE));

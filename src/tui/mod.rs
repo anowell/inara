@@ -1,5 +1,7 @@
 pub mod app;
+pub mod edit;
 pub mod fuzzy;
+pub mod hud;
 pub mod input;
 pub mod view;
 
@@ -17,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use self::app::{AppState, Mode};
+use self::hud::HudResultHandle;
 use self::input::handle_key;
 
 /// Tick rate for the event loop poll interval.
@@ -102,7 +105,7 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
 
     let state = AppState::new(schema, connection_info);
 
-    let result = run_event_loop(&mut terminal, state);
+    let result = run_event_loop(&mut terminal, state, pool);
 
     restore_terminal();
 
@@ -113,13 +116,25 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
 fn run_event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     mut state: AppState,
+    pool: sqlx::PgPool,
 ) -> Result<()> {
+    let mut hud_handle: Option<HudResultHandle> = None;
+
     loop {
         // Update viewport height from terminal size
         let area = terminal.size()?;
         // Content area height = total height - header(1) - status bar(1) - content borders(2)
         let content_height = area.height.saturating_sub(4) as usize;
         state = state.with_viewport_height(content_height);
+
+        // Poll for HUD query results
+        if let Some(ref handle) = hud_handle {
+            if let Ok(mut guard) = handle.lock() {
+                if let Some(status) = guard.take() {
+                    state = state.with_hud_status(status);
+                }
+            }
+        }
 
         terminal.draw(|frame| draw(frame, &state))?;
 
@@ -133,7 +148,15 @@ fn run_event_loop(
                 Event::Key(key) => {
                     // Only handle key press events (ignore release/repeat)
                     if key.kind == KeyEventKind::Press {
-                        state = handle_key(state, key);
+                        let (new_state, new_handle) = handle_key(state, key, &pool);
+                        state = new_state;
+                        if let Some(h) = new_handle {
+                            hud_handle = Some(h);
+                        }
+                        // Clear handle when leaving HUD mode
+                        if state.mode != Mode::HUD {
+                            hud_handle = None;
+                        }
                     }
                 }
                 Event::Resize(_, _) => {
@@ -173,6 +196,11 @@ fn draw(frame: &mut Frame, state: &AppState) {
         }
         _ => {}
     }
+
+    // HUD overlay renders on top of everything
+    if let Some(ref hud_state) = state.hud {
+        hud::render_hud(frame, area, hud_state);
+    }
 }
 
 /// Render the header bar with app name and connection info.
@@ -191,18 +219,82 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
     frame.render_widget(Paragraph::new(header), area);
 }
 
-/// Render the main content area with the schema document.
+/// Render the main content area with the schema document or edit buffer.
 fn draw_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    if state.mode == Mode::Edit {
+        draw_edit_content(frame, area, state);
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Schema ");
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let visible_lines = view::render_document(state);
+        let content = Paragraph::new(visible_lines);
+        frame.render_widget(content, inner);
+    }
+}
+
+/// Render the edit mode content area with the text buffer.
+fn draw_edit_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let title = match &state.edit_table {
+        Some(name) => format!(" Editing: {name} "),
+        None => " Editing ".to_string(),
+    };
+
+    let border_color = if state.edit_error.is_some() {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Schema ");
+        .border_style(Style::default().fg(border_color))
+        .title(title);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let visible_lines = view::render_document(state);
-    let content = Paragraph::new(visible_lines);
+    let lines: Vec<Line> = state
+        .edit_buffer
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == state.edit_cursor_row {
+                // Show cursor position with a highlighted character
+                let col = state.edit_cursor_col.min(line.len());
+                let before = &line[..col];
+                let cursor_char = line.get(col..col + 1).unwrap_or(" ");
+                let after = if col < line.len() {
+                    &line[col + 1..]
+                } else {
+                    ""
+                };
+                Line::from(vec![
+                    Span::styled(before.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        cursor_char.to_string(),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White),
+                ))
+            }
+        })
+        .collect();
+
+    let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
 }
 
@@ -211,6 +303,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
     let mode_style = match state.mode {
         Mode::Normal => Style::default().fg(Color::Black).bg(Color::Blue),
         Mode::Edit => Style::default().fg(Color::Black).bg(Color::Yellow),
+        Mode::Rename => Style::default().fg(Color::Black).bg(Color::Yellow),
         Mode::Search => Style::default().fg(Color::Black).bg(Color::Green),
         Mode::HUD => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
@@ -232,6 +325,28 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         spans.push(Span::styled(
             &state.command_buf,
             Style::default().fg(Color::White),
+        ));
+    }
+
+    // Show rename prompt
+    if state.mode == Mode::Rename {
+        let label = match &state.rename_target {
+            Some(app::RenameTarget::Table(_)) => " Rename table: ",
+            Some(app::RenameTarget::Column(_, _)) => " Rename column: ",
+            None => " Rename: ",
+        };
+        spans.push(Span::styled(label, Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            &state.rename_buf,
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    // Show edit error
+    if let Some(ref err) = state.edit_error {
+        spans.push(Span::styled(
+            format!(" Error: {err}"),
+            Style::default().fg(Color::Red),
         ));
     }
 

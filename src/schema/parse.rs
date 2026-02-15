@@ -26,6 +26,32 @@ pub fn parse_schema(input: &str) -> Result<Schema, SchemaParseError> {
     schema.parse(input).map_err(|e| format_error(input, e))
 }
 
+/// Parse a single table declaration from its declarative text format.
+///
+/// This is the inverse of `render::render_single_table`. Used by the edit
+/// mode to parse a user-edited table declaration back into a `Table`.
+pub fn parse_single_table(input: &str) -> Result<Table, SchemaParseError> {
+    // Parse as a full schema containing just one table declaration
+    let schema = parse_schema(input)?;
+    if schema.tables.len() != 1 || !schema.enums.is_empty() || !schema.types.is_empty() {
+        return Err(SchemaParseError {
+            line: 1,
+            col: 1,
+            message: "expected exactly one table declaration".into(),
+        });
+    }
+    // Safety: we verified len() == 1 above, so next() always succeeds
+    schema
+        .tables
+        .into_values()
+        .next()
+        .ok_or_else(|| SchemaParseError {
+            line: 1,
+            col: 1,
+            message: "expected exactly one table declaration".into(),
+        })
+}
+
 fn format_error(input: &str, e: ParseError<&str, ContextError>) -> SchemaParseError {
     let offset = e.offset();
     let consumed = &input[..offset];
