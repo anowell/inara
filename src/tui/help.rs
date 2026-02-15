@@ -1,0 +1,364 @@
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::Frame;
+
+use super::app::Mode;
+
+/// A keybinding entry for display in the help overlay.
+struct Binding {
+    key: &'static str,
+    desc: &'static str,
+}
+
+/// Normal mode keybindings (top-level only — nested sequences like `g r` are not shown).
+const NORMAL_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "j / Down",
+        desc: "Move down",
+    },
+    Binding {
+        key: "k / Up",
+        desc: "Move up",
+    },
+    Binding {
+        key: "gg",
+        desc: "Jump to first",
+    },
+    Binding {
+        key: "G",
+        desc: "Jump to last",
+    },
+    Binding {
+        key: "Ctrl-d",
+        desc: "Half-page down",
+    },
+    Binding {
+        key: "Ctrl-u",
+        desc: "Half-page up",
+    },
+    Binding {
+        key: "Enter",
+        desc: "Toggle expand/collapse",
+    },
+    Binding {
+        key: "Tab",
+        desc: "Next table",
+    },
+    Binding {
+        key: "Shift-Tab",
+        desc: "Previous table",
+    },
+    Binding {
+        key: "Space",
+        desc: "Command palette",
+    },
+    Binding {
+        key: ":",
+        desc: "Command mode",
+    },
+    Binding {
+        key: "e",
+        desc: "Edit table",
+    },
+    Binding {
+        key: "r",
+        desc: "Rename element",
+    },
+    Binding {
+        key: "q",
+        desc: "Query HUD",
+    },
+    Binding {
+        key: "g",
+        desc: "Goto...",
+    },
+    Binding {
+        key: "Ctrl-t",
+        desc: "Toggle Rust types",
+    },
+];
+
+const COMMAND_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Execute command",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+    Binding {
+        key: "Backspace",
+        desc: "Delete character",
+    },
+];
+
+const SEARCH_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Select result",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+    Binding {
+        key: "Down / Ctrl-n",
+        desc: "Next result",
+    },
+    Binding {
+        key: "Up / Ctrl-p",
+        desc: "Previous result",
+    },
+    Binding {
+        key: "Backspace",
+        desc: "Delete character",
+    },
+];
+
+const HUD_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Esc",
+        desc: "Close HUD",
+    },
+    Binding {
+        key: "y",
+        desc: "Confirm safety warning",
+    },
+];
+
+const EDIT_BINDINGS: &[Binding] = &[Binding {
+    key: "Esc",
+    desc: "Exit edit mode",
+}];
+
+const RENAME_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Confirm rename",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+];
+
+const MIGRATION_PREVIEW_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Confirm and write",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+    Binding {
+        key: "j / Down",
+        desc: "Scroll down",
+    },
+    Binding {
+        key: "k / Up",
+        desc: "Scroll up",
+    },
+];
+
+const SPACE_MENU_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "f",
+        desc: "Find all symbols",
+    },
+    Binding {
+        key: "t",
+        desc: "Find table",
+    },
+    Binding {
+        key: "c",
+        desc: "Find column",
+    },
+    Binding {
+        key: "m",
+        desc: "Find migration",
+    },
+    Binding {
+        key: "p",
+        desc: "Pending migrations",
+    },
+    Binding {
+        key: "?",
+        desc: "Help",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+];
+
+const LLM_PENDING_BINDINGS: &[Binding] = &[Binding {
+    key: "Esc",
+    desc: "Cancel",
+}];
+
+const LLM_PREVIEW_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Accept suggestion",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+    Binding {
+        key: "j / Down",
+        desc: "Scroll down",
+    },
+    Binding {
+        key: "k / Up",
+        desc: "Scroll up",
+    },
+];
+
+/// Get the keybinding list for a given mode.
+fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
+    match mode {
+        Mode::Normal | Mode::Help => NORMAL_BINDINGS,
+        Mode::Command => COMMAND_BINDINGS,
+        Mode::Search => SEARCH_BINDINGS,
+        Mode::HUD => HUD_BINDINGS,
+        Mode::Edit => EDIT_BINDINGS,
+        Mode::Rename => RENAME_BINDINGS,
+        Mode::MigrationPreview => MIGRATION_PREVIEW_BINDINGS,
+        Mode::SpaceMenu => SPACE_MENU_BINDINGS,
+        Mode::LlmPending => LLM_PENDING_BINDINGS,
+        Mode::LlmPreview => LLM_PREVIEW_BINDINGS,
+    }
+}
+
+/// Render the help overlay centered in the given area.
+///
+/// Shows keybindings for `source_mode` — the mode the user was in before
+/// pressing `?`.
+pub fn render_help(frame: &mut Frame, area: Rect, source_mode: Mode) {
+    let bindings = bindings_for_mode(source_mode);
+
+    let title = format!(" Help — {} ", source_mode);
+    let key_col_width = bindings.iter().map(|b| b.key.len()).max().unwrap_or(0);
+
+    let mut lines: Vec<Line<'static>> = bindings
+        .iter()
+        .map(|b| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {:width$}", b.key, width = key_col_width),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {}", b.desc), Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+
+    // Footer
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press ? or Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let content_height = lines.len() as u16 + 2; // +2 for borders
+    let content_width = {
+        // key_col_width + desc max width + padding
+        let desc_max = bindings.iter().map(|b| b.desc.len()).max().unwrap_or(0);
+        (key_col_width + desc_max + 6) as u16 // 2 indent + 2 gap + 2 border
+    }
+    .max(title.len() as u16 + 2);
+
+    let overlay_width = content_width.min(area.width.saturating_sub(4));
+    let overlay_height = content_height.min(area.height.saturating_sub(2));
+
+    // Center horizontally, place near top
+    let x = area.x + area.width.saturating_sub(overlay_width) / 2;
+    let y = area.y + 2;
+    let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+    frame.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, overlay_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_bindings_not_empty() {
+        let bindings = bindings_for_mode(Mode::Normal);
+        assert!(!bindings.is_empty());
+    }
+
+    #[test]
+    fn help_mode_shows_normal_bindings() {
+        // Help mode should show the same bindings as Normal mode
+        let help = bindings_for_mode(Mode::Help);
+        let normal = bindings_for_mode(Mode::Normal);
+        assert_eq!(help.len(), normal.len());
+    }
+
+    #[test]
+    fn all_modes_have_bindings() {
+        let modes = [
+            Mode::Normal,
+            Mode::Edit,
+            Mode::Rename,
+            Mode::Search,
+            Mode::HUD,
+            Mode::Command,
+            Mode::SpaceMenu,
+            Mode::MigrationPreview,
+            Mode::LlmPending,
+            Mode::LlmPreview,
+            Mode::Help,
+        ];
+        for mode in modes {
+            let bindings = bindings_for_mode(mode);
+            assert!(
+                !bindings.is_empty(),
+                "Mode {:?} should have at least one binding",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn space_menu_includes_help_key() {
+        let bindings = bindings_for_mode(Mode::SpaceMenu);
+        assert!(
+            bindings.iter().any(|b| b.key == "?"),
+            "Space menu should include the ? key"
+        );
+    }
+
+    #[test]
+    fn normal_mode_shows_goto_as_prefix() {
+        let bindings = bindings_for_mode(Mode::Normal);
+        let goto = bindings.iter().find(|b| b.key == "g");
+        assert!(goto.is_some(), "Normal mode should show g as a goto key");
+        assert!(
+            goto.unwrap().desc.contains("Goto"),
+            "g should be described as Goto"
+        );
+    }
+}

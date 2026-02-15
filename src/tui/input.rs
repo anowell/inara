@@ -101,6 +101,7 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
         Mode::MigrationPreview => HandleResult::state_only(handle_migration_preview(state, key)),
         Mode::LlmPending => HandleResult::state_only(handle_llm_pending(state, key)),
         Mode::LlmPreview => HandleResult::state_only(handle_llm_preview(state, key)),
+        Mode::Help => HandleResult::state_only(handle_help(state, key)),
     }
 }
 
@@ -531,6 +532,19 @@ fn find_latest_up_migration(dir: &std::path::Path) -> Option<(String, String)> {
     Some((content, description))
 }
 
+/// Handle key events in Help mode.
+///
+/// `?` or `Esc` dismisses the overlay and returns to the source mode.
+fn handle_help(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('?') => {
+            let target = state.help_source_mode;
+            state.with_mode(target)
+        }
+        _ => state, // ignore all other keys
+    }
+}
+
 /// Handle key events in LlmPending mode (waiting for LLM response).
 ///
 /// Only Esc to cancel is supported.
@@ -658,6 +672,11 @@ fn handle_space_menu(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleRes
             HandleResult::state_only(state.enter_search(SearchFilter::Migrations))
         }
         KeyCode::Char('p') => toggle_pending_overlay(state, pool),
+        KeyCode::Char('?') => {
+            let mut state = state;
+            state.help_source_mode = Mode::Normal;
+            HandleResult::state_only(state.with_mode(Mode::Help))
+        }
         KeyCode::Esc | KeyCode::Char(' ') => {
             HandleResult::state_only(state.with_mode(Mode::Normal))
         }
@@ -1087,6 +1106,7 @@ mod tests {
             Mode::MigrationPreview => handle_migration_preview(state, key),
             Mode::LlmPending => handle_llm_pending(state, key),
             Mode::LlmPreview => handle_llm_preview(state, key),
+            Mode::Help => handle_help(state, key),
         }
     }
 
@@ -2231,5 +2251,42 @@ mod tests {
     fn find_latest_up_migration_returns_none_for_nonexistent_dir() {
         let result = find_latest_up_migration(std::path::Path::new("/nonexistent/dir"));
         assert!(result.is_none());
+    }
+
+    // --- Help overlay ---
+
+    #[test]
+    fn space_question_mark_opens_help() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('?')));
+        assert_eq!(state.mode, Mode::Help);
+        assert_eq!(state.help_source_mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_esc_returns_to_source_mode() {
+        let mut state = sample_state();
+        state.help_source_mode = Mode::Normal;
+        state.mode = Mode::Help;
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_question_mark_dismisses() {
+        let mut state = sample_state();
+        state.help_source_mode = Mode::Normal;
+        state.mode = Mode::Help;
+        let state = handle_key_no_pool(state, key(KeyCode::Char('?')));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_ignores_other_keys() {
+        let mut state = sample_state();
+        state.help_source_mode = Mode::Normal;
+        state.mode = Mode::Help;
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert_eq!(state.mode, Mode::Help, "Help mode should ignore j");
     }
 }

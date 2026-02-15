@@ -39,6 +39,7 @@ Inara's navigation is inspired by helix editor. This document defines the keybin
 | `Space c` | Fuzzy column search |
 | `Space m` | Fuzzy migration search |
 | `Space p` | Show pending migrations |
+| `Space ?` | Show keybinding help |
 
 ### Goto Matrix (`g` prefix)
 

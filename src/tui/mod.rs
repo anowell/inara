@@ -2,6 +2,7 @@ pub mod app;
 pub mod edit;
 pub mod fuzzy;
 pub mod goto;
+pub mod help;
 pub mod hud;
 pub mod input;
 pub mod view;
@@ -317,6 +318,9 @@ fn draw(frame: &mut Frame, state: &AppState) {
             if let Some(ref preview) = state.llm_preview {
                 render_llm_preview(frame, layout[1], preview);
             }
+        }
+        Mode::Help => {
+            help::render_help(frame, layout[1], state.help_source_mode);
         }
         _ => {}
     }
@@ -675,6 +679,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::MigrationPreview => Style::default().fg(Color::Black).bg(Color::Green),
         Mode::LlmPending => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::LlmPreview => Style::default().fg(Color::Black).bg(Color::Magenta),
+        Mode::Help => Style::default().fg(Color::Black).bg(Color::Blue),
     };
 
     let mode_label = format!(" {} ", state.mode);

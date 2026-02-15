@@ -25,6 +25,7 @@ pub enum Mode {
     MigrationPreview,
     LlmPending,
     LlmPreview,
+    Help,
 }
 
 /// Metadata for a rename operation. Recorded so the diff engine can
@@ -223,6 +224,9 @@ pub struct AppState {
     pub llm_preview: Option<LlmPreviewState>,
     /// Pending LLM operation description (shown during LlmPending mode).
     pub llm_pending_message: Option<String>,
+    /// The mode the user was in before entering Help mode (for showing
+    /// the correct keybindings).
+    pub help_source_mode: Mode,
 }
 
 impl AppState {
@@ -266,6 +270,7 @@ impl AppState {
             show_pending_overlay: false,
             llm_preview: None,
             llm_pending_message: None,
+            help_source_mode: Mode::Normal,
         }
     }
 
@@ -901,6 +906,7 @@ mod tests {
         assert_eq!(Mode::MigrationPreview.to_string(), "MigrationPreview");
         assert_eq!(Mode::LlmPending.to_string(), "LlmPending");
         assert_eq!(Mode::LlmPreview.to_string(), "LlmPreview");
+        assert_eq!(Mode::Help.to_string(), "Help");
     }
 
     #[test]
