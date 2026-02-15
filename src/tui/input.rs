@@ -1,11 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sqlx::PgPool;
 
-use super::app::{AppState, FocusTarget, Mode, PendingKey};
+use super::app::{AppState, FocusTarget, MigrationPreviewState, Mode, PendingKey};
 use super::edit;
 use super::fuzzy::SearchFilter;
 use super::goto::{self, GotoResult};
 use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
+use crate::schema::diff::{self, Rename};
 
 /// Process a key event and return the new application state.
 ///
@@ -32,6 +33,7 @@ pub fn handle_key(
         Mode::Edit => (edit::handle_edit(state, key), None),
         Mode::Rename => (edit::handle_rename(state, key), None),
         Mode::HUD => handle_hud(state, key, pool),
+        Mode::MigrationPreview => (handle_migration_preview(state, key), None),
     }
 }
 
@@ -106,6 +108,12 @@ fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
 }
 
 /// Handle key events in Command mode.
+///
+/// Public for integration tests that simulate the :w workflow without a pool.
+pub fn handle_command_for_test(state: AppState, key: KeyEvent) -> AppState {
+    handle_command(state, key)
+}
+
 fn handle_command(state: AppState, key: KeyEvent) -> AppState {
     match key.code {
         KeyCode::Esc => state.with_mode(Mode::Normal),
@@ -128,10 +136,110 @@ fn handle_command(state: AppState, key: KeyEvent) -> AppState {
 fn execute_command(state: AppState) -> AppState {
     let cmd = state.command_buf.trim().to_string();
     let state = state.with_mode(Mode::Normal);
-    match cmd.as_str() {
-        "q" => state.quit(),
-        // Future: :w, :w!, :ai, etc.
-        _ => state, // Unknown command, ignore
+
+    if cmd == "q" {
+        return state.quit();
+    }
+
+    // :w or :w <description>
+    if cmd == "w" || cmd.starts_with("w ") {
+        let description = if cmd.len() > 2 {
+            cmd[2..].trim().to_string()
+        } else {
+            String::new()
+        };
+        return execute_write_migration(state, description);
+    }
+
+    state // Unknown command, ignore
+}
+
+/// Generate migration SQL and show preview, or report no changes.
+fn execute_write_migration(state: AppState, description: String) -> AppState {
+    let original = match &state.original_schema {
+        Some(orig) => orig,
+        None => {
+            return state.with_status_message("No schema changes to migrate".into());
+        }
+    };
+
+    // Convert RenameMetadata to diff::Rename
+    let renames: Vec<Rename> = state
+        .renames
+        .iter()
+        .map(|r| Rename {
+            table: r.table.clone(),
+            from: r.from.clone(),
+            to: r.to.clone(),
+        })
+        .collect();
+
+    let changes = diff::diff(original, &state.schema, &renames);
+    if changes.is_empty() {
+        return state.with_status_message("No schema changes to migrate".into());
+    }
+
+    let sql = crate::migration::generate_sql(&changes);
+
+    // Auto-generate description from changes if none provided
+    let description = if description.is_empty() {
+        auto_describe(&changes)
+    } else {
+        description
+    };
+
+    let preview = MigrationPreviewState {
+        sql,
+        description,
+        scroll: 0,
+    };
+
+    let mut state = state;
+    state.migration_preview = Some(preview);
+    state.mode = Mode::MigrationPreview;
+    state
+}
+
+/// Generate a human-readable summary from changes for auto-description.
+fn auto_describe(changes: &[diff::Change]) -> String {
+    let mut parts = Vec::new();
+    for change in changes {
+        match change {
+            diff::Change::AddTable(t) => parts.push(format!("add_{}", t.name)),
+            diff::Change::DropTable(name) => parts.push(format!("drop_{name}")),
+            diff::Change::AddColumn { table, column } => {
+                parts.push(format!("add_{}_to_{table}", column.name));
+            }
+            diff::Change::DropColumn { table, column } => {
+                parts.push(format!("drop_{column}_from_{table}"));
+            }
+            diff::Change::AlterColumn {
+                table,
+                column,
+                changes,
+            } => {
+                if changes.rename.is_some() {
+                    parts.push(format!("rename_{column}_in_{table}"));
+                } else {
+                    parts.push(format!("alter_{column}_in_{table}"));
+                }
+            }
+            diff::Change::AddConstraint { table, .. } => {
+                parts.push(format!("add_constraint_to_{table}"));
+            }
+            diff::Change::DropConstraint { table, name } => {
+                parts.push(format!("drop_{name}_from_{table}"));
+            }
+            diff::Change::AddIndex { table, index } => {
+                parts.push(format!("add_{}_on_{table}", index.name));
+            }
+            diff::Change::DropIndex(name) => parts.push(format!("drop_{name}")),
+        }
+    }
+    if parts.len() <= 3 {
+        parts.join("_and_")
+    } else {
+        format!("{}_and_{}_more_changes", parts[0], parts.len() - 1)
     }
 }
 
@@ -317,6 +425,110 @@ fn open_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle
     (state, Some(handle))
 }
 
+/// Handle key events in MigrationPreview mode (public for integration tests).
+pub fn handle_migration_preview_for_test(state: AppState, key: KeyEvent) -> AppState {
+    handle_migration_preview(state, key)
+}
+
+/// Handle key events in MigrationPreview mode.
+///
+/// Enter confirms and writes the migration file. Esc cancels.
+/// j/k or Up/Down scroll the preview.
+fn handle_migration_preview(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => state.with_mode(Mode::Normal),
+        KeyCode::Enter => confirm_migration(state),
+        KeyCode::Char('j') | KeyCode::Down => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.migration_preview {
+                preview.scroll = preview.scroll.saturating_add(1);
+            }
+            state
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.migration_preview {
+                preview.scroll = preview.scroll.saturating_sub(1);
+            }
+            state
+        }
+        _ => state,
+    }
+}
+
+/// Write the migration file and clear edit state.
+fn confirm_migration(state: AppState) -> AppState {
+    let preview = match &state.migration_preview {
+        Some(p) => p,
+        None => return state.with_mode(Mode::Normal),
+    };
+
+    let sql = preview.sql.clone();
+    let description = preview.description.clone();
+
+    // Generate timestamp: YYYYMMDDHHMMSS
+    let now = std::time::SystemTime::now();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    // Convert to rough datetime components (no chrono dependency)
+    let timestamp = format_timestamp(secs);
+
+    let migrations_dir = std::path::Path::new("migrations");
+    if let Err(e) = std::fs::create_dir_all(migrations_dir) {
+        return state
+            .with_mode(Mode::Normal)
+            .with_status_message(format!("Failed to create migrations directory: {e}"));
+    }
+
+    match crate::migration::write_migration(migrations_dir, &description, &sql, &timestamp) {
+        Ok(path) => {
+            let filename = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            state
+                .clear_edit_state()
+                .with_mode(Mode::Normal)
+                .with_status_message(format!("Migration written: {filename}"))
+        }
+        Err(e) => state
+            .with_mode(Mode::Normal)
+            .with_status_message(format!("Failed to write migration: {e}")),
+    }
+}
+
+/// Format a unix timestamp as YYYYMMDDHHMMSS.
+fn format_timestamp(secs: u64) -> String {
+    // Days since epoch
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    // Convert days to y/m/d using a civil calendar algorithm
+    let (year, month, day) = days_to_civil(days as i64);
+    format!("{year:04}{month:02}{day:02}{hours:02}{minutes:02}{seconds:02}")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Algorithm from Howard Hinnant's chrono-compatible date algorithms.
+fn days_to_civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// Handle 'y' key in HUD mode to confirm a safety warning and run the query.
 fn confirm_safety_warning(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle>) {
     let hud = match &state.hud {
@@ -414,6 +626,7 @@ mod tests {
                     state
                 }
             }
+            Mode::MigrationPreview => handle_migration_preview(state, key),
         }
     }
 
@@ -585,6 +798,13 @@ mod tests {
         let state = sample_state().with_mode(Mode::HUD);
         let state = handle_key_no_pool(state, key(KeyCode::Esc));
         assert_eq!(state.mode, Mode::Normal, "Esc should exit HUD mode");
+    }
+
+    #[test]
+    fn esc_exits_migration_preview_mode() {
+        let state = sample_state().with_mode(Mode::MigrationPreview);
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal, "Esc should exit MigrationPreview");
     }
 
     // --- Enter toggles expand/collapse ---
@@ -1144,5 +1364,212 @@ mod tests {
 
         let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
         assert!(state.status_message.is_none());
+    }
+
+    // --- Migration workflow (:w command) ---
+
+    fn edited_state() -> AppState {
+        use crate::schema::types::PgType;
+        use crate::schema::Column;
+        use crate::tui::edit;
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+        let state = AppState::new(schema, "test".into()).with_viewport_height(20);
+
+        // Enter edit mode and add a column
+        let state = state.toggle_expand();
+        let state = edit::enter_edit_mode(state);
+        let mut state = state;
+        // Insert a bio column line before the closing brace
+        let close_idx = state
+            .edit_buffer
+            .iter()
+            .position(|l| l.trim() == "}")
+            .expect("closing brace");
+        state
+            .edit_buffer
+            .insert(close_idx, "    bio  text".to_string());
+        // Exit edit mode (parses and updates schema)
+        edit::handle_edit(state, key(KeyCode::Esc))
+    }
+
+    #[test]
+    fn command_w_without_edits_shows_no_changes() {
+        let state = sample_state().with_mode(Mode::Command);
+        // Type "w" and press Enter
+        let state = handle_key_no_pool(state, key(KeyCode::Char('w')));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No schema changes to migrate")
+        );
+    }
+
+    #[test]
+    fn command_w_with_edits_opens_preview() {
+        let state = edited_state();
+        assert!(state.original_schema.is_some());
+        assert!(state.edited_tables.contains("users"));
+
+        let state = state.with_mode(Mode::Command);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('w')));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        assert_eq!(state.mode, Mode::MigrationPreview);
+        assert!(state.migration_preview.is_some());
+        let preview = state.migration_preview.as_ref().unwrap();
+        assert!(preview.sql.contains("ALTER TABLE"));
+        assert!(!preview.description.is_empty());
+    }
+
+    #[test]
+    fn command_w_with_description() {
+        let state = edited_state().with_mode(Mode::Command);
+        // Type "w add_bio_to_users"
+        for ch in "w add_bio_to_users".chars() {
+            let state_inner = handle_key_no_pool(state.clone(), key(KeyCode::Char(ch)));
+            // We need to chain properly
+            let _ = state_inner;
+        }
+        // Simpler: manually set command_buf and execute
+        let mut state = edited_state();
+        state.mode = Mode::Command;
+        state.command_buf = "w add_bio_to_users".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        assert_eq!(state.mode, Mode::MigrationPreview);
+        let preview = state.migration_preview.as_ref().unwrap();
+        assert_eq!(preview.description, "add_bio_to_users");
+    }
+
+    #[test]
+    fn migration_preview_esc_cancels() {
+        let state = edited_state();
+        let state = state.with_mode(Mode::Command);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('w')));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::MigrationPreview);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.migration_preview.is_none());
+        // Edit state should still be intact (not cleared on cancel)
+        assert!(state.original_schema.is_some());
+        assert!(!state.edited_tables.is_empty());
+    }
+
+    #[test]
+    fn migration_preview_scroll() {
+        let state = edited_state();
+        let mut state = state.with_mode(Mode::Command);
+        state.command_buf = "w test".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::MigrationPreview);
+
+        // Scroll down
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert_eq!(state.migration_preview.as_ref().unwrap().scroll, 1);
+
+        // Scroll up
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.migration_preview.as_ref().unwrap().scroll, 0);
+
+        // Can't scroll past 0
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.migration_preview.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn migration_preview_confirm_writes_file() {
+        let state = edited_state();
+        let mut state = state.with_mode(Mode::Command);
+        state.command_buf = "w test_migration".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::MigrationPreview);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+
+        // Edit state should be cleared
+        assert!(state.renames.is_empty());
+        assert!(state.edited_tables.is_empty());
+
+        // Status message should indicate success
+        let msg = state.status_message.as_deref().unwrap_or("");
+        assert!(msg.starts_with("Migration written:"), "got: {msg}");
+        assert!(msg.contains("test_migration"));
+
+        // Cleanup: remove the migration file
+        let _ = std::fs::remove_dir_all("migrations");
+    }
+
+    #[test]
+    fn migration_preview_confirm_clears_edit_state() {
+        let state = edited_state();
+        assert!(state.original_schema.is_some());
+        assert!(!state.renames.is_empty() || !state.edited_tables.is_empty());
+
+        let mut state = state.with_mode(Mode::Command);
+        state.command_buf = "w clear_state_test".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        // After confirm, original_schema should be updated to current
+        assert!(state.original_schema.is_some());
+        assert!(state.renames.is_empty());
+        assert!(state.edited_tables.is_empty());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all("migrations");
+    }
+
+    #[test]
+    fn timestamp_format() {
+        // Test known epoch values
+        assert_eq!(format_timestamp(0), "19700101000000");
+        // 2026-02-14 12:00:00 UTC
+        let ts = 1771070400;
+        let result = format_timestamp(ts);
+        assert!(result.starts_with("2026"), "got: {result}");
+        assert_eq!(result.len(), 14);
+    }
+
+    #[test]
+    fn auto_describe_single_change() {
+        let changes = vec![diff::Change::AddColumn {
+            table: "users".into(),
+            column: crate::schema::Column::new("bio", crate::schema::types::PgType::Text),
+        }];
+        let desc = auto_describe(&changes);
+        assert_eq!(desc, "add_bio_to_users");
+    }
+
+    #[test]
+    fn auto_describe_many_changes() {
+        let changes = vec![
+            diff::Change::AddColumn {
+                table: "users".into(),
+                column: crate::schema::Column::new("bio", crate::schema::types::PgType::Text),
+            },
+            diff::Change::AddColumn {
+                table: "users".into(),
+                column: crate::schema::Column::new("avatar", crate::schema::types::PgType::Text),
+            },
+            diff::Change::AddColumn {
+                table: "users".into(),
+                column: crate::schema::Column::new("phone", crate::schema::types::PgType::Text),
+            },
+            diff::Change::DropColumn {
+                table: "users".into(),
+                column: "legacy".into(),
+            },
+        ];
+        let desc = auto_describe(&changes);
+        assert!(desc.contains("3_more_changes"));
     }
 }

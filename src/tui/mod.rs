@@ -202,6 +202,11 @@ fn draw(frame: &mut Frame, state: &AppState) {
                 fuzzy::render_search_overlay(frame, layout[1], search);
             }
         }
+        Mode::MigrationPreview => {
+            if let Some(ref preview) = state.migration_preview {
+                render_migration_preview(frame, layout[1], preview);
+            }
+        }
         _ => {}
     }
 
@@ -306,6 +311,73 @@ fn draw_edit_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &App
     frame.render_widget(content, inner);
 }
 
+/// Render the migration preview overlay.
+fn render_migration_preview(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    preview: &app::MigrationPreviewState,
+) {
+    use ratatui::widgets::Clear;
+
+    let sql_lines: Vec<&str> = preview.sql.lines().collect();
+    let total_lines = sql_lines.len();
+
+    // Use the full content area for the overlay
+    frame.render_widget(Clear, area);
+
+    let title = format!(" Migration: {} ", preview.description);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible_height = inner.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = preview.scroll.min(max_scroll);
+
+    let mut lines: Vec<Line> = sql_lines
+        .iter()
+        .skip(scroll)
+        .take(visible_height.saturating_sub(2)) // leave room for footer
+        .map(|line| {
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+
+    // Add separator and footer instructions
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Enter",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" confirm  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let content = Paragraph::new(lines);
+    frame.render_widget(content, inner);
+}
+
 /// Render the status bar with current mode and context info.
 fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let mode_style = match state.mode {
@@ -316,6 +388,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::HUD => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
         Mode::SpaceMenu => Style::default().fg(Color::Black).bg(Color::Cyan),
+        Mode::MigrationPreview => Style::default().fg(Color::Black).bg(Color::Green),
     };
 
     let mode_label = format!(" {} ", state.mode);
@@ -363,6 +436,14 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         spans.push(Span::styled(
             format!(" Error: {err}"),
             Style::default().fg(Color::Red),
+        ));
+    }
+
+    // Show status message
+    if let Some(ref msg) = state.status_message {
+        spans.push(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::Green),
         ));
     }
 
