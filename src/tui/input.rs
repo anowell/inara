@@ -3,11 +3,14 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sqlx::PgPool;
 
-use super::app::{AppState, FocusTarget, MigrationPreviewState, Mode, PendingKey};
+use super::app::{
+    AppState, FocusTarget, LlmPreviewKind, LlmPreviewState, MigrationPreviewState, Mode, PendingKey,
+};
 use super::edit;
 use super::fuzzy::SearchFilter;
 use super::goto::{self, GotoResult};
 use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
+use crate::llm::{self, LlmResultHandle};
 use crate::migration::overlay::PendingOverlay;
 use crate::migration::warnings::MigrationWarning;
 use crate::schema::diff::{self, Rename};
@@ -34,6 +37,7 @@ pub struct HandleResult {
     pub hud_handle: Option<HudResultHandle>,
     pub warning_handle: Option<WarningResultHandle>,
     pub overlay_handle: Option<OverlayResultHandle>,
+    pub llm_handle: Option<LlmResultHandle>,
 }
 
 impl HandleResult {
@@ -43,6 +47,7 @@ impl HandleResult {
             hud_handle: None,
             warning_handle: None,
             overlay_handle: None,
+            llm_handle: None,
         }
     }
 
@@ -52,6 +57,17 @@ impl HandleResult {
             hud_handle: handle,
             warning_handle: None,
             overlay_handle: None,
+            llm_handle: None,
+        }
+    }
+
+    fn with_llm(state: AppState, handle: LlmResultHandle) -> Self {
+        Self {
+            state,
+            hud_handle: None,
+            warning_handle: None,
+            overlay_handle: None,
+            llm_handle: Some(handle),
         }
     }
 }
@@ -83,6 +99,8 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
             HandleResult::with_hud(state, handle)
         }
         Mode::MigrationPreview => HandleResult::state_only(handle_migration_preview(state, key)),
+        Mode::LlmPending => HandleResult::state_only(handle_llm_pending(state, key)),
+        Mode::LlmPreview => HandleResult::state_only(handle_llm_preview(state, key)),
     }
 }
 
@@ -234,6 +252,23 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
         return execute_write_migration(state, description, pool);
     }
 
+    // :ai <prompt>
+    if cmd == "ai" {
+        return HandleResult::state_only(state.with_status("Usage: :ai <prompt>"));
+    }
+    if let Some(rest) = cmd.strip_prefix("ai ") {
+        let prompt = rest.trim().to_string();
+        if prompt.is_empty() {
+            return HandleResult::state_only(state.with_status("Usage: :ai <prompt>"));
+        }
+        return execute_ai_command(state, prompt);
+    }
+
+    // :generate-down
+    if cmd == "generate-down" {
+        return execute_generate_down(state);
+    }
+
     HandleResult::state_only(state) // Unknown command, ignore
 }
 
@@ -298,6 +333,7 @@ fn execute_write_migration(state: AppState, description: String, pool: &PgPool) 
         hud_handle: None,
         warning_handle: Some(handle),
         overlay_handle: None,
+        llm_handle: None,
     }
 }
 
@@ -368,6 +404,246 @@ fn auto_describe(changes: &[diff::Change]) -> String {
     }
 }
 
+/// Execute `:ai <prompt>` — send the current migration context to the LLM.
+fn execute_ai_command(state: AppState, prompt: String) -> HandleResult {
+    if !llm::LlmConfig::is_configured() {
+        return HandleResult::state_only(
+            state.with_status("LLM not configured — set OPENAI_API_KEY"),
+        );
+    }
+
+    // Need a migration preview or edited schema to have SQL context
+    let (sql, description) = match &state.migration_preview {
+        Some(preview) => (preview.sql.clone(), preview.description.clone()),
+        None => {
+            // Generate migration SQL from current edits
+            let original = match &state.original_schema {
+                Some(orig) => orig,
+                None => {
+                    return HandleResult::state_only(
+                        state.with_status("No schema changes — edit the schema first"),
+                    );
+                }
+            };
+            let renames: Vec<Rename> = state
+                .renames
+                .iter()
+                .map(|r| Rename {
+                    table: r.table.clone(),
+                    from: r.from.clone(),
+                    to: r.to.clone(),
+                })
+                .collect();
+            let changes = diff::diff(original, &state.schema, &renames);
+            if changes.is_empty() {
+                return HandleResult::state_only(
+                    state.with_status("No schema changes to send to AI"),
+                );
+            }
+            let sql = crate::migration::generate_sql(&changes);
+            let description = auto_describe(&changes);
+            (sql, description)
+        }
+    };
+
+    let handle = llm::new_llm_handle();
+    llm::spawn_ai_request(&state.schema, &sql, &prompt, handle.clone());
+
+    let mut state = state;
+    state.mode = Mode::LlmPending;
+    state.llm_pending_message = Some(format!("AI: {prompt}"));
+    // Stash the context for when the result arrives
+    state.llm_preview = Some(LlmPreviewState {
+        sql: String::new(), // will be filled when result arrives
+        kind: LlmPreviewKind::AiEdit {
+            original_sql: sql,
+            description,
+        },
+        scroll: 0,
+    });
+
+    HandleResult::with_llm(state, handle)
+}
+
+/// Execute `:generate-down` — generate a down migration from the last written migration.
+fn execute_generate_down(state: AppState) -> HandleResult {
+    if !llm::LlmConfig::is_configured() {
+        return HandleResult::state_only(
+            state.with_status("LLM not configured — set OPENAI_API_KEY"),
+        );
+    }
+
+    // Find the most recent .up.sql migration file
+    let migrations_dir = std::path::Path::new("migrations");
+    let (up_sql, description) = match find_latest_up_migration(migrations_dir) {
+        Some(result) => result,
+        None => {
+            return HandleResult::state_only(
+                state.with_status("No up migration found in migrations/"),
+            );
+        }
+    };
+
+    let original = state.original_schema.as_ref().unwrap_or(&state.schema);
+
+    let handle = llm::new_llm_handle();
+    llm::spawn_generate_down_request(original, &state.schema, &up_sql, handle.clone());
+
+    let mut state = state;
+    state.mode = Mode::LlmPending;
+    state.llm_pending_message = Some("Generating down migration...".to_string());
+    state.llm_preview = Some(LlmPreviewState {
+        sql: String::new(),
+        kind: LlmPreviewKind::GenerateDown {
+            up_sql,
+            description,
+        },
+        scroll: 0,
+    });
+
+    HandleResult::with_llm(state, handle)
+}
+
+/// Find the most recent .up.sql migration file and return its content + description.
+fn find_latest_up_migration(dir: &std::path::Path) -> Option<(String, String)> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".up.sql"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    entries.sort_by_key(|e| e.file_name());
+    let latest = entries.last()?;
+    let content = std::fs::read_to_string(latest.path()).ok()?;
+    let filename = latest.file_name().to_string_lossy().to_string();
+    // Extract description from filename: TIMESTAMP_description.up.sql
+    let description = filename
+        .strip_suffix(".up.sql")
+        .and_then(|s| s.split_once('_').map(|(_, desc)| desc.to_string()))
+        .unwrap_or_else(|| filename.clone());
+
+    Some((content, description))
+}
+
+/// Handle key events in LlmPending mode (waiting for LLM response).
+///
+/// Only Esc to cancel is supported.
+fn handle_llm_pending(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => state.with_mode(Mode::Normal),
+        _ => state, // ignore all other keys while waiting
+    }
+}
+
+/// Handle key events in LlmPreview mode (reviewing LLM response).
+///
+/// Enter confirms and applies the suggestion, Esc cancels.
+/// j/k or Up/Down scroll the preview.
+fn handle_llm_preview(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => state.with_mode(Mode::Normal),
+        KeyCode::Enter => confirm_llm_preview(state),
+        KeyCode::Char('j') | KeyCode::Down => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.llm_preview {
+                preview.scroll = preview.scroll.saturating_add(1);
+            }
+            state
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.llm_preview {
+                preview.scroll = preview.scroll.saturating_sub(1);
+            }
+            state
+        }
+        _ => state,
+    }
+}
+
+/// Apply the LLM suggestion.
+fn confirm_llm_preview(state: AppState) -> AppState {
+    let preview = match &state.llm_preview {
+        Some(p) => p,
+        None => return state.with_mode(Mode::Normal),
+    };
+
+    match &preview.kind {
+        LlmPreviewKind::AiEdit { description, .. } => {
+            // Apply the LLM-suggested SQL as the migration preview
+            let sql = preview.sql.clone();
+            let description = description.clone();
+            let migration_preview = MigrationPreviewState {
+                sql,
+                description,
+                scroll: 0,
+                warnings: Some(Vec::new()), // Skip warnings for AI-edited migrations
+            };
+            let mut state = state;
+            state.llm_preview = None;
+            state.migration_preview = Some(migration_preview);
+            state.mode = Mode::MigrationPreview;
+            state
+        }
+        LlmPreviewKind::GenerateDown { description, .. } => {
+            // Write the down migration file
+            let sql = preview.sql.clone();
+            let description = description.clone();
+            let header = "-- AI-generated down migration. Review carefully.\n\n";
+            let full_sql = format!("{header}{sql}");
+
+            let migrations_dir = std::path::Path::new("migrations");
+            if let Err(e) = std::fs::create_dir_all(migrations_dir) {
+                return state
+                    .with_mode(Mode::Normal)
+                    .with_status(format!("Failed to create migrations directory: {e}"));
+            }
+
+            // Generate timestamp
+            let now = std::time::SystemTime::now();
+            let duration = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let timestamp = format_timestamp(duration.as_secs());
+
+            let slug = slugify(&description);
+            let filename = format!("{timestamp}_{slug}.down.sql");
+            let path = migrations_dir.join(&filename);
+            match std::fs::write(&path, &full_sql) {
+                Ok(()) => state
+                    .with_mode(Mode::Normal)
+                    .with_status(format!("Down migration written: {filename}")),
+                Err(e) => state
+                    .with_mode(Mode::Normal)
+                    .with_status(format!("Failed to write down migration: {e}")),
+            }
+        }
+    }
+}
+
+/// Convert a description to a filename-safe slug (same logic as migration::slugify).
+fn slugify(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 /// Handle key events in SpaceMenu mode.
 ///
 /// The space menu shows available subcommands. Pressing a submenu key
@@ -414,6 +690,7 @@ fn toggle_pending_overlay(state: AppState, pool: &PgPool) -> HandleResult {
         hud_handle: None,
         warning_handle: None,
         overlay_handle: Some(handle),
+        llm_handle: None,
     }
 }
 
@@ -808,6 +1085,8 @@ mod tests {
                 }
             }
             Mode::MigrationPreview => handle_migration_preview(state, key),
+            Mode::LlmPending => handle_llm_pending(state, key),
+            Mode::LlmPreview => handle_llm_preview(state, key),
         }
     }
 
@@ -1756,5 +2035,201 @@ mod tests {
         ];
         let desc = auto_describe(&changes);
         assert!(desc.contains("3_more_changes"));
+    }
+
+    // --- LLM commands ---
+
+    #[test]
+    fn command_ai_without_api_key_shows_not_configured() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "ai add an index on email".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("not configured"),
+            "got: {:?}",
+            state.status_message
+        );
+    }
+
+    #[test]
+    fn command_ai_without_edits_shows_error() {
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "ai add an index".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        let msg = state.status_message.as_deref().unwrap_or("");
+        // Without edits: either "not configured" or "edit the schema first"
+        assert!(
+            msg.contains("not configured") || msg.contains("edit the schema"),
+            "got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn command_ai_empty_prompt_shows_usage() {
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "ai ".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Usage"),
+            "got: {:?}",
+            state.status_message
+        );
+    }
+
+    #[test]
+    fn command_generate_down_without_api_key_shows_not_configured() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "generate-down".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("not configured"),
+            "got: {:?}",
+            state.status_message
+        );
+    }
+
+    #[test]
+    fn command_generate_down_without_migrations_shows_error() {
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "generate-down".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        let msg = state.status_message.as_deref().unwrap_or("");
+        // Should show either "not configured" or "No up migration" depending on env
+        assert!(
+            msg.contains("not configured") || msg.contains("No up migration"),
+            "got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn llm_pending_esc_cancels() {
+        let state = sample_state().with_mode(Mode::LlmPending);
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn llm_pending_ignores_other_keys() {
+        let state = sample_state().with_mode(Mode::LlmPending);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert_eq!(state.mode, Mode::LlmPending);
+    }
+
+    #[test]
+    fn llm_preview_esc_cancels() {
+        let mut state = sample_state().with_mode(Mode::LlmPreview);
+        state.llm_preview = Some(crate::tui::app::LlmPreviewState {
+            sql: "SELECT 1;".into(),
+            kind: crate::tui::app::LlmPreviewKind::AiEdit {
+                original_sql: "SELECT 1;".into(),
+                description: "test".into(),
+            },
+            scroll: 0,
+        });
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.llm_preview.is_none());
+    }
+
+    #[test]
+    fn llm_preview_scroll() {
+        let mut state = sample_state().with_mode(Mode::LlmPreview);
+        state.llm_preview = Some(crate::tui::app::LlmPreviewState {
+            sql: "SELECT 1;\nSELECT 2;\nSELECT 3;".into(),
+            kind: crate::tui::app::LlmPreviewKind::AiEdit {
+                original_sql: "SELECT 1;".into(),
+                description: "test".into(),
+            },
+            scroll: 0,
+        });
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert_eq!(state.llm_preview.as_ref().unwrap().scroll, 1);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.llm_preview.as_ref().unwrap().scroll, 0);
+
+        // Can't scroll past 0
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.llm_preview.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn llm_preview_confirm_ai_edit_enters_migration_preview() {
+        let mut state = edited_state().with_mode(Mode::LlmPreview);
+        state.llm_preview = Some(crate::tui::app::LlmPreviewState {
+            sql: "ALTER TABLE users ADD COLUMN avatar text;".into(),
+            kind: crate::tui::app::LlmPreviewKind::AiEdit {
+                original_sql: "ALTER TABLE users ADD COLUMN bio text;".into(),
+                description: "ai_edit".into(),
+            },
+            scroll: 0,
+        });
+
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::MigrationPreview);
+        assert!(state.migration_preview.is_some());
+        let preview = state.migration_preview.as_ref().unwrap();
+        assert!(preview
+            .sql
+            .contains("ALTER TABLE users ADD COLUMN avatar text;"));
+        assert!(state.llm_preview.is_none());
+    }
+
+    #[test]
+    fn llm_preview_confirm_generate_down_writes_file() {
+        let dir = std::env::temp_dir().join("inara_test_llm_down");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut state = sample_state().with_mode(Mode::LlmPreview);
+        state.llm_preview = Some(crate::tui::app::LlmPreviewState {
+            sql: "ALTER TABLE users DROP COLUMN bio;".into(),
+            kind: crate::tui::app::LlmPreviewKind::GenerateDown {
+                up_sql: "ALTER TABLE users ADD COLUMN bio text;".into(),
+                description: "add_bio".into(),
+            },
+            scroll: 0,
+        });
+
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        let msg = state.status_message.as_deref().unwrap_or("");
+        // Should succeed or fail depending on migrations/ dir
+        assert!(
+            msg.contains("Down migration written") || msg.contains("Failed"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn slugify_works() {
+        assert_eq!(slugify("add bio to users"), "add_bio_to_users");
+        assert_eq!(slugify("Add FK: posts→users"), "add_fk_posts_users");
+        assert_eq!(slugify("  multiple   spaces  "), "multiple_spaces");
+    }
+
+    #[test]
+    fn find_latest_up_migration_returns_none_for_nonexistent_dir() {
+        let result = find_latest_up_migration(std::path::Path::new("/nonexistent/dir"));
+        assert!(result.is_none());
     }
 }

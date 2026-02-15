@@ -141,6 +141,7 @@ fn run_event_loop(
     let mut hud_handle: Option<HudResultHandle> = None;
     let mut warning_handle: Option<WarningResultHandle> = None;
     let mut overlay_handle: Option<OverlayResultHandle> = None;
+    let mut llm_handle: Option<crate::llm::LlmResultHandle> = None;
 
     loop {
         // Update viewport height from terminal size
@@ -203,6 +204,27 @@ fn run_event_loop(
             overlay_handle = None;
         }
 
+        // Poll for LLM results
+        if let Some(ref handle) = llm_handle {
+            if let Ok(mut guard) = handle.lock() {
+                if let Some(result) = guard.take() {
+                    match result {
+                        crate::llm::LlmResult::Success(sql) => {
+                            if let Some(ref mut preview) = state.llm_preview {
+                                preview.sql = sql;
+                            }
+                            state.mode = Mode::LlmPreview;
+                        }
+                        crate::llm::LlmResult::Error(err) => {
+                            state = state
+                                .with_mode(Mode::Normal)
+                                .with_status(format!("LLM error: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+
         // Check pending key timeout (1 second)
         if state.is_pending_key_expired(Duration::from_secs(1)) {
             state = state
@@ -233,12 +255,18 @@ fn run_event_loop(
                         if let Some(h) = result.overlay_handle {
                             overlay_handle = Some(h);
                         }
+                        if let Some(h) = result.llm_handle {
+                            llm_handle = Some(h);
+                        }
                         // Clear handles when leaving respective modes
                         if state.mode != Mode::HUD {
                             hud_handle = None;
                         }
                         if state.mode != Mode::MigrationPreview {
                             warning_handle = None;
+                        }
+                        if state.mode != Mode::LlmPending && state.mode != Mode::LlmPreview {
+                            llm_handle = None;
                         }
                     }
                 }
@@ -280,6 +308,14 @@ fn draw(frame: &mut Frame, state: &AppState) {
         Mode::MigrationPreview => {
             if let Some(ref preview) = state.migration_preview {
                 render_migration_preview(frame, layout[1], preview);
+            }
+        }
+        Mode::LlmPending => {
+            render_llm_pending(frame, layout[1], state);
+        }
+        Mode::LlmPreview => {
+            if let Some(ref preview) = state.llm_preview {
+                render_llm_preview(frame, layout[1], preview);
             }
         }
         _ => {}
@@ -502,6 +538,130 @@ fn render_migration_preview(
     frame.render_widget(content, inner);
 }
 
+/// Render the LLM pending overlay (loading indicator).
+fn render_llm_pending(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    use ratatui::widgets::Clear;
+
+    frame.render_widget(Clear, area);
+
+    let msg = state
+        .llm_pending_message
+        .as_deref()
+        .unwrap_or("Waiting for LLM...");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" AI ")
+        .title_style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {msg}"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::ITALIC),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let content = Paragraph::new(lines);
+    frame.render_widget(content, inner);
+}
+
+/// Render the LLM preview overlay (reviewing response).
+fn render_llm_preview(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    preview: &app::LlmPreviewState,
+) {
+    use ratatui::widgets::Clear;
+
+    frame.render_widget(Clear, area);
+
+    let title = match &preview.kind {
+        app::LlmPreviewKind::AiEdit { .. } => " AI Suggestion ",
+        app::LlmPreviewKind::GenerateDown { .. } => " AI Down Migration ",
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut content_lines: Vec<Line> = Vec::new();
+
+    // AI-generated notice
+    content_lines.push(Line::from(Span::styled(
+        " AI-generated — review carefully",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    content_lines.push(Line::from(""));
+
+    // SQL content
+    for sql_line in preview.sql.lines() {
+        content_lines.push(Line::from(Span::styled(
+            sql_line.to_string(),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    let total_lines = content_lines.len();
+    let visible_height = inner.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = preview.scroll.min(max_scroll);
+
+    let mut lines: Vec<Line> = content_lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible_height.saturating_sub(2)) // leave room for footer
+        .collect();
+
+    // Footer instructions
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Enter",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" confirm  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let content = Paragraph::new(lines);
+    frame.render_widget(content, inner);
+}
+
 /// Render the status bar with current mode and context info.
 fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let mode_style = match state.mode {
@@ -513,6 +673,8 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
         Mode::SpaceMenu => Style::default().fg(Color::Black).bg(Color::Cyan),
         Mode::MigrationPreview => Style::default().fg(Color::Black).bg(Color::Green),
+        Mode::LlmPending => Style::default().fg(Color::Black).bg(Color::Magenta),
+        Mode::LlmPreview => Style::default().fg(Color::Black).bg(Color::Magenta),
     };
 
     let mode_label = format!(" {} ", state.mode);

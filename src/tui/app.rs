@@ -23,6 +23,8 @@ pub enum Mode {
     Command,
     SpaceMenu,
     MigrationPreview,
+    LlmPending,
+    LlmPreview,
 }
 
 /// Metadata for a rename operation. Recorded so the diff engine can
@@ -56,6 +58,36 @@ pub struct MigrationPreviewState {
     /// Safety warnings from pre-flight checks.
     /// `None` = checks still running, `Some` = checks complete.
     pub warnings: Option<Vec<crate::migration::warnings::MigrationWarning>>,
+}
+
+/// State for the LLM preview overlay.
+#[derive(Debug, Clone)]
+pub struct LlmPreviewState {
+    /// The LLM-generated SQL to display.
+    pub sql: String,
+    /// What kind of LLM operation produced this preview.
+    pub kind: LlmPreviewKind,
+    /// Scroll offset in the preview.
+    pub scroll: usize,
+}
+
+/// What kind of LLM operation is being previewed.
+#[derive(Debug, Clone)]
+pub enum LlmPreviewKind {
+    /// `:ai <prompt>` — edit the migration SQL.
+    AiEdit {
+        /// The original migration SQL before LLM edit.
+        original_sql: String,
+        /// The migration description.
+        description: String,
+    },
+    /// `:generate-down` — generate a down migration.
+    GenerateDown {
+        /// The up migration SQL (for finding the matching .down.sql path).
+        up_sql: String,
+        /// The migration description.
+        description: String,
+    },
 }
 
 /// Pending key state for multi-key sequences (e.g. `gg`, `g r`).
@@ -187,6 +219,10 @@ pub struct AppState {
     pub pending_overlay: Option<PendingOverlay>,
     /// Whether the pending overlay is currently visible.
     pub show_pending_overlay: bool,
+    /// LLM preview state (present when mode is LlmPreview).
+    pub llm_preview: Option<LlmPreviewState>,
+    /// Pending LLM operation description (shown during LlmPending mode).
+    pub llm_pending_message: Option<String>,
 }
 
 impl AppState {
@@ -228,6 +264,8 @@ impl AppState {
             show_rust_types: false,
             pending_overlay: None,
             show_pending_overlay: false,
+            llm_preview: None,
+            llm_pending_message: None,
         }
     }
 
@@ -259,6 +297,12 @@ impl AppState {
         }
         if mode != Mode::MigrationPreview {
             self.migration_preview = None;
+        }
+        if mode != Mode::LlmPreview {
+            self.llm_preview = None;
+        }
+        if mode != Mode::LlmPending {
+            self.llm_pending_message = None;
         }
         // Clear status message on any mode transition
         self.status_message = None;
@@ -855,6 +899,8 @@ mod tests {
         assert_eq!(Mode::Command.to_string(), "Command");
         assert_eq!(Mode::SpaceMenu.to_string(), "SpaceMenu");
         assert_eq!(Mode::MigrationPreview.to_string(), "MigrationPreview");
+        assert_eq!(Mode::LlmPending.to_string(), "LlmPending");
+        assert_eq!(Mode::LlmPreview.to_string(), "LlmPreview");
     }
 
     #[test]
