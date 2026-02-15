@@ -6,5 +6,19 @@ description = "A terminal-native schema explorer and migration generator for sql
 license = "MIT"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+color-eyre = "0.6"
+crossterm = "0.28"
+itertools = "0.14"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+strum = { version = "0.27", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+insta = "1"
+proptest = "1"
