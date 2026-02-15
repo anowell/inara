@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::{AppState, Mode, PendingKey};
+use super::fuzzy::SearchFilter;
 
 /// Process a key event and return the new application state.
 ///
@@ -14,8 +15,10 @@ pub fn handle_key(state: AppState, key: KeyEvent) -> AppState {
     match state.mode {
         Mode::Normal => handle_normal(state, key),
         Mode::Command => handle_command(state, key),
+        Mode::SpaceMenu => handle_space_menu(state, key),
+        Mode::Search => handle_search(state, key),
         // Other modes are placeholders for future beads
-        Mode::Edit | Mode::Search | Mode::HUD => {
+        Mode::Edit | Mode::HUD => {
             if key.code == KeyCode::Esc {
                 state.with_mode(Mode::Normal)
             } else {
@@ -59,6 +62,7 @@ fn handle_normal(state: AppState, key: KeyEvent) -> AppState {
 
         // Mode transitions
         KeyCode::Char(':') => state.with_mode(Mode::Command),
+        KeyCode::Char(' ') => state.with_mode(Mode::SpaceMenu),
 
         // Ignore unmapped keys
         _ => state,
@@ -102,6 +106,94 @@ fn execute_command(state: AppState) -> AppState {
         "q" => state.quit(),
         // Future: :w, :w!, :ai, etc.
         _ => state, // Unknown command, ignore
+    }
+}
+
+/// Handle key events in SpaceMenu mode.
+///
+/// The space menu shows available subcommands. Pressing a submenu key
+/// immediately opens the corresponding search filter. Esc or any
+/// unrecognized key dismisses the menu.
+fn handle_space_menu(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Char('f') => state.enter_search(SearchFilter::All),
+        KeyCode::Char('t') => state.enter_search(SearchFilter::Tables),
+        KeyCode::Char('c') => state.enter_search(SearchFilter::Columns),
+        KeyCode::Char('m') => state.enter_search(SearchFilter::Migrations),
+        KeyCode::Esc | KeyCode::Char(' ') => state.with_mode(Mode::Normal),
+        _ => state.with_mode(Mode::Normal), // dismiss on unknown key
+    }
+}
+
+/// Handle key events in Search mode.
+///
+/// Captures typed characters into the search query, navigates results with
+/// Up/Down or Ctrl-p/Ctrl-n, selects with Enter, and dismisses with Esc.
+fn handle_search(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => state.with_mode(Mode::Normal),
+        KeyCode::Enter => {
+            // Select the current result and jump to it
+            let symbol = state
+                .search
+                .as_ref()
+                .and_then(|s| s.selected_result())
+                .map(|r| r.symbol.clone());
+            let state = state.with_mode(Mode::Normal);
+            if let Some(sym) = symbol {
+                state.jump_to_symbol(&sym)
+            } else {
+                state
+            }
+        }
+        KeyCode::Down => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                state.search = Some(search.select_next());
+            }
+            state
+        }
+        KeyCode::Up => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                state.search = Some(search.select_prev());
+            }
+            state
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                state.search = Some(search.select_next());
+            }
+            state
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                state.search = Some(search.select_prev());
+            }
+            state
+        }
+        KeyCode::Backspace => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                if search.query.is_empty() {
+                    // Exit search if query is empty
+                    state.search = None;
+                    return state.with_mode(Mode::Normal);
+                }
+                state.search = Some(search.pop_char());
+            }
+            state
+        }
+        KeyCode::Char(ch) => {
+            let mut state = state;
+            if let Some(search) = state.search.take() {
+                state.search = Some(search.push_char(ch));
+            }
+            state
+        }
+        _ => state,
     }
 }
 
@@ -270,7 +362,7 @@ mod tests {
 
     #[test]
     fn esc_exits_placeholder_modes() {
-        for mode in [Mode::Edit, Mode::Search, Mode::HUD] {
+        for mode in [Mode::Edit, Mode::HUD] {
             let state = sample_state().with_mode(mode);
             let state = handle_key(state, key(KeyCode::Esc));
             assert_eq!(state.mode, Mode::Normal, "Esc should exit {mode:?}");
@@ -330,5 +422,191 @@ mod tests {
         let state = handle_key(state, key(KeyCode::Char('x'))); // unknown
         assert_eq!(state.pending_key, PendingKey::None);
         assert_eq!(state.cursor, 2); // unchanged
+    }
+
+    // --- Space menu ---
+
+    #[test]
+    fn space_opens_space_menu() {
+        let state = handle_key(sample_state(), key(KeyCode::Char(' ')));
+        assert_eq!(state.mode, Mode::SpaceMenu);
+    }
+
+    #[test]
+    fn space_menu_esc_returns_to_normal() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn space_menu_f_enters_search_all() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Char('f')));
+        assert_eq!(state.mode, Mode::Search);
+        assert!(state.search.is_some());
+        assert_eq!(state.search.as_ref().unwrap().filter, SearchFilter::All);
+    }
+
+    #[test]
+    fn space_menu_t_enters_search_tables() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Char('t')));
+        assert_eq!(state.mode, Mode::Search);
+        assert_eq!(state.search.as_ref().unwrap().filter, SearchFilter::Tables);
+    }
+
+    #[test]
+    fn space_menu_c_enters_search_columns() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Char('c')));
+        assert_eq!(state.mode, Mode::Search);
+        assert_eq!(state.search.as_ref().unwrap().filter, SearchFilter::Columns);
+    }
+
+    #[test]
+    fn space_menu_m_enters_search_migrations() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Char('m')));
+        assert_eq!(state.mode, Mode::Search);
+        assert_eq!(
+            state.search.as_ref().unwrap().filter,
+            SearchFilter::Migrations
+        );
+    }
+
+    #[test]
+    fn space_menu_unknown_dismisses() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key(state, key(KeyCode::Char('z')));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    // --- Search mode ---
+
+    fn search_state() -> AppState {
+        use crate::schema::types::PgType;
+        use crate::schema::Column;
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+
+        let mut posts = Table::new("posts");
+        posts.add_column(Column::new("id", PgType::Uuid));
+        posts.add_column(Column::new("title", PgType::Text));
+        schema.add_table(posts);
+
+        AppState::new(schema, "test".into())
+            .with_viewport_height(20)
+            .enter_search(SearchFilter::All)
+    }
+
+    #[test]
+    fn search_esc_returns_to_normal() {
+        let state = search_state();
+        assert_eq!(state.mode, Mode::Search);
+        let state = handle_key(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.search.is_none());
+    }
+
+    #[test]
+    fn search_typing_updates_query() {
+        let state = search_state();
+        let state = handle_key(state, key(KeyCode::Char('u')));
+        assert_eq!(state.search.as_ref().unwrap().query, "u");
+        let state = handle_key(state, key(KeyCode::Char('s')));
+        assert_eq!(state.search.as_ref().unwrap().query, "us");
+    }
+
+    #[test]
+    fn search_backspace_removes_char() {
+        let state = search_state();
+        let state = handle_key(state, key(KeyCode::Char('u')));
+        let state = handle_key(state, key(KeyCode::Char('s')));
+        let state = handle_key(state, key(KeyCode::Backspace));
+        assert_eq!(state.search.as_ref().unwrap().query, "u");
+    }
+
+    #[test]
+    fn search_backspace_empty_exits() {
+        let state = search_state();
+        let state = handle_key(state, key(KeyCode::Backspace));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn search_down_selects_next() {
+        let state = search_state();
+        assert_eq!(state.search.as_ref().unwrap().selected, 0);
+        let state = handle_key(state, key(KeyCode::Down));
+        assert_eq!(state.search.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn search_up_selects_prev() {
+        let state = search_state();
+        let state = handle_key(state, key(KeyCode::Down));
+        let state = handle_key(state, key(KeyCode::Down));
+        let state = handle_key(state, key(KeyCode::Up));
+        assert_eq!(state.search.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn search_ctrl_n_selects_next() {
+        let state = search_state();
+        let state = handle_key(
+            state,
+            key_with_mod(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.search.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn search_ctrl_p_selects_prev() {
+        let state = search_state();
+        let state = handle_key(state, key(KeyCode::Down));
+        let state = handle_key(
+            state,
+            key_with_mod(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.search.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn search_enter_selects_and_jumps() {
+        let state = search_state();
+        // Type "users" to filter to users table
+        let state = handle_key(state, key(KeyCode::Char('u')));
+        let state = handle_key(state, key(KeyCode::Char('s')));
+        let state = handle_key(state, key(KeyCode::Char('e')));
+        let state = handle_key(state, key(KeyCode::Char('r')));
+        let state = handle_key(state, key(KeyCode::Char('s')));
+
+        // Select the result
+        let state = handle_key(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.search.is_none());
+        // Should have jumped to the "users" table
+        assert_eq!(
+            state.focus(),
+            Some(&crate::tui::app::FocusTarget::Table("users".into()))
+        );
+    }
+
+    #[test]
+    fn search_enter_with_no_results_returns_normal() {
+        let state = search_state();
+        // Type something that won't match
+        let state = handle_key(state, key(KeyCode::Char('z')));
+        let state = handle_key(state, key(KeyCode::Char('z')));
+        let state = handle_key(state, key(KeyCode::Char('z')));
+        assert!(state.search.as_ref().unwrap().results.is_empty());
+
+        let state = handle_key(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
     }
 }

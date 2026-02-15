@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use strum::Display;
 
+use super::fuzzy::SearchState;
 use crate::schema::Schema;
 
 /// The TUI application mode. Determines which input handler processes keys.
@@ -12,6 +13,7 @@ pub enum Mode {
     Search,
     HUD,
     Command,
+    SpaceMenu,
 }
 
 /// Pending key state for multi-key sequences (e.g. `gg`, `g r`).
@@ -101,6 +103,8 @@ pub struct AppState {
     pub expanded: BTreeSet<String>,
     /// The flat document model — one entry per visible line.
     pub doc: Vec<DocLine>,
+    /// Active search state (present when mode is Search).
+    pub search: Option<SearchState>,
 }
 
 impl AppState {
@@ -120,6 +124,7 @@ impl AppState {
             connection_info,
             expanded,
             doc,
+            search: None,
         }
     }
 
@@ -140,6 +145,17 @@ impl AppState {
         if mode == Mode::Command {
             self.command_buf = String::new();
         }
+        if mode != Mode::Search {
+            self.search = None;
+        }
+        self
+    }
+
+    /// Enter search mode with the given filter.
+    pub fn enter_search(mut self, filter: super::fuzzy::SearchFilter) -> Self {
+        self.search = Some(SearchState::new(&self.schema, filter));
+        self.mode = Mode::Search;
+        self.pending_key = PendingKey::None;
         self
     }
 
@@ -172,6 +188,67 @@ impl AppState {
     /// Set viewport height (called on resize).
     pub fn with_viewport_height(mut self, height: usize) -> Self {
         self.viewport_height = height;
+        self.scroll_to_cursor()
+    }
+
+    /// Jump focus to a symbol from search results.
+    ///
+    /// For tables: jumps to the table header (expanding it).
+    /// For columns: jumps to the column line (expanding the parent table).
+    /// For enums/types: jumps to the header line.
+    pub fn jump_to_symbol(mut self, symbol: &super::fuzzy::Symbol) -> Self {
+        use super::fuzzy::SymbolKind;
+
+        match symbol.kind {
+            SymbolKind::Table => {
+                // Expand the table, rebuild doc, find and jump to it
+                if !self.expanded.contains(&symbol.display) {
+                    self.expanded.insert(symbol.display.clone());
+                    self.rebuild_doc();
+                }
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Table(symbol.display.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+            SymbolKind::Column => {
+                // display is "table.column"
+                if let Some((table_name, col_name)) = symbol.display.split_once('.') {
+                    if !self.expanded.contains(table_name) {
+                        self.expanded.insert(table_name.to_string());
+                        self.rebuild_doc();
+                    }
+                    if let Some(pos) = self.doc.iter().position(|l| {
+                        l.target
+                            == FocusTarget::Column(table_name.to_string(), col_name.to_string())
+                    }) {
+                        self.cursor = pos;
+                    }
+                }
+            }
+            SymbolKind::Enum => {
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Enum(symbol.display.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+            SymbolKind::Type => {
+                if let Some(pos) = self
+                    .doc
+                    .iter()
+                    .position(|l| l.target == FocusTarget::Type(symbol.display.clone()))
+                {
+                    self.cursor = pos;
+                }
+            }
+        }
+
         self.scroll_to_cursor()
     }
 
@@ -495,6 +572,7 @@ mod tests {
         assert_eq!(Mode::Search.to_string(), "Search");
         assert_eq!(Mode::HUD.to_string(), "HUD");
         assert_eq!(Mode::Command.to_string(), "Command");
+        assert_eq!(Mode::SpaceMenu.to_string(), "SpaceMenu");
     }
 
     #[test]

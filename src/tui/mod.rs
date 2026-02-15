@@ -1,4 +1,5 @@
 pub mod app;
+pub mod fuzzy;
 pub mod input;
 pub mod view;
 
@@ -161,6 +162,17 @@ fn draw(frame: &mut Frame, state: &AppState) {
     draw_header(frame, layout[0], state);
     draw_content(frame, layout[1], state);
     draw_status_bar(frame, layout[2], state);
+
+    // Render overlays on top of the content area
+    match state.mode {
+        Mode::SpaceMenu => fuzzy::render_space_menu(frame, layout[1]),
+        Mode::Search => {
+            if let Some(ref search) = state.search {
+                fuzzy::render_search_overlay(frame, layout[1], search);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Render the header bar with app name and connection info.
@@ -202,6 +214,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::Search => Style::default().fg(Color::Black).bg(Color::Green),
         Mode::HUD => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
+        Mode::SpaceMenu => Style::default().fg(Color::Black).bg(Color::Cyan),
     };
 
     let mode_label = format!(" {} ", state.mode);
