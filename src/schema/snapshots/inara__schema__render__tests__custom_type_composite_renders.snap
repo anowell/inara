@@ -1,0 +1,9 @@
+---
+source: src/schema/render.rs
+expression: rendered
+---
+composite address {
+    street  text
+    city    text
+    zip     varchar(10)
+}

@@ -1,5 +1,6 @@
 pub mod diff;
 pub mod relations;
+pub mod render;
 pub mod types;
 
 use std::collections::BTreeMap;

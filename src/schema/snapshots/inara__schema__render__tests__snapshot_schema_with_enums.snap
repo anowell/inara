@@ -1,0 +1,21 @@
+---
+source: src/schema/render.rs
+expression: rendered
+---
+enum mood {
+    happy
+    sad
+    neutral
+}
+
+enum status {
+    active
+    inactive
+    pending
+}
+
+table profiles {
+    id      uuid    NOT NULL  PRIMARY KEY
+    mood    mood
+    status  status  NOT NULL
+}

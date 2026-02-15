@@ -1,0 +1,18 @@
+---
+source: src/schema/render.rs
+expression: rendered
+---
+table orders {
+    id         bigint         NOT NULL  UNIQUE
+    tenant_id  uuid           NOT NULL
+    user_id    uuid           NOT NULL
+    amount     numeric(10,2)  NOT NULL
+    status     order_status   NOT NULL
+
+    PRIMARY KEY (tenant_id, id)
+    UNIQUE (tenant_id, user_id)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+    CHECK (amount > 0)
+    INDEX orders_user_idx(user_id)
+    INDEX orders_status_idx(status) WHERE status != 'completed'
+}

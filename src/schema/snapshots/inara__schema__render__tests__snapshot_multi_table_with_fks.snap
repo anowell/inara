@@ -1,0 +1,18 @@
+---
+source: src/schema/render.rs
+expression: rendered
+---
+table posts {
+    id         uuid  NOT NULL  PRIMARY KEY
+    author_id  uuid  NOT NULL
+    title      text  NOT NULL
+    body       text
+
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+    INDEX posts_author_idx(author_id)
+}
+
+table users {
+    id    uuid  NOT NULL  PRIMARY KEY
+    name  text  NOT NULL
+}
