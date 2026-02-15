@@ -1,14 +1,16 @@
 pub mod diff;
+pub mod relations;
 pub mod types;
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use types::{Expression, ForeignKeyRef, PgType, ReferentialAction};
 
 /// Top-level schema model. The single source of truth for all features.
 ///
 /// Uses `BTreeMap` for deterministic iteration order (alphabetical by name).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     pub tables: BTreeMap<String, Table>,
     pub enums: BTreeMap<String, EnumType>,
@@ -63,7 +65,7 @@ impl Default for Schema {
 }
 
 /// A database table with its columns, constraints, and indexes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
@@ -122,7 +124,7 @@ impl Table {
 ///
 /// Column order in `Vec<Column>` reflects the physical table definition
 /// order as reported by `pg_catalog`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub pg_type: PgType,
@@ -158,7 +160,7 @@ impl Column {
 ///
 /// All constraint variants are stored in a single list on the table,
 /// matching how Postgres reports them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Constraint {
     PrimaryKey {
         name: Option<String>,
@@ -182,7 +184,7 @@ pub enum Constraint {
 }
 
 /// A table index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Index {
     pub name: String,
     pub columns: Vec<String>,
@@ -191,21 +193,21 @@ pub struct Index {
 }
 
 /// A Postgres enum type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumType {
     pub name: String,
     pub variants: Vec<String>,
 }
 
 /// A Postgres custom type (domain, composite, or range).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomType {
     pub name: String,
     pub kind: CustomTypeKind,
 }
 
 /// The kind of custom type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustomTypeKind {
     Domain {
         base_type: PgType,

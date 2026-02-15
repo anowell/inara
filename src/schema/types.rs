@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 /// Postgres type representation.
 ///
 /// Covers common types with a `Custom` variant for anything else
 /// (enums, domains, composite types).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PgType {
     Boolean,
     SmallInt,
@@ -67,7 +69,7 @@ impl std::fmt::Display for PgType {
 ///
 /// Enables structural comparison during diffing. The `Raw` variant
 /// is the escape hatch for expressions we can't parse structurally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
     Literal(String),
     FunctionCall(String),
@@ -85,7 +87,7 @@ impl std::fmt::Display for Expression {
 }
 
 /// Foreign key referential action (ON DELETE / ON UPDATE).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReferentialAction {
     NoAction,
     Restrict,
@@ -107,7 +109,7 @@ impl std::fmt::Display for ReferentialAction {
 }
 
 /// Target of a foreign key constraint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyRef {
     pub table: String,
     pub columns: Vec<String>,
