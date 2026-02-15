@@ -1,0 +1,5 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+ALTER TABLE posts DROP CONSTRAINT posts_author_fk;

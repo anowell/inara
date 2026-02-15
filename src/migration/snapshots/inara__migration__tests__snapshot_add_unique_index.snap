@@ -1,0 +1,5 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+CREATE UNIQUE INDEX users_email_idx ON users (email);

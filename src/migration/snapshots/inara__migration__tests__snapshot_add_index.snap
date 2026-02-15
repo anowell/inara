@@ -1,0 +1,5 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+CREATE INDEX posts_author_idx ON posts (author_id);

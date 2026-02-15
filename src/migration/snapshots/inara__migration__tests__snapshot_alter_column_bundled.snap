@@ -1,0 +1,8 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+ALTER TABLE users RENAME COLUMN name TO full_name;
+ALTER TABLE users ALTER COLUMN full_name TYPE text USING full_name::text;
+ALTER TABLE users ALTER COLUMN full_name SET NOT NULL;
+ALTER TABLE users ALTER COLUMN full_name SET DEFAULT '';

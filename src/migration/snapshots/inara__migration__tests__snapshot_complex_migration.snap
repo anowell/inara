@@ -1,0 +1,25 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+DROP INDEX legacy_idx;
+
+ALTER TABLE posts DROP CONSTRAINT posts_author_fk;
+
+ALTER TABLE users DROP COLUMN legacy_field;
+
+DROP TABLE legacy_table;
+
+CREATE TABLE tags (
+    id integer NOT NULL,
+    name varchar(100) NOT NULL,
+    CONSTRAINT tags_pkey PRIMARY KEY (id)
+);
+
+ALTER TABLE users ADD COLUMN bio text;
+
+ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+
+ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL;
+
+CREATE INDEX users_bio_idx ON users (bio) WHERE bio IS NOT NULL;

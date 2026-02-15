@@ -1,0 +1,5 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+ALTER TABLE products ADD CONSTRAINT positive_price CHECK (price > 0);

@@ -1,0 +1,5 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+DROP INDEX posts_author_idx;

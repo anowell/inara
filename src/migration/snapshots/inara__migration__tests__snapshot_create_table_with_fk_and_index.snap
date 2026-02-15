@@ -1,0 +1,14 @@
+---
+source: src/migration/mod.rs
+expression: sql
+---
+CREATE TABLE posts (
+    id uuid NOT NULL,
+    author_id uuid NOT NULL,
+    title text NOT NULL,
+    body text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT posts_pkey PRIMARY KEY (id),
+    CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX posts_author_idx ON posts (author_id);
