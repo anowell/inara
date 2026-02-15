@@ -1,5 +1,6 @@
 pub mod app;
 pub mod input;
+pub mod view;
 
 use std::io;
 use std::time::Duration;
@@ -188,51 +189,7 @@ fn draw_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let table_names: Vec<&str> = state.schema.table_names().collect();
-
-    if table_names.is_empty() {
-        let placeholder = Paragraph::new(Line::from(Span::styled(
-            "No tables found in schema.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        frame.render_widget(placeholder, inner);
-        return;
-    }
-
-    // Build visible lines from viewport
-    let visible_lines: Vec<Line> = table_names
-        .iter()
-        .enumerate()
-        .skip(state.viewport_offset)
-        .take(inner.height as usize)
-        .map(|(i, name)| {
-            let style = if i == state.cursor {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let col_count = state
-                .schema
-                .table(name)
-                .map(|t| t.columns.len())
-                .unwrap_or(0);
-            Line::from(vec![
-                Span::styled(format!("  {name}"), style),
-                Span::styled(
-                    format!("  ({col_count} columns)"),
-                    if i == state.cursor {
-                        style
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-            ])
-        })
-        .collect();
-
+    let visible_lines = view::render_document(state);
     let content = Paragraph::new(visible_lines);
     frame.render_widget(content, inner);
 }

@@ -50,6 +50,13 @@ fn handle_normal(state: AppState, key: KeyEvent) -> AppState {
             state.cursor_up(half.max(1))
         }
 
+        // Expand/collapse
+        KeyCode::Enter => state.toggle_expand(),
+
+        // Table jumping
+        KeyCode::Tab => state.next_table(),
+        KeyCode::BackTab => state.prev_table(),
+
         // Mode transitions
         KeyCode::Char(':') => state.with_mode(Mode::Command),
 
@@ -158,7 +165,8 @@ mod tests {
     #[test]
     fn normal_big_g_jumps_to_last() {
         let state = handle_key(sample_state(), key(KeyCode::Char('G')));
-        assert_eq!(state.cursor, 4);
+        // 5 tables with 4 blank separators = 9 lines, last at index 8
+        assert_eq!(state.cursor, 8);
     }
 
     #[test]
@@ -267,6 +275,50 @@ mod tests {
             let state = handle_key(state, key(KeyCode::Esc));
             assert_eq!(state.mode, Mode::Normal, "Esc should exit {mode:?}");
         }
+    }
+
+    // --- Enter toggles expand/collapse ---
+
+    #[test]
+    fn enter_toggles_expand() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+
+        let state = handle_key(state, key(KeyCode::Enter));
+        assert!(state.expanded.contains("alpha"));
+
+        let state = handle_key(state, key(KeyCode::Enter));
+        assert!(!state.expanded.contains("alpha"));
+    }
+
+    // --- Tab/Shift-Tab jumps between tables ---
+
+    #[test]
+    fn tab_jumps_to_next_table() {
+        let state = sample_state();
+        assert_eq!(
+            state.focus(),
+            Some(&crate::tui::app::FocusTarget::Table("alpha".into()))
+        );
+
+        let state = handle_key(state, key(KeyCode::Tab));
+        assert_eq!(
+            state.focus(),
+            Some(&crate::tui::app::FocusTarget::Table("bravo".into()))
+        );
+    }
+
+    #[test]
+    fn shift_tab_jumps_to_prev_table() {
+        let state = sample_state();
+        let state = handle_key(state, key(KeyCode::Tab)); // bravo
+        let state = handle_key(state, key(KeyCode::Tab)); // charlie
+
+        let state = handle_key(state, key(KeyCode::BackTab));
+        assert_eq!(
+            state.focus(),
+            Some(&crate::tui::app::FocusTarget::Table("bravo".into()))
+        );
     }
 
     // --- g-sequence edge cases ---

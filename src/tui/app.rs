@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use strum::Display;
 
 use crate::schema::Schema;
@@ -17,6 +19,58 @@ pub enum Mode {
 pub enum PendingKey {
     None,
     G,
+}
+
+/// What type of schema element is currently focused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusTarget {
+    /// An enum type declaration (header line).
+    Enum(String),
+    /// A variant line inside an enum block.
+    EnumVariant(String, usize),
+    /// A closing brace for an enum block.
+    EnumClose(String),
+    /// A custom type declaration (single-line for domain/range, header for composite).
+    Type(String),
+    /// A field line inside a composite type block.
+    TypeField(String, usize),
+    /// A closing brace for a composite type block.
+    TypeClose(String),
+    /// A table header line (`table name {` or `table name { ... N columns ... }`).
+    Table(String),
+    /// A column line inside a table block.
+    Column(String, String),
+    /// A blank separator line inside a table block.
+    Separator(String),
+    /// A constraint line inside a table block.
+    Constraint(String, usize),
+    /// An index line inside a table block.
+    Index(String, usize),
+    /// A closing brace for a table block.
+    TableClose(String),
+    /// A blank line between top-level blocks.
+    Blank,
+}
+
+impl FocusTarget {
+    /// Returns the table name if this target is inside a table block.
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            FocusTarget::Table(n)
+            | FocusTarget::Column(n, _)
+            | FocusTarget::Separator(n)
+            | FocusTarget::Constraint(n, _)
+            | FocusTarget::Index(n, _)
+            | FocusTarget::TableClose(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+/// A single line in the document with its focus target.
+#[derive(Debug, Clone)]
+pub struct DocLine {
+    pub target: FocusTarget,
 }
 
 /// The single application state struct passed to all renderers.
@@ -43,11 +97,17 @@ pub struct AppState {
     pub should_quit: bool,
     /// Connection display string (masked URL).
     pub connection_info: String,
+    /// Set of table names that are currently expanded.
+    pub expanded: BTreeSet<String>,
+    /// The flat document model — one entry per visible line.
+    pub doc: Vec<DocLine>,
 }
 
 impl AppState {
     /// Create a new application state from a loaded schema.
     pub fn new(schema: Schema, connection_info: String) -> Self {
+        let expanded = BTreeSet::new();
+        let doc = build_document(&schema, &expanded);
         Self {
             schema,
             mode: Mode::Normal,
@@ -58,13 +118,19 @@ impl AppState {
             command_buf: String::new(),
             should_quit: false,
             connection_info,
+            expanded,
+            doc,
         }
     }
 
     /// Total number of lines in the rendered document.
     pub fn line_count(&self) -> usize {
-        // One line per table name (collapsed view for the shell)
-        self.schema.tables.len()
+        self.doc.len()
+    }
+
+    /// Returns the focus target for the current cursor position.
+    pub fn focus(&self) -> Option<&FocusTarget> {
+        self.doc.get(self.cursor).map(|l| &l.target)
     }
 
     /// Transition to a new mode, resetting mode-specific state.
@@ -127,6 +193,79 @@ impl AppState {
         self
     }
 
+    /// Toggle expand/collapse for the table under the cursor.
+    pub fn toggle_expand(mut self) -> Self {
+        let table_name = match self.focus() {
+            Some(target) => target.table_name().map(|s| s.to_string()),
+            None => None,
+        };
+        if let Some(name) = table_name {
+            if self.expanded.contains(&name) {
+                self.expanded.remove(&name);
+            } else {
+                self.expanded.insert(name);
+            }
+            self.rebuild_doc();
+        }
+        self
+    }
+
+    /// Jump cursor to the next table header.
+    pub fn next_table(mut self) -> Self {
+        for i in (self.cursor + 1)..self.doc.len() {
+            if matches!(self.doc[i].target, FocusTarget::Table(_)) {
+                self.cursor = i;
+                return self.scroll_to_cursor();
+            }
+        }
+        // Wrap or stay
+        self
+    }
+
+    /// Jump cursor to the previous table header.
+    pub fn prev_table(mut self) -> Self {
+        if self.cursor == 0 {
+            return self;
+        }
+        for i in (0..self.cursor).rev() {
+            if matches!(self.doc[i].target, FocusTarget::Table(_)) {
+                self.cursor = i;
+                return self.scroll_to_cursor();
+            }
+        }
+        self
+    }
+
+    /// Rebuild the document after expand/collapse changes, preserving cursor context.
+    fn rebuild_doc(&mut self) {
+        let old_target = self.focus().cloned();
+        self.doc = build_document(&self.schema, &self.expanded);
+
+        // Try to find the same target in the new doc
+        if let Some(ref target) = old_target {
+            // For table-related targets when collapsing, jump to the table header
+            let search_target = match target {
+                FocusTarget::Column(t, _)
+                | FocusTarget::Separator(t)
+                | FocusTarget::Constraint(t, _)
+                | FocusTarget::Index(t, _)
+                | FocusTarget::TableClose(t) => Some(FocusTarget::Table(t.clone())),
+                other => Some(other.clone()),
+            };
+
+            if let Some(ref st) = search_target {
+                if let Some(pos) = self.doc.iter().position(|l| &l.target == st) {
+                    self.cursor = pos;
+                    return;
+                }
+            }
+        }
+
+        // Clamp cursor
+        let max = self.line_count().saturating_sub(1);
+        self.cursor = self.cursor.min(max);
+    }
+
     /// Adjust viewport so the cursor is visible.
     fn scroll_to_cursor(mut self) -> Self {
         if self.viewport_height == 0 {
@@ -139,6 +278,189 @@ impl AppState {
             self.viewport_offset = self.cursor - self.viewport_height + 1;
         }
         self
+    }
+}
+
+/// Build the flat document model from a schema and expanded set.
+///
+/// The document is a list of lines, one per visible element. Collapsed tables
+/// show a single summary line. Expanded tables show all internal lines.
+/// Enums and custom types are always expanded (they're typically short).
+pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLine> {
+    let mut lines = Vec::new();
+    let mut first = true;
+
+    // Enums
+    for enum_type in schema.enums.values() {
+        if !first {
+            lines.push(DocLine {
+                target: FocusTarget::Blank,
+            });
+        }
+        first = false;
+        lines.push(DocLine {
+            target: FocusTarget::Enum(enum_type.name.clone()),
+        });
+        if enum_type.variants.is_empty() {
+            // Single-line enum: `enum name { }` — no close brace line
+        } else {
+            for (i, _variant) in enum_type.variants.iter().enumerate() {
+                lines.push(DocLine {
+                    target: FocusTarget::EnumVariant(enum_type.name.clone(), i),
+                });
+            }
+            lines.push(DocLine {
+                target: FocusTarget::EnumClose(enum_type.name.clone()),
+            });
+        }
+    }
+
+    // Custom types
+    for custom_type in schema.types.values() {
+        if !first {
+            lines.push(DocLine {
+                target: FocusTarget::Blank,
+            });
+        }
+        first = false;
+
+        lines.push(DocLine {
+            target: FocusTarget::Type(custom_type.name.clone()),
+        });
+
+        if let crate::schema::CustomTypeKind::Composite { fields } = &custom_type.kind {
+            if !fields.is_empty() {
+                for (i, _) in fields.iter().enumerate() {
+                    lines.push(DocLine {
+                        target: FocusTarget::TypeField(custom_type.name.clone(), i),
+                    });
+                }
+                lines.push(DocLine {
+                    target: FocusTarget::TypeClose(custom_type.name.clone()),
+                });
+            }
+        }
+    }
+
+    // Tables
+    for table in schema.tables.values() {
+        if !first {
+            lines.push(DocLine {
+                target: FocusTarget::Blank,
+            });
+        }
+        first = false;
+
+        lines.push(DocLine {
+            target: FocusTarget::Table(table.name.clone()),
+        });
+
+        if expanded.contains(&table.name) {
+            let is_empty = table.columns.is_empty()
+                && table.constraints.is_empty()
+                && table.indexes.is_empty();
+            if is_empty {
+                // Empty table shows as `table name { }` — single line, no close
+            } else {
+                // Build the inline constraint sets just like render.rs
+                let single_pk_cols = single_column_pk_set(&table.constraints);
+                let single_unique_cols = single_column_unique_set(&table.constraints);
+
+                // Columns
+                for col in &table.columns {
+                    lines.push(DocLine {
+                        target: FocusTarget::Column(table.name.clone(), col.name.clone()),
+                    });
+                }
+
+                // Separate constraints
+                let separate_constraints: Vec<usize> = table
+                    .constraints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        should_render_constraint_separately(c, &single_pk_cols, &single_unique_cols)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if !separate_constraints.is_empty() {
+                    lines.push(DocLine {
+                        target: FocusTarget::Separator(table.name.clone()),
+                    });
+                    for &ci in &separate_constraints {
+                        lines.push(DocLine {
+                            target: FocusTarget::Constraint(table.name.clone(), ci),
+                        });
+                    }
+                }
+
+                // Indexes
+                if !table.indexes.is_empty() {
+                    if separate_constraints.is_empty() {
+                        lines.push(DocLine {
+                            target: FocusTarget::Separator(table.name.clone()),
+                        });
+                    }
+                    for (i, _) in table.indexes.iter().enumerate() {
+                        lines.push(DocLine {
+                            target: FocusTarget::Index(table.name.clone(), i),
+                        });
+                    }
+                }
+
+                lines.push(DocLine {
+                    target: FocusTarget::TableClose(table.name.clone()),
+                });
+            }
+        }
+    }
+
+    lines
+}
+
+/// Collect single-column PK column names (for inline rendering).
+fn single_column_pk_set(constraints: &[crate::schema::Constraint]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for c in constraints {
+        if let crate::schema::Constraint::PrimaryKey { columns, .. } = c {
+            if columns.len() == 1 {
+                set.insert(columns[0].clone());
+            }
+        }
+    }
+    set
+}
+
+/// Collect single-column unique constraint column names (for inline rendering).
+fn single_column_unique_set(constraints: &[crate::schema::Constraint]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for c in constraints {
+        if let crate::schema::Constraint::Unique { columns, .. } = c {
+            if columns.len() == 1 {
+                set.insert(columns[0].clone());
+            }
+        }
+    }
+    set
+}
+
+/// Determine if a constraint should be rendered as a separate line.
+fn should_render_constraint_separately(
+    constraint: &crate::schema::Constraint,
+    single_pk_cols: &BTreeSet<String>,
+    single_unique_cols: &BTreeSet<String>,
+) -> bool {
+    match constraint {
+        crate::schema::Constraint::PrimaryKey { columns, .. } => {
+            columns.len() > 1 || (columns.len() == 1 && !single_pk_cols.contains(&columns[0]))
+        }
+        crate::schema::Constraint::Unique { columns, .. } => {
+            columns.len() > 1 || (columns.len() == 1 && !single_unique_cols.contains(&columns[0]))
+        }
+        crate::schema::Constraint::ForeignKey { .. } | crate::schema::Constraint::Check { .. } => {
+            true
+        }
     }
 }
 
@@ -178,13 +500,14 @@ mod tests {
     #[test]
     fn cursor_down_clamps() {
         let state = sample_state();
-        assert_eq!(state.line_count(), 5);
+        // 5 tables with blank separators between them = 9 lines
+        assert_eq!(state.line_count(), 9);
 
         let state = state.cursor_down(1);
         assert_eq!(state.cursor, 1);
 
         let state = state.cursor_down(100);
-        assert_eq!(state.cursor, 4); // clamped to last
+        assert_eq!(state.cursor, 8); // clamped to last
     }
 
     #[test]
@@ -203,7 +526,7 @@ mod tests {
     fn cursor_to_clamps() {
         let state = sample_state();
         let state = state.cursor_to(100);
-        assert_eq!(state.cursor, 4);
+        assert_eq!(state.cursor, 8);
 
         let state = state.cursor_to(2);
         assert_eq!(state.cursor, 2);
@@ -294,5 +617,134 @@ mod tests {
 
         let state = state.cursor_up(half);
         assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn focus_target_on_collapsed_tables() {
+        let state = sample_state();
+        // All tables start collapsed. Doc should have table headers with blank lines between.
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+
+        let state = state.cursor_down(1);
+        assert_eq!(state.focus(), Some(&FocusTarget::Blank));
+
+        let state = state.cursor_down(1);
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+    }
+
+    #[test]
+    fn toggle_expand_collapse() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+
+        // Toggle expand on "alpha"
+        let state = state.toggle_expand();
+        assert!(state.expanded.contains("alpha"));
+
+        // Toggle collapse
+        let state = state.toggle_expand();
+        assert!(!state.expanded.contains("alpha"));
+    }
+
+    #[test]
+    fn expand_table_with_columns() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Constraint, Table};
+
+        let mut schema = Schema::new();
+        let mut table = Table::new("users");
+        table.add_column(Column::new("id", PgType::Uuid));
+        table.add_column(Column::new("name", PgType::Text));
+        table.add_constraint(Constraint::PrimaryKey {
+            name: Some("users_pkey".into()),
+            columns: vec!["id".into()],
+        });
+        schema.add_table(table);
+
+        let state = AppState::new(schema, String::new());
+        assert_eq!(state.line_count(), 1); // Just the table header
+
+        // Expand
+        let state = state.toggle_expand();
+        // Header + id + name + close = 4 lines
+        assert_eq!(state.line_count(), 4);
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Check doc structure
+        assert!(matches!(state.doc[0].target, FocusTarget::Table(_)));
+        assert!(matches!(state.doc[1].target, FocusTarget::Column(_, _)));
+        assert!(matches!(state.doc[2].target, FocusTarget::Column(_, _)));
+        assert!(matches!(state.doc[3].target, FocusTarget::TableClose(_)));
+    }
+
+    #[test]
+    fn next_prev_table() {
+        let state = sample_state();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+
+        let state = state.next_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        let state = state.next_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+
+        let state = state.prev_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        // prev from first table stays
+        let state = state.prev_table().prev_table().prev_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn next_table_at_end_stays() {
+        let state = sample_state();
+        // Jump to last table (echo)
+        let state = state.next_table().next_table().next_table().next_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("echo".into())));
+
+        let state = state.next_table();
+        // Should stay on echo since no more tables
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("echo".into())));
+    }
+
+    #[test]
+    fn document_with_enums_and_tables() {
+        use crate::schema::{EnumType, Table};
+
+        let mut schema = Schema::new();
+        schema.add_enum(EnumType {
+            name: "mood".into(),
+            variants: vec!["happy".into(), "sad".into()],
+        });
+        schema.add_table(Table::new("users"));
+
+        let state = AppState::new(schema, String::new());
+        // enum header + 2 variants + close + blank + table header = 6
+        assert_eq!(state.line_count(), 6);
+        assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
+    }
+
+    #[test]
+    fn collapse_moves_cursor_to_table_header() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut table = Table::new("users");
+        table.add_column(Column::new("id", PgType::Uuid));
+        table.add_column(Column::new("name", PgType::Text));
+        schema.add_table(table);
+
+        let state = AppState::new(schema, String::new());
+        // Expand and navigate to a column
+        let state = state.toggle_expand();
+        let state = state.cursor_down(1); // now on "id" column
+        assert!(matches!(state.focus(), Some(FocusTarget::Column(_, _))));
+
+        // Collapse — cursor should jump to table header
+        let state = state.toggle_expand();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
     }
 }
