@@ -13,22 +13,12 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
     match &cli.database_url {
         Some(url) => {
-            // Mask password in output for safety
             let display_url = mask_password(url);
-            tracing::info!("Database URL: {display_url}");
-            println!("inara: ready to connect to {display_url}");
+            inara::tui::run(url, display_url).await?;
         }
         None => {
             eprintln!(
