@@ -16,6 +16,7 @@ pub enum Mode {
     HUD,
     Command,
     SpaceMenu,
+    MigrationPreview,
 }
 
 /// Metadata for a rename operation. Recorded so the diff engine can
@@ -35,6 +36,17 @@ pub struct RenameMetadata {
 pub enum RenameTarget {
     Table(String),
     Column(String, String),
+}
+
+/// State for the migration preview overlay.
+#[derive(Debug, Clone)]
+pub struct MigrationPreviewState {
+    /// The generated SQL to display.
+    pub sql: String,
+    /// Migration description (from `:w description`).
+    pub description: String,
+    /// Scroll offset in the preview.
+    pub scroll: usize,
 }
 
 /// Pending key state for multi-key sequences (e.g. `gg`, `g r`).
@@ -148,6 +160,10 @@ pub struct AppState {
     pub edited_tables: BTreeSet<String>,
     /// HUD overlay state (present when mode is HUD).
     pub hud: Option<HudState>,
+    /// Migration preview state (present when mode is MigrationPreview).
+    pub migration_preview: Option<MigrationPreviewState>,
+    /// Transient status message to display in the status bar.
+    pub status_message: Option<String>,
 }
 
 impl AppState {
@@ -179,6 +195,8 @@ impl AppState {
             renames: Vec::new(),
             edited_tables: BTreeSet::new(),
             hud: None,
+            migration_preview: None,
+            status_message: None,
         }
     }
 
@@ -208,6 +226,11 @@ impl AppState {
         if mode != Mode::HUD {
             self.hud = None;
         }
+        if mode != Mode::MigrationPreview {
+            self.migration_preview = None;
+        }
+        // Clear status message on any mode transition
+        self.status_message = None;
         self
     }
 
@@ -355,6 +378,21 @@ impl AppState {
     /// Returns true if any tables have been edited.
     pub fn has_edits(&self) -> bool {
         !self.edited_tables.is_empty()
+    }
+
+    /// Clear edit tracking state after a migration has been written.
+    /// Sets original_schema = current schema, clears renames and edited_tables.
+    pub fn clear_edit_state(mut self) -> Self {
+        self.original_schema = Some(self.schema.clone());
+        self.renames.clear();
+        self.edited_tables.clear();
+        self
+    }
+
+    /// Set a transient status message for the status bar.
+    pub fn with_status_message(mut self, msg: String) -> Self {
+        self.status_message = Some(msg);
+        self
     }
 
     /// Toggle expand/collapse for the table under the cursor.
@@ -661,6 +699,7 @@ mod tests {
         assert_eq!(Mode::HUD.to_string(), "HUD");
         assert_eq!(Mode::Command.to_string(), "Command");
         assert_eq!(Mode::SpaceMenu.to_string(), "SpaceMenu");
+        assert_eq!(Mode::MigrationPreview.to_string(), "MigrationPreview");
     }
 
     #[test]
