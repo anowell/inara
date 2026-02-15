@@ -1044,6 +1044,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
+ "dotenvy",
  "insta",
  "itertools 0.14.0",
  "nucleo",

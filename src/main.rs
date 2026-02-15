@@ -13,6 +13,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file if present (before Cli::parse so DATABASE_URL is available to clap)
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     match &cli.database_url {
