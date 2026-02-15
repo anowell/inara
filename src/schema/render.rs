@@ -82,6 +82,17 @@ fn render_custom_type(out: &mut String, custom_type: &CustomType) {
     }
 }
 
+/// Render a single table to its declarative text format.
+///
+/// This produces the same output as `render_schema` would for a schema
+/// containing only this table. Used by the edit mode to pre-fill the
+/// text editor with a table's current declaration.
+pub fn render_single_table(table: &Table) -> String {
+    let mut out = String::new();
+    render_table(&mut out, table);
+    out
+}
+
 /// Render a table in the declarative format.
 fn render_table(out: &mut String, table: &Table) {
     let _ = write!(out, "table {} {{", table.name);

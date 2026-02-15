@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::{AppState, Mode, PendingKey};
+use super::edit;
 
 /// Process a key event and return the new application state.
 ///
@@ -14,8 +15,10 @@ pub fn handle_key(state: AppState, key: KeyEvent) -> AppState {
     match state.mode {
         Mode::Normal => handle_normal(state, key),
         Mode::Command => handle_command(state, key),
+        Mode::Edit => edit::handle_edit(state, key),
+        Mode::Rename => edit::handle_rename(state, key),
         // Other modes are placeholders for future beads
-        Mode::Edit | Mode::Search | Mode::HUD => {
+        Mode::Search | Mode::HUD => {
             if key.code == KeyCode::Esc {
                 state.with_mode(Mode::Normal)
             } else {
@@ -59,6 +62,8 @@ fn handle_normal(state: AppState, key: KeyEvent) -> AppState {
 
         // Mode transitions
         KeyCode::Char(':') => state.with_mode(Mode::Command),
+        KeyCode::Char('e') => edit::enter_edit_mode(state),
+        KeyCode::Char('r') => edit::enter_rename_mode(state),
 
         // Ignore unmapped keys
         _ => state,
@@ -270,7 +275,7 @@ mod tests {
 
     #[test]
     fn esc_exits_placeholder_modes() {
-        for mode in [Mode::Edit, Mode::Search, Mode::HUD] {
+        for mode in [Mode::Search, Mode::HUD] {
             let state = sample_state().with_mode(mode);
             let state = handle_key(state, key(KeyCode::Esc));
             assert_eq!(state.mode, Mode::Normal, "Esc should exit {mode:?}");

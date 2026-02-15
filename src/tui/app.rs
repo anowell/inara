@@ -9,9 +9,29 @@ use crate::schema::Schema;
 pub enum Mode {
     Normal,
     Edit,
+    Rename,
     Search,
     HUD,
     Command,
+}
+
+/// Metadata for a rename operation. Recorded so the diff engine can
+/// distinguish renames from drop+create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameMetadata {
+    /// The table containing the renamed element (or the table itself if renaming a table).
+    pub table: String,
+    /// The original name.
+    pub from: String,
+    /// The new name.
+    pub to: String,
+}
+
+/// What kind of element is being renamed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameTarget {
+    Table(String),
+    Column(String, String),
 }
 
 /// Pending key state for multi-key sequences (e.g. `gg`, `g r`).
@@ -81,6 +101,8 @@ pub struct DocLine {
 pub struct AppState {
     /// The introspected database schema.
     pub schema: Schema,
+    /// The original schema before any edits (set on first edit).
+    pub original_schema: Option<Schema>,
     /// Current application mode.
     pub mode: Mode,
     /// Cursor position (line index in the document).
@@ -101,6 +123,24 @@ pub struct AppState {
     pub expanded: BTreeSet<String>,
     /// The flat document model — one entry per visible line.
     pub doc: Vec<DocLine>,
+    /// Edit mode: the text buffer being edited.
+    pub edit_buffer: Vec<String>,
+    /// Edit mode: cursor row in the text buffer.
+    pub edit_cursor_row: usize,
+    /// Edit mode: cursor column in the text buffer.
+    pub edit_cursor_col: usize,
+    /// Edit mode: the name of the table being edited.
+    pub edit_table: Option<String>,
+    /// Edit mode: parse error message to display.
+    pub edit_error: Option<String>,
+    /// Rename mode: the input buffer for the new name.
+    pub rename_buf: String,
+    /// Rename mode: what element is being renamed.
+    pub rename_target: Option<RenameTarget>,
+    /// Accumulated rename metadata for the diff engine.
+    pub renames: Vec<RenameMetadata>,
+    /// Set of table names that have been edited (for visual diff hints).
+    pub edited_tables: BTreeSet<String>,
 }
 
 impl AppState {
@@ -110,6 +150,7 @@ impl AppState {
         let doc = build_document(&schema, &expanded);
         Self {
             schema,
+            original_schema: None,
             mode: Mode::Normal,
             cursor: 0,
             viewport_offset: 0,
@@ -120,6 +161,15 @@ impl AppState {
             connection_info,
             expanded,
             doc,
+            edit_buffer: Vec::new(),
+            edit_cursor_row: 0,
+            edit_cursor_col: 0,
+            edit_table: None,
+            edit_error: None,
+            rename_buf: String::new(),
+            rename_target: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
         }
     }
 
@@ -139,6 +189,9 @@ impl AppState {
         self.pending_key = PendingKey::None;
         if mode == Mode::Command {
             self.command_buf = String::new();
+        }
+        if mode == Mode::Rename {
+            self.rename_buf = String::new();
         }
         self
     }
@@ -193,6 +246,19 @@ impl AppState {
         self
     }
 
+    /// Snapshot the original schema if this is the first edit.
+    pub fn ensure_original_schema(mut self) -> Self {
+        if self.original_schema.is_none() {
+            self.original_schema = Some(self.schema.clone());
+        }
+        self
+    }
+
+    /// Returns true if any tables have been edited.
+    pub fn has_edits(&self) -> bool {
+        !self.edited_tables.is_empty()
+    }
+
     /// Toggle expand/collapse for the table under the cursor.
     pub fn toggle_expand(mut self) -> Self {
         let table_name = match self.focus() {
@@ -236,8 +302,8 @@ impl AppState {
         self
     }
 
-    /// Rebuild the document after expand/collapse changes, preserving cursor context.
-    fn rebuild_doc(&mut self) {
+    /// Rebuild the document after expand/collapse or schema changes, preserving cursor context.
+    pub fn rebuild_doc(&mut self) {
         let old_target = self.focus().cloned();
         self.doc = build_document(&self.schema, &self.expanded);
 
@@ -492,6 +558,7 @@ mod tests {
     fn mode_display() {
         assert_eq!(Mode::Normal.to_string(), "Normal");
         assert_eq!(Mode::Edit.to_string(), "Edit");
+        assert_eq!(Mode::Rename.to_string(), "Rename");
         assert_eq!(Mode::Search.to_string(), "Search");
         assert_eq!(Mode::HUD.to_string(), "HUD");
         assert_eq!(Mode::Command.to_string(), "Command");
