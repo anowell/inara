@@ -41,7 +41,7 @@ test-verbose:
 
 # Run integration tests (requires DATABASE_URL)
 test-integration:
-    cargo test --test '*' -- --ignored
+    cargo test --test '*' -- --ignored --test-threads=1
 
 # Run all tests including integration
 test-all: test test-integration
