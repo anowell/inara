@@ -51,6 +51,9 @@ pub struct MigrationPreviewState {
     pub description: String,
     /// Scroll offset in the preview.
     pub scroll: usize,
+    /// Safety warnings from pre-flight checks.
+    /// `None` = checks still running, `Some` = checks complete.
+    pub warnings: Option<Vec<crate::migration::warnings::MigrationWarning>>,
 }
 
 /// Pending key state for multi-key sequences (e.g. `gg`, `g r`).

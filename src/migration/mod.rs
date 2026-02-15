@@ -1,5 +1,7 @@
 // Migration generation — structural diff to SQL.
 
+pub mod warnings;
+
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 

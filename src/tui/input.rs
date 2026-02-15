@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sqlx::PgPool;
 
@@ -6,34 +8,69 @@ use super::edit;
 use super::fuzzy::SearchFilter;
 use super::goto::{self, GotoResult};
 use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
+use crate::migration::warnings::MigrationWarning;
 use crate::schema::diff::{self, Rename};
+
+/// Shared handle for receiving async warning check results.
+pub type WarningResultHandle = Arc<Mutex<Option<Vec<MigrationWarning>>>>;
+
+/// Create a new warning result handle.
+pub fn new_warning_handle() -> WarningResultHandle {
+    Arc::new(Mutex::new(None))
+}
+
+/// Result from handle_key — updated state plus optional async handles.
+pub struct HandleResult {
+    pub state: AppState,
+    pub hud_handle: Option<HudResultHandle>,
+    pub warning_handle: Option<WarningResultHandle>,
+}
+
+impl HandleResult {
+    fn state_only(state: AppState) -> Self {
+        Self {
+            state,
+            hud_handle: None,
+            warning_handle: None,
+        }
+    }
+
+    fn with_hud(state: AppState, handle: Option<HudResultHandle>) -> Self {
+        Self {
+            state,
+            hud_handle: handle,
+            warning_handle: None,
+        }
+    }
+}
 
 /// Process a key event and return the new application state.
 ///
-/// Returns the updated state and an optional HUD result handle when
-/// an async query has been spawned.
-pub fn handle_key(
-    state: AppState,
-    key: KeyEvent,
-    pool: &PgPool,
-) -> (AppState, Option<HudResultHandle>) {
+/// Returns the updated state and optional async handles for HUD or warning queries.
+pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
     // Clear transient status message on any key press
     let state = state.clear_status();
 
     // Ctrl-c always quits regardless of mode
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return (state.quit(), None);
+        return HandleResult::state_only(state.quit());
     }
 
     match state.mode {
-        Mode::Normal => handle_normal(state, key, pool),
-        Mode::Command => (handle_command(state, key), None),
-        Mode::SpaceMenu => (handle_space_menu(state, key), None),
-        Mode::Search => (handle_search(state, key), None),
-        Mode::Edit => (edit::handle_edit(state, key), None),
-        Mode::Rename => (edit::handle_rename(state, key), None),
-        Mode::HUD => handle_hud(state, key, pool),
-        Mode::MigrationPreview => (handle_migration_preview(state, key), None),
+        Mode::Normal => {
+            let (state, handle) = handle_normal(state, key, pool);
+            HandleResult::with_hud(state, handle)
+        }
+        Mode::Command => handle_command(state, key, pool),
+        Mode::SpaceMenu => HandleResult::state_only(handle_space_menu(state, key)),
+        Mode::Search => HandleResult::state_only(handle_search(state, key)),
+        Mode::Edit => HandleResult::state_only(edit::handle_edit(state, key)),
+        Mode::Rename => HandleResult::state_only(edit::handle_rename(state, key)),
+        Mode::HUD => {
+            let (state, handle) = handle_hud(state, key, pool);
+            HandleResult::with_hud(state, handle)
+        }
+        Mode::MigrationPreview => HandleResult::state_only(handle_migration_preview(state, key)),
     }
 }
 
@@ -114,34 +151,59 @@ fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
 ///
 /// Public for integration tests that simulate the :w workflow without a pool.
 pub fn handle_command_for_test(state: AppState, key: KeyEvent) -> AppState {
-    handle_command(state, key)
+    handle_command(state, key, &no_pool()).state
 }
 
-fn handle_command(state: AppState, key: KeyEvent) -> AppState {
+/// Create a dummy pool reference for offline/test contexts.
+///
+/// Uses a tokio runtime to construct the pool. If no runtime exists
+/// (e.g. in unit tests), creates a temporary one for pool construction only.
+fn no_pool() -> PgPool {
+    use sqlx::pool::PoolOptions;
+    // connect_lazy requires a tokio context for internal setup
+    if tokio::runtime::Handle::try_current().is_ok() {
+        PoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool creation should not fail")
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("temp runtime");
+        rt.block_on(async {
+            PoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://localhost/unused")
+                .expect("lazy pool creation should not fail")
+        })
+    }
+}
+
+fn handle_command(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
     match key.code {
-        KeyCode::Esc => state.with_mode(Mode::Normal),
-        KeyCode::Enter => execute_command(state),
+        KeyCode::Esc => HandleResult::state_only(state.with_mode(Mode::Normal)),
+        KeyCode::Enter => execute_command(state, pool),
         KeyCode::Backspace => {
             let state = state.command_pop();
             // If buffer is empty after backspace, exit command mode
             if state.command_buf.is_empty() {
-                state.with_mode(Mode::Normal)
+                HandleResult::state_only(state.with_mode(Mode::Normal))
             } else {
-                state
+                HandleResult::state_only(state)
             }
         }
-        KeyCode::Char(ch) => state.command_push(ch),
-        _ => state,
+        KeyCode::Char(ch) => HandleResult::state_only(state.command_push(ch)),
+        _ => HandleResult::state_only(state),
     }
 }
 
 /// Execute the current command buffer content.
-fn execute_command(state: AppState) -> AppState {
+fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
     let cmd = state.command_buf.trim().to_string();
     let state = state.with_mode(Mode::Normal);
 
     if cmd == "q" {
-        return state.quit();
+        return HandleResult::state_only(state.quit());
     }
 
     // :w or :w <description>
@@ -151,18 +213,23 @@ fn execute_command(state: AppState) -> AppState {
         } else {
             String::new()
         };
-        return execute_write_migration(state, description);
+        return execute_write_migration(state, description, pool);
     }
 
-    state // Unknown command, ignore
+    HandleResult::state_only(state) // Unknown command, ignore
 }
 
 /// Generate migration SQL and show preview, or report no changes.
-fn execute_write_migration(state: AppState, description: String) -> AppState {
+///
+/// Spawns async warning checks against the live database. The preview
+/// shows "Checking..." until results arrive.
+fn execute_write_migration(state: AppState, description: String, pool: &PgPool) -> HandleResult {
     let original = match &state.original_schema {
         Some(orig) => orig,
         None => {
-            return state.with_status_message("No schema changes to migrate".into());
+            return HandleResult::state_only(
+                state.with_status_message("No schema changes to migrate".into()),
+            );
         }
     };
 
@@ -179,7 +246,9 @@ fn execute_write_migration(state: AppState, description: String) -> AppState {
 
     let changes = diff::diff(original, &state.schema, &renames);
     if changes.is_empty() {
-        return state.with_status_message("No schema changes to migrate".into());
+        return HandleResult::state_only(
+            state.with_status_message("No schema changes to migrate".into()),
+        );
     }
 
     let sql = crate::migration::generate_sql(&changes);
@@ -191,16 +260,50 @@ fn execute_write_migration(state: AppState, description: String) -> AppState {
         description
     };
 
+    // Spawn async warning checks
+    let handle = new_warning_handle();
+    spawn_warning_checks(pool.clone(), changes, handle.clone());
+
     let preview = MigrationPreviewState {
         sql,
         description,
         scroll: 0,
+        warnings: None, // checks in progress
     };
 
     let mut state = state;
     state.migration_preview = Some(preview);
     state.mode = Mode::MigrationPreview;
-    state
+
+    HandleResult {
+        state,
+        hud_handle: None,
+        warning_handle: Some(handle),
+    }
+}
+
+/// Spawn async warning checks in a background task.
+///
+/// If no Tokio runtime is available (e.g. in unit tests), the warnings
+/// are set to an empty list immediately.
+fn spawn_warning_checks(pool: PgPool, changes: Vec<diff::Change>, handle: WarningResultHandle) {
+    let handle_clone = handle.clone();
+    let result = tokio::runtime::Handle::try_current().map(|rt| {
+        rt.spawn(async move {
+            let result = crate::migration::warnings::check_changes(&pool, "public", &changes).await;
+            let warnings = result.unwrap_or_default();
+            if let Ok(mut guard) = handle_clone.lock() {
+                *guard = Some(warnings);
+            }
+        });
+    });
+
+    // No runtime available — set empty warnings immediately
+    if result.is_err() {
+        if let Ok(mut guard) = handle.lock() {
+            *guard = Some(Vec::new());
+        }
+    }
 }
 
 /// Generate a human-readable summary from changes for auto-description.
@@ -617,7 +720,7 @@ mod tests {
 
         match state.mode {
             Mode::Normal => handle_normal_no_pool(state, key),
-            Mode::Command => handle_command(state, key),
+            Mode::Command => handle_command(state, key, &no_pool()).state,
             Mode::SpaceMenu => handle_space_menu(state, key),
             Mode::Search => handle_search(state, key),
             Mode::Edit => edit::handle_edit(state, key),

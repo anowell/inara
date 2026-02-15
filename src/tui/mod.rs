@@ -21,7 +21,7 @@ use ratatui::Frame;
 
 use self::app::{AppState, Mode};
 use self::hud::HudResultHandle;
-use self::input::handle_key;
+use self::input::{handle_key, WarningResultHandle};
 
 /// Tick rate for the event loop poll interval.
 const TICK_RATE: Duration = Duration::from_millis(50);
@@ -139,6 +139,7 @@ fn run_event_loop(
     pool: sqlx::PgPool,
 ) -> Result<()> {
     let mut hud_handle: Option<HudResultHandle> = None;
+    let mut warning_handle: Option<WarningResultHandle> = None;
 
     loop {
         // Update viewport height from terminal size
@@ -152,6 +153,17 @@ fn run_event_loop(
             if let Ok(mut guard) = handle.lock() {
                 if let Some(status) = guard.take() {
                     state = state.with_hud_status(status);
+                }
+            }
+        }
+
+        // Poll for warning check results
+        if let Some(ref handle) = warning_handle {
+            if let Ok(mut guard) = handle.lock() {
+                if let Some(warnings) = guard.take() {
+                    if let Some(ref mut preview) = state.migration_preview {
+                        preview.warnings = Some(warnings);
+                    }
                 }
             }
         }
@@ -175,14 +187,20 @@ fn run_event_loop(
                 Event::Key(key) => {
                     // Only handle key press events (ignore release/repeat)
                     if key.kind == KeyEventKind::Press {
-                        let (new_state, new_handle) = handle_key(state, key, &pool);
-                        state = new_state;
-                        if let Some(h) = new_handle {
+                        let result = handle_key(state, key, &pool);
+                        state = result.state;
+                        if let Some(h) = result.hud_handle {
                             hud_handle = Some(h);
                         }
-                        // Clear handle when leaving HUD mode
+                        if let Some(h) = result.warning_handle {
+                            warning_handle = Some(h);
+                        }
+                        // Clear handles when leaving respective modes
                         if state.mode != Mode::HUD {
                             hud_handle = None;
+                        }
+                        if state.mode != Mode::MigrationPreview {
+                            warning_handle = None;
                         }
                     }
                 }
@@ -336,22 +354,77 @@ fn render_migration_preview(
     area: ratatui::layout::Rect,
     preview: &app::MigrationPreviewState,
 ) {
+    use crate::migration::warnings::Severity;
     use ratatui::widgets::Clear;
 
-    let sql_lines: Vec<&str> = preview.sql.lines().collect();
-    let total_lines = sql_lines.len();
+    // Build the full content: warnings section + SQL
+    let mut content_lines: Vec<Line> = Vec::new();
+
+    // Warnings section (above SQL)
+    match &preview.warnings {
+        None => {
+            // Checks still running
+            content_lines.push(Line::from(Span::styled(
+                " Checking for potential issues...",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            content_lines.push(Line::from(""));
+        }
+        Some(warnings) if !warnings.is_empty() => {
+            for w in warnings {
+                let (icon, color) = match w.severity {
+                    Severity::Error => ("!!", Color::Red),
+                    Severity::Warning => ("!!", Color::Yellow),
+                };
+                content_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {icon} "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("[{}] ", w.severity), Style::default().fg(color)),
+                    Span::styled(&w.description, Style::default().fg(Color::White)),
+                ]));
+                // Show remediation as indented hint
+                content_lines.push(Line::from(Span::styled(
+                    format!("      Fix: {}", w.remediation),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            content_lines.push(Line::from(""));
+        }
+        Some(_) => {
+            // No warnings — skip section
+        }
+    }
+
+    // SQL lines
+    for sql_line in preview.sql.lines() {
+        content_lines.push(Line::from(Span::styled(
+            sql_line.to_string(),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    let total_lines = content_lines.len();
 
     // Use the full content area for the overlay
     frame.render_widget(Clear, area);
 
     let title = format!(" Migration: {} ", preview.description);
+    let border_color = match &preview.warnings {
+        Some(ws) if ws.iter().any(|w| w.severity == Severity::Error) => Color::Red,
+        Some(ws) if !ws.is_empty() => Color::Yellow,
+        _ => Color::Green,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(border_color))
         .title(title)
         .title_style(
             Style::default()
-                .fg(Color::Green)
+                .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -362,16 +435,10 @@ fn render_migration_preview(
     let max_scroll = total_lines.saturating_sub(visible_height);
     let scroll = preview.scroll.min(max_scroll);
 
-    let mut lines: Vec<Line> = sql_lines
-        .iter()
+    let mut lines: Vec<Line> = content_lines
+        .into_iter()
         .skip(scroll)
         .take(visible_height.saturating_sub(2)) // leave room for footer
-        .map(|line| {
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White),
-            ))
-        })
         .collect();
 
     // Add separator and footer instructions
