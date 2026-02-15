@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use strum::Display;
 
+use super::hud::{HudState, HudStatus};
 use crate::schema::Schema;
 
 /// The TUI application mode. Determines which input handler processes keys.
@@ -101,6 +102,8 @@ pub struct AppState {
     pub expanded: BTreeSet<String>,
     /// The flat document model — one entry per visible line.
     pub doc: Vec<DocLine>,
+    /// HUD overlay state (present when mode is HUD).
+    pub hud: Option<HudState>,
 }
 
 impl AppState {
@@ -120,6 +123,7 @@ impl AppState {
             connection_info,
             expanded,
             doc,
+            hud: None,
         }
     }
 
@@ -139,6 +143,23 @@ impl AppState {
         self.pending_key = PendingKey::None;
         if mode == Mode::Command {
             self.command_buf = String::new();
+        }
+        if mode != Mode::HUD {
+            self.hud = None;
+        }
+        self
+    }
+
+    /// Set the HUD state.
+    pub fn with_hud(mut self, hud: Option<HudState>) -> Self {
+        self.hud = hud;
+        self
+    }
+
+    /// Update HUD query status (called when async result arrives).
+    pub fn with_hud_status(mut self, status: HudStatus) -> Self {
+        if let Some(ref mut hud) = self.hud {
+            hud.status = status;
         }
         self
     }

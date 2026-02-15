@@ -1,4 +1,5 @@
 pub mod app;
+pub mod hud;
 pub mod input;
 pub mod view;
 
@@ -16,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use self::app::{AppState, Mode};
+use self::hud::HudResultHandle;
 use self::input::handle_key;
 
 /// Tick rate for the event loop poll interval.
@@ -101,7 +103,7 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
 
     let state = AppState::new(schema, connection_info);
 
-    let result = run_event_loop(&mut terminal, state);
+    let result = run_event_loop(&mut terminal, state, pool);
 
     restore_terminal();
 
@@ -112,13 +114,25 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
 fn run_event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     mut state: AppState,
+    pool: sqlx::PgPool,
 ) -> Result<()> {
+    let mut hud_handle: Option<HudResultHandle> = None;
+
     loop {
         // Update viewport height from terminal size
         let area = terminal.size()?;
         // Content area height = total height - header(1) - status bar(1) - content borders(2)
         let content_height = area.height.saturating_sub(4) as usize;
         state = state.with_viewport_height(content_height);
+
+        // Poll for HUD query results
+        if let Some(ref handle) = hud_handle {
+            if let Ok(mut guard) = handle.lock() {
+                if let Some(status) = guard.take() {
+                    state = state.with_hud_status(status);
+                }
+            }
+        }
 
         terminal.draw(|frame| draw(frame, &state))?;
 
@@ -132,7 +146,15 @@ fn run_event_loop(
                 Event::Key(key) => {
                     // Only handle key press events (ignore release/repeat)
                     if key.kind == KeyEventKind::Press {
-                        state = handle_key(state, key);
+                        let (new_state, new_handle) = handle_key(state, key, &pool);
+                        state = new_state;
+                        if let Some(h) = new_handle {
+                            hud_handle = Some(h);
+                        }
+                        // Clear handle when leaving HUD mode
+                        if state.mode != Mode::HUD {
+                            hud_handle = None;
+                        }
                     }
                 }
                 Event::Resize(_, _) => {
@@ -161,6 +183,11 @@ fn draw(frame: &mut Frame, state: &AppState) {
     draw_header(frame, layout[0], state);
     draw_content(frame, layout[1], state);
     draw_status_bar(frame, layout[2], state);
+
+    // HUD overlay renders on top of everything
+    if let Some(ref hud_state) = state.hud {
+        hud::render_hud(frame, area, hud_state);
+    }
 }
 
 /// Render the header bar with app name and connection info.
