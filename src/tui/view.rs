@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::app::{AppState, FocusTarget};
+use crate::migration::overlay::ChangeMarker;
 use crate::schema::{Constraint, CustomTypeKind};
 
 /// Style constants for syntax highlighting.
@@ -38,9 +39,38 @@ pub fn render_document(state: &AppState) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Get the overlay change marker for a focus target, if any.
+fn overlay_marker(state: &AppState, target: &FocusTarget) -> Option<ChangeMarker> {
+    if !state.show_pending_overlay {
+        return None;
+    }
+    let overlay = state.pending_overlay.as_ref()?;
+    match target {
+        FocusTarget::Table(name) | FocusTarget::TableClose(name) | FocusTarget::Separator(name) => {
+            overlay.table_marker(name)
+        }
+        FocusTarget::Column(table, col) => overlay.column_marker(table, col),
+        FocusTarget::Constraint(table, _) | FocusTarget::Index(table, _) => {
+            overlay.table_marker(table)
+        }
+        _ => None,
+    }
+}
+
+/// Get the style for a change marker.
+fn marker_style(marker: ChangeMarker) -> Style {
+    match marker {
+        ChangeMarker::Added => OVERLAY_ADDED_STYLE,
+        ChangeMarker::Removed => OVERLAY_REMOVED_STYLE,
+        ChangeMarker::Modified => OVERLAY_MODIFIED_STYLE,
+    }
+}
+
 /// Render a single document line based on its FocusTarget.
 fn render_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line<'static> {
-    let spans = match target {
+    let marker = overlay_marker(state, target);
+
+    let mut spans = match target {
         FocusTarget::Enum(name) => render_enum_header(state, name),
         FocusTarget::EnumVariant(name, idx) => render_enum_variant(state, name, *idx),
         FocusTarget::EnumClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
@@ -55,6 +85,11 @@ fn render_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line
         FocusTarget::TableClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
         FocusTarget::Blank => vec![Span::raw("")],
     };
+
+    // Prepend overlay marker if applicable
+    if let Some(m) = marker {
+        spans.insert(0, Span::styled(m.prefix().to_string(), marker_style(m)));
+    }
 
     if is_focused {
         // Apply focus background to all spans
@@ -170,6 +205,11 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
 
 /// Style for the edit indicator on modified tables.
 const EDITED_STYLE: Style = Style::new().fg(Color::Yellow);
+
+/// Overlay marker styles.
+const OVERLAY_ADDED_STYLE: Style = Style::new().fg(Color::Green);
+const OVERLAY_REMOVED_STYLE: Style = Style::new().fg(Color::Red);
+const OVERLAY_MODIFIED_STYLE: Style = Style::new().fg(Color::Yellow);
 
 /// Render a table header line.
 ///
@@ -749,5 +789,111 @@ mod tests {
             zip_text.contains("// i32"),
             "composite field should show Rust type, got: {zip_text}"
         );
+    }
+
+    // --- Pending overlay annotation tests ---
+
+    use crate::migration::overlay::{ChangeMarker, PendingOverlay};
+    use crate::schema::diff::Change;
+
+    /// Build a state with overlay data. BTreeMap order: posts < users.
+    /// "posts" is in the AddTable change, "users" has AddColumn change.
+    fn overlay_state() -> AppState {
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+        schema.add_table(Table::new("posts"));
+
+        let overlay = PendingOverlay {
+            changes: vec![
+                Change::AddColumn {
+                    table: "users".into(),
+                    column: Column::new("bio", PgType::Text),
+                },
+                Change::AddTable({
+                    let mut t = Table::new("posts");
+                    t.add_column(Column::new("id", PgType::Uuid));
+                    t
+                }),
+            ],
+            pending_count: 1,
+            unparseable: Vec::new(),
+        };
+
+        AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .with_pending_overlay(Some(overlay))
+            .toggle_pending_overlay()
+    }
+
+    #[test]
+    fn overlay_marker_on_modified_table() {
+        let state = overlay_state();
+        let lines = render_document(&state);
+        // BTreeMap order: posts, users. "users" is modified (AddColumn).
+        let users_line = lines
+            .iter()
+            .map(|l| spans_to_string(l))
+            .find(|s| s.contains("users"))
+            .expect("should have users table line");
+        assert!(
+            users_line.starts_with("~ "),
+            "modified table should have ~ prefix, got: {users_line}"
+        );
+    }
+
+    #[test]
+    fn overlay_marker_on_added_column() {
+        // Expand "users" (second table in BTreeMap) to see columns.
+        let mut state = overlay_state();
+        // Navigate to users (Tab from posts)
+        state = state.next_table().toggle_expand();
+        let lines = render_document(&state);
+        // "email" column in users should have no marker (not in overlay changes)
+        let email_line = lines
+            .iter()
+            .map(|l| spans_to_string(l))
+            .find(|s| s.contains("email"))
+            .expect("should have email column line");
+        assert!(
+            !email_line.starts_with("+ ")
+                && !email_line.starts_with("- ")
+                && !email_line.starts_with("~ "),
+            "unaffected column should have no marker, got: {email_line}"
+        );
+    }
+
+    #[test]
+    fn overlay_marker_on_added_table() {
+        let state = overlay_state();
+        let lines = render_document(&state);
+        // "posts" is first in BTreeMap order, and is being AddTable'd
+        let posts_line = spans_to_string(&lines[0]);
+        assert!(
+            posts_line.starts_with("+ "),
+            "added table should have + prefix, got: {posts_line}"
+        );
+    }
+
+    #[test]
+    fn overlay_markers_hidden_when_not_active() {
+        let state = overlay_state().toggle_pending_overlay(); // turn off
+        assert!(!state.show_pending_overlay);
+        let lines = render_document(&state);
+        // First line is "posts" which would have "+" when overlay is on
+        let header = spans_to_string(&lines[0]);
+        assert!(
+            !header.starts_with("~ ") && !header.starts_with("+ ") && !header.starts_with("- "),
+            "no overlay markers when overlay is off, got: {header}"
+        );
+    }
+
+    #[test]
+    fn overlay_marker_style_colors() {
+        assert_eq!(marker_style(ChangeMarker::Added).fg, Some(Color::Green));
+        assert_eq!(marker_style(ChangeMarker::Removed).fg, Some(Color::Red));
+        assert_eq!(marker_style(ChangeMarker::Modified).fg, Some(Color::Yellow));
     }
 }

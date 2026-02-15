@@ -21,7 +21,7 @@ use ratatui::Frame;
 
 use self::app::{AppState, Mode};
 use self::hud::HudResultHandle;
-use self::input::{handle_key, WarningResultHandle};
+use self::input::{handle_key, OverlayResultHandle, WarningResultHandle};
 
 /// Tick rate for the event loop poll interval.
 const TICK_RATE: Duration = Duration::from_millis(50);
@@ -140,6 +140,7 @@ fn run_event_loop(
 ) -> Result<()> {
     let mut hud_handle: Option<HudResultHandle> = None;
     let mut warning_handle: Option<WarningResultHandle> = None;
+    let mut overlay_handle: Option<OverlayResultHandle> = None;
 
     loop {
         // Update viewport height from terminal size
@@ -168,6 +169,40 @@ fn run_event_loop(
             }
         }
 
+        // Poll for overlay computation results
+        let overlay_result = overlay_handle
+            .as_ref()
+            .and_then(|h| h.lock().ok().and_then(|mut guard| guard.take()));
+        if let Some(result) = overlay_result {
+            match result {
+                Ok(overlay) => {
+                    if overlay.is_empty() {
+                        state = state
+                            .with_pending_overlay(None)
+                            .with_status("No pending migrations");
+                        state.show_pending_overlay = false;
+                    } else {
+                        let count = overlay.pending_count;
+                        let change_count = overlay.changes.len();
+                        let unparseable_count = overlay.unparseable.len();
+                        let mut msg =
+                            format!("{count} pending migration(s), {change_count} change(s)");
+                        if unparseable_count > 0 {
+                            msg.push_str(&format!(", {unparseable_count} unparseable"));
+                        }
+                        state = state.with_pending_overlay(Some(overlay)).with_status(msg);
+                    }
+                }
+                Err(err) => {
+                    state = state
+                        .with_pending_overlay(None)
+                        .with_status(format!("Overlay error: {err}"));
+                    state.show_pending_overlay = false;
+                }
+            }
+            overlay_handle = None;
+        }
+
         // Check pending key timeout (1 second)
         if state.is_pending_key_expired(Duration::from_secs(1)) {
             state = state
@@ -194,6 +229,9 @@ fn run_event_loop(
                         }
                         if let Some(h) = result.warning_handle {
                             warning_handle = Some(h);
+                        }
+                        if let Some(h) = result.overlay_handle {
+                            overlay_handle = Some(h);
                         }
                         // Clear handles when leaving respective modes
                         if state.mode != Mode::HUD {
@@ -531,6 +569,24 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
             format!(" {msg}"),
             Style::default().fg(Color::Green),
         ));
+    }
+
+    // Show pending overlay indicator
+    if state.show_pending_overlay {
+        if let Some(ref overlay) = state.pending_overlay {
+            let count = overlay.pending_count;
+            spans.push(Span::styled(
+                format!(" [{count} pending]"),
+                Style::default().fg(Color::Magenta),
+            ));
+            if !overlay.unparseable.is_empty() {
+                let n = overlay.unparseable.len();
+                spans.push(Span::styled(
+                    format!(" ({n} unparseable)"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
     }
 
     // Right-aligned table count

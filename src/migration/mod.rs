@@ -1,6 +1,7 @@
 // Migration generation — structural diff to SQL.
 
 pub mod loader;
+pub mod overlay;
 pub mod warnings;
 
 use std::fmt::Write;

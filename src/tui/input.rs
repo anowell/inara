@@ -8,14 +8,23 @@ use super::edit;
 use super::fuzzy::SearchFilter;
 use super::goto::{self, GotoResult};
 use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
+use crate::migration::overlay::PendingOverlay;
 use crate::migration::warnings::MigrationWarning;
 use crate::schema::diff::{self, Rename};
 
 /// Shared handle for receiving async warning check results.
 pub type WarningResultHandle = Arc<Mutex<Option<Vec<MigrationWarning>>>>;
 
+/// Shared handle for receiving async pending overlay results.
+pub type OverlayResultHandle = Arc<Mutex<Option<Result<PendingOverlay, String>>>>;
+
 /// Create a new warning result handle.
 pub fn new_warning_handle() -> WarningResultHandle {
+    Arc::new(Mutex::new(None))
+}
+
+/// Create a new overlay result handle.
+pub fn new_overlay_handle() -> OverlayResultHandle {
     Arc::new(Mutex::new(None))
 }
 
@@ -24,6 +33,7 @@ pub struct HandleResult {
     pub state: AppState,
     pub hud_handle: Option<HudResultHandle>,
     pub warning_handle: Option<WarningResultHandle>,
+    pub overlay_handle: Option<OverlayResultHandle>,
 }
 
 impl HandleResult {
@@ -32,6 +42,7 @@ impl HandleResult {
             state,
             hud_handle: None,
             warning_handle: None,
+            overlay_handle: None,
         }
     }
 
@@ -40,6 +51,7 @@ impl HandleResult {
             state,
             hud_handle: handle,
             warning_handle: None,
+            overlay_handle: None,
         }
     }
 }
@@ -62,7 +74,7 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
             HandleResult::with_hud(state, handle)
         }
         Mode::Command => handle_command(state, key, pool),
-        Mode::SpaceMenu => HandleResult::state_only(handle_space_menu(state, key)),
+        Mode::SpaceMenu => handle_space_menu(state, key, pool),
         Mode::Search => HandleResult::state_only(handle_search(state, key)),
         Mode::Edit => HandleResult::state_only(edit::handle_edit(state, key)),
         Mode::Rename => HandleResult::state_only(edit::handle_rename(state, key)),
@@ -285,6 +297,7 @@ fn execute_write_migration(state: AppState, description: String, pool: &PgPool) 
         state,
         hud_handle: None,
         warning_handle: Some(handle),
+        overlay_handle: None,
     }
 }
 
@@ -360,14 +373,70 @@ fn auto_describe(changes: &[diff::Change]) -> String {
 /// The space menu shows available subcommands. Pressing a submenu key
 /// immediately opens the corresponding search filter. Esc or any
 /// unrecognized key dismisses the menu.
-fn handle_space_menu(state: AppState, key: KeyEvent) -> AppState {
+fn handle_space_menu(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
     match key.code {
-        KeyCode::Char('f') => state.enter_search(SearchFilter::All),
-        KeyCode::Char('t') => state.enter_search(SearchFilter::Tables),
-        KeyCode::Char('c') => state.enter_search(SearchFilter::Columns),
-        KeyCode::Char('m') => state.enter_search(SearchFilter::Migrations),
-        KeyCode::Esc | KeyCode::Char(' ') => state.with_mode(Mode::Normal),
-        _ => state.with_mode(Mode::Normal), // dismiss on unknown key
+        KeyCode::Char('f') => HandleResult::state_only(state.enter_search(SearchFilter::All)),
+        KeyCode::Char('t') => HandleResult::state_only(state.enter_search(SearchFilter::Tables)),
+        KeyCode::Char('c') => HandleResult::state_only(state.enter_search(SearchFilter::Columns)),
+        KeyCode::Char('m') => {
+            HandleResult::state_only(state.enter_search(SearchFilter::Migrations))
+        }
+        KeyCode::Char('p') => toggle_pending_overlay(state, pool),
+        KeyCode::Esc | KeyCode::Char(' ') => {
+            HandleResult::state_only(state.with_mode(Mode::Normal))
+        }
+        _ => HandleResult::state_only(state.with_mode(Mode::Normal)),
+    }
+}
+
+/// Toggle the pending migrations overlay.
+///
+/// If the overlay is currently showing, hides it. Otherwise, spawns an
+/// async task to compute the overlay data from the database.
+fn toggle_pending_overlay(state: AppState, pool: &PgPool) -> HandleResult {
+    let state = state.with_mode(Mode::Normal);
+
+    if state.show_pending_overlay {
+        // Turn off the overlay
+        return HandleResult::state_only(state.toggle_pending_overlay());
+    }
+
+    // Turn on the overlay — spawn async computation
+    let handle = new_overlay_handle();
+    spawn_overlay_computation(pool.clone(), handle.clone());
+
+    let state = state
+        .toggle_pending_overlay()
+        .with_status("Loading pending migrations...");
+
+    HandleResult {
+        state,
+        hud_handle: None,
+        warning_handle: None,
+        overlay_handle: Some(handle),
+    }
+}
+
+/// Spawn async overlay computation in a background task.
+fn spawn_overlay_computation(pool: PgPool, handle: OverlayResultHandle) {
+    let handle_clone = handle.clone();
+    let result = tokio::runtime::Handle::try_current().map(|rt| {
+        rt.spawn(async move {
+            let migrations_dir = std::path::Path::new("migrations");
+            let result =
+                crate::migration::overlay::compute_overlay(&pool, migrations_dir, "public").await;
+            let result = result.map_err(|e| e.to_string());
+            if let Ok(mut guard) = handle_clone.lock() {
+                *guard = Some(result);
+            }
+        });
+    });
+
+    // No runtime available — set error immediately
+    if result.is_err() {
+        if let Ok(mut guard) = handle.lock() {
+            *guard = Some(Err("No async runtime available".into()));
+        }
     }
 }
 
@@ -727,7 +796,7 @@ mod tests {
         match state.mode {
             Mode::Normal => handle_normal_no_pool(state, key),
             Mode::Command => handle_command(state, key, &no_pool()).state,
-            Mode::SpaceMenu => handle_space_menu(state, key),
+            Mode::SpaceMenu => handle_space_menu(state, key, &no_pool()).state,
             Mode::Search => handle_search(state, key),
             Mode::Edit => edit::handle_edit(state, key),
             Mode::Rename => edit::handle_rename(state, key),
@@ -1046,6 +1115,24 @@ mod tests {
             state.search.as_ref().unwrap().filter,
             SearchFilter::Migrations
         );
+    }
+
+    #[test]
+    fn space_menu_p_toggles_pending_overlay() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('p')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.show_pending_overlay);
+    }
+
+    #[test]
+    fn space_menu_p_toggles_off() {
+        let state = sample_state()
+            .with_mode(Mode::SpaceMenu)
+            .toggle_pending_overlay(); // pre-enable
+        assert!(state.show_pending_overlay);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('p')));
+        assert!(!state.show_pending_overlay);
     }
 
     #[test]

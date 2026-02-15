@@ -5,10 +5,13 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
+use inara::migration::overlay::PendingOverlay;
+use inara::schema::diff::Change;
 use inara::schema::types::{Expression, PgType};
 use inara::schema::{Column, Constraint, Schema, Table};
 use inara::tui::app::{AppState, FocusTarget, Mode};
 use inara::tui::edit;
+use inara::tui::view;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -381,4 +384,146 @@ fn second_write_after_confirm_shows_no_changes() {
 
     // Cleanup
     let _ = std::fs::remove_dir_all("migrations");
+}
+
+// ── Pending overlay integration tests ─────────────────────────────
+
+/// Helper: convert a ratatui Line to plain text.
+fn spans_to_string(line: &ratatui::text::Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+#[test]
+fn overlay_shows_added_table_marker() {
+    let mut schema = Schema::new();
+    let mut users = Table::new("users");
+    users.add_column(Column::new("id", PgType::Uuid));
+    schema.add_table(users);
+
+    let overlay = PendingOverlay {
+        changes: vec![Change::AddTable({
+            let mut t = Table::new("posts");
+            t.add_column(Column::new("id", PgType::Uuid));
+            t
+        })],
+        pending_count: 1,
+        unparseable: Vec::new(),
+    };
+
+    let state = AppState::new(schema, "test".into())
+        .with_viewport_height(20)
+        .with_pending_overlay(Some(overlay))
+        .toggle_pending_overlay();
+
+    assert!(state.show_pending_overlay);
+    let lines = view::render_document(&state);
+
+    // "users" is not affected → no marker
+    let users_text = spans_to_string(&lines[0]);
+    assert!(
+        !users_text.starts_with("+ ") && !users_text.starts_with("- "),
+        "unaffected table should have no overlay marker, got: {users_text}"
+    );
+}
+
+#[test]
+fn overlay_shows_modified_table_marker_with_columns() {
+    let mut schema = Schema::new();
+    let mut users = Table::new("users");
+    users.add_column(Column::new("id", PgType::Uuid));
+    users.add_column(Column::new("email", PgType::Text));
+    schema.add_table(users);
+
+    let overlay = PendingOverlay {
+        changes: vec![Change::AddColumn {
+            table: "users".into(),
+            column: Column::new("bio", PgType::Text),
+        }],
+        pending_count: 1,
+        unparseable: Vec::new(),
+    };
+
+    let state = AppState::new(schema, "test".into())
+        .with_viewport_height(20)
+        .toggle_expand() // expand users
+        .with_pending_overlay(Some(overlay))
+        .toggle_pending_overlay();
+
+    let lines = view::render_document(&state);
+    let header = spans_to_string(&lines[0]);
+    assert!(
+        header.starts_with("~ "),
+        "table with column changes should have ~ marker, got: {header}"
+    );
+}
+
+#[test]
+fn overlay_empty_shows_no_markers() {
+    let mut schema = Schema::new();
+    schema.add_table(Table::new("users"));
+
+    let overlay = PendingOverlay {
+        changes: Vec::new(),
+        pending_count: 0,
+        unparseable: Vec::new(),
+    };
+
+    let state = AppState::new(schema, "test".into())
+        .with_viewport_height(20)
+        .with_pending_overlay(Some(overlay))
+        .toggle_pending_overlay();
+
+    let lines = view::render_document(&state);
+    let text = spans_to_string(&lines[0]);
+    assert!(
+        !text.starts_with("+ ") && !text.starts_with("- ") && !text.starts_with("~ "),
+        "empty overlay should show no markers, got: {text}"
+    );
+}
+
+#[test]
+fn overlay_toggle_on_off() {
+    let mut schema = Schema::new();
+    schema.add_table(Table::new("users"));
+
+    let overlay = PendingOverlay {
+        changes: vec![Change::AddTable(Table::new("users"))],
+        pending_count: 1,
+        unparseable: Vec::new(),
+    };
+
+    let state = AppState::new(schema, "test".into())
+        .with_viewport_height(20)
+        .with_pending_overlay(Some(overlay))
+        .toggle_pending_overlay();
+
+    // Overlay is on → should have marker
+    let lines = view::render_document(&state);
+    let text = spans_to_string(&lines[0]);
+    assert!(
+        text.starts_with("+ "),
+        "overlay on → added table marker, got: {text}"
+    );
+
+    // Toggle off
+    let state = state.toggle_pending_overlay();
+    let lines = view::render_document(&state);
+    let text = spans_to_string(&lines[0]);
+    assert!(
+        !text.starts_with("+ "),
+        "overlay off → no marker, got: {text}"
+    );
+}
+
+#[test]
+fn overlay_with_unparseable_has_pending_count() {
+    let overlay = PendingOverlay {
+        changes: Vec::new(),
+        pending_count: 2,
+        unparseable: vec!["bad_migration.up.sql".into()],
+    };
+
+    assert!(!overlay.is_empty());
+    assert_eq!(overlay.unparseable.len(), 1);
+    assert_eq!(overlay.pending_count, 2);
 }

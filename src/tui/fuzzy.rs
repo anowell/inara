@@ -301,6 +301,7 @@ pub const SPACE_MENU_ITEMS: &[(&str, &str)] = &[
     ("t", "Find table"),
     ("c", "Find column"),
     ("m", "Find migration"),
+    ("p", "Pending migrations"),
 ];
 
 /// Render the space menu overlay.

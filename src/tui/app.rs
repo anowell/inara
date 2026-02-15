@@ -7,6 +7,7 @@ use super::fuzzy::SearchState;
 use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
 use crate::migration::loader::MigrationIndex;
+use crate::migration::overlay::PendingOverlay;
 use crate::schema::relations::RelationMap;
 use crate::schema::type_map::TypeMapper;
 use crate::schema::Schema;
@@ -182,6 +183,10 @@ pub struct AppState {
     pub type_mapper: TypeMapper,
     /// Whether to show Rust type annotations alongside PG types.
     pub show_rust_types: bool,
+    /// Pending migrations overlay state (present when overlay is active).
+    pub pending_overlay: Option<PendingOverlay>,
+    /// Whether the pending overlay is currently visible.
+    pub show_pending_overlay: bool,
 }
 
 impl AppState {
@@ -221,6 +226,8 @@ impl AppState {
             pending_key_time: None,
             type_mapper: TypeMapper::new(),
             show_rust_types: false,
+            pending_overlay: None,
+            show_pending_overlay: false,
         }
     }
 
@@ -527,6 +534,18 @@ impl AppState {
     /// Toggle Rust type annotation display on/off.
     pub fn toggle_rust_types(mut self) -> Self {
         self.show_rust_types = !self.show_rust_types;
+        self
+    }
+
+    /// Set the pending overlay data.
+    pub fn with_pending_overlay(mut self, overlay: Option<PendingOverlay>) -> Self {
+        self.pending_overlay = overlay;
+        self
+    }
+
+    /// Toggle the pending overlay visibility on/off.
+    pub fn toggle_pending_overlay(mut self) -> Self {
+        self.show_pending_overlay = !self.show_pending_overlay;
         self
     }
 
