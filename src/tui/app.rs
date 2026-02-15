@@ -427,7 +427,7 @@ impl AppState {
                 }
             }
         }
-        self.scroll_to_cursor()
+        self.scroll_to_focus()
     }
 
     /// Enter search mode pre-populated with goto picker results.
@@ -526,7 +526,7 @@ impl AppState {
             }
         }
 
-        self.scroll_to_cursor()
+        self.scroll_to_focus()
     }
 
     /// Set the quit flag.
@@ -620,7 +620,7 @@ impl AppState {
         for i in (self.cursor + 1)..self.doc.len() {
             if matches!(self.doc[i].target, FocusTarget::Table(_)) {
                 self.cursor = i;
-                return self.scroll_to_cursor();
+                return self.scroll_to_focus();
             }
         }
         // Wrap or stay
@@ -635,7 +635,7 @@ impl AppState {
         for i in (0..self.cursor).rev() {
             if matches!(self.doc[i].target, FocusTarget::Table(_)) {
                 self.cursor = i;
-                return self.scroll_to_cursor();
+                return self.scroll_to_focus();
             }
         }
         self
@@ -684,6 +684,74 @@ impl AppState {
             self.viewport_offset = self.cursor - self.viewport_height + 1;
         }
         self
+    }
+
+    /// Smart scroll for goto/jump operations.
+    ///
+    /// Priority:
+    /// 1. Center cursor — if full node also fits in view, this is ideal.
+    /// 2. Show full node (centered in viewport) — cursor is always inside.
+    /// 3. Center cursor as fallback when node is too large for viewport.
+    fn scroll_to_focus(mut self) -> Self {
+        if self.viewport_height == 0 {
+            return self;
+        }
+
+        let (node_start, node_end) = self.node_range_at(self.cursor);
+        let vh = self.viewport_height;
+        let max_offset = self.doc.len().saturating_sub(vh);
+
+        // Centered offset for cursor
+        let centered = self.cursor.saturating_sub(vh / 2).min(max_offset);
+
+        // 1. Center cursor — check if full node is visible at that position
+        if node_start >= centered && node_end < centered + vh {
+            self.viewport_offset = centered;
+            return self;
+        }
+
+        // 2. Show full node centered in viewport (cursor is always inside the node)
+        let node_height = node_end - node_start + 1;
+        if node_height <= vh {
+            let offset = node_start
+                .saturating_sub((vh - node_height) / 2)
+                .min(max_offset);
+            self.viewport_offset = offset;
+            return self;
+        }
+
+        // 3. Fallback: center cursor (node too large for viewport)
+        self.viewport_offset = centered;
+        self
+    }
+
+    /// Find the range (start, end inclusive) of the block containing the given line.
+    ///
+    /// Blocks are separated by `Blank` lines. Returns `(pos, pos)` for blank
+    /// lines or out-of-bounds positions.
+    fn node_range_at(&self, pos: usize) -> (usize, usize) {
+        if self.doc.is_empty() || pos >= self.doc.len() {
+            return (pos, pos);
+        }
+
+        if matches!(self.doc[pos].target, FocusTarget::Blank) {
+            return (pos, pos);
+        }
+
+        // Search backward for block start (line after a Blank, or start of doc)
+        let start = (0..pos)
+            .rev()
+            .find(|&i| matches!(self.doc[i].target, FocusTarget::Blank))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // Search forward for block end (line before a Blank, or end of doc)
+        let end = ((pos + 1)..self.doc.len())
+            .find(|&i| matches!(self.doc[i].target, FocusTarget::Blank))
+            .map(|i| i - 1)
+            .unwrap_or(self.doc.len() - 1);
+
+        (start, end)
     }
 }
 
@@ -1158,5 +1226,164 @@ mod tests {
         // Collapse — cursor should jump to table header
         let state = state.toggle_expand();
         assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+    }
+
+    // --- node_range_at tests ---
+
+    #[test]
+    fn node_range_collapsed_tables() {
+        let state = sample_state();
+        // Doc: alpha(0) blank(1) bravo(2) blank(3) charlie(4) blank(5) delta(6) blank(7) echo(8)
+        assert_eq!(state.node_range_at(0), (0, 0)); // alpha alone
+        assert_eq!(state.node_range_at(1), (1, 1)); // blank
+        assert_eq!(state.node_range_at(2), (2, 2)); // bravo alone
+        assert_eq!(state.node_range_at(8), (8, 8)); // echo alone
+    }
+
+    #[test]
+    fn node_range_expanded_table() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut table = Table::new("aaa_users");
+        table.add_column(Column::new("id", PgType::Uuid));
+        table.add_column(Column::new("name", PgType::Text));
+        schema.add_table(table);
+        schema.add_table(Table::new("zzz_posts"));
+
+        let mut state = AppState::new(schema, String::new());
+        state.expanded.insert("aaa_users".into());
+        state.rebuild_doc();
+        // Doc: aaa_users(0) id(1) name(2) close(3) blank(4) zzz_posts(5)
+
+        assert_eq!(state.node_range_at(0), (0, 3)); // table header
+        assert_eq!(state.node_range_at(1), (0, 3)); // column inside
+        assert_eq!(state.node_range_at(2), (0, 3)); // column inside
+        assert_eq!(state.node_range_at(3), (0, 3)); // close brace
+        assert_eq!(state.node_range_at(4), (4, 4)); // blank
+        assert_eq!(state.node_range_at(5), (5, 5)); // zzz_posts collapsed
+    }
+
+    // --- scroll_to_focus tests ---
+
+    #[test]
+    fn scroll_to_focus_centers_cursor_when_node_fits() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        // Create a table with 5 columns (7 lines expanded: header + 5 cols + close)
+        let mut table = Table::new("users");
+        for name in ["a", "b", "c", "d", "e"] {
+            table.add_column(Column::new(name, PgType::Text));
+        }
+        schema.add_table(table);
+        // Add padding tables so doc is long enough to need scrolling
+        for i in 0..10 {
+            schema.add_table(Table::new(format!("t{i:02}")));
+        }
+
+        let mut state = AppState::new(schema, String::new());
+        state.expanded.insert("users".into());
+        state.rebuild_doc();
+        let state = state.with_viewport_height(20);
+
+        // Jump cursor to "users" table header (line 0)
+        // Node is lines 0-6, viewport 20 lines — node fits easily
+        let state = state.cursor_to(0);
+        let state = AppState {
+            cursor: state.cursor,
+            ..state
+        }
+        .scroll_to_focus();
+        // Centered offset for cursor 0 = 0 (can't go negative)
+        // Node 0-6 fits in viewport starting at 0
+        assert_eq!(state.viewport_offset, 0);
+    }
+
+    #[test]
+    fn scroll_to_focus_centers_node_when_centering_cursor_would_clip_node() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        // 10 padding tables before the target
+        for i in 0..10 {
+            schema.add_table(Table::new(format!("a{i:02}")));
+        }
+        // Target table with 8 columns (10 lines: header + 8 cols + close)
+        let mut table = Table::new("target");
+        for i in 0..8 {
+            table.add_column(Column::new(format!("col{i}"), PgType::Text));
+        }
+        schema.add_table(table);
+
+        let mut state = AppState::new(schema, String::new());
+        state.expanded.insert("target".into());
+        state.rebuild_doc();
+        let state = state.with_viewport_height(12);
+
+        // Find the close brace position for "target"
+        let close_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::TableClose("target".into()))
+            .unwrap();
+
+        // Jump to the close brace — centering cursor would clip the table header
+        let mut state = state.cursor_to(close_pos);
+        state = AppState {
+            cursor: state.cursor,
+            ..state
+        }
+        .scroll_to_focus();
+
+        // Node should be fully visible
+        let node_start = close_pos - 9; // header is 9 lines before close
+        assert!(state.viewport_offset <= node_start);
+        assert!(close_pos < state.viewport_offset + state.viewport_height);
+    }
+
+    #[test]
+    fn scroll_to_focus_centers_cursor_for_large_node() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        // 5 padding tables
+        for i in 0..5 {
+            schema.add_table(Table::new(format!("a{i:02}")));
+        }
+        // Large table with 20 columns (22 lines: header + 20 cols + close)
+        let mut table = Table::new("big");
+        for i in 0..20 {
+            table.add_column(Column::new(format!("col{i:02}"), PgType::Text));
+        }
+        schema.add_table(table);
+
+        let mut state = AppState::new(schema, String::new());
+        state.expanded.insert("big".into());
+        state.rebuild_doc();
+        let state = state.with_viewport_height(10);
+
+        // Find a column in the middle of the big table
+        let mid_col = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("big".into(), "col10".into()))
+            .unwrap();
+
+        let mut state = state.cursor_to(mid_col);
+        state = AppState {
+            cursor: state.cursor,
+            ..state
+        }
+        .scroll_to_focus();
+
+        // Node is 22 lines, viewport is 10 — can't show full node
+        // Should center cursor: offset ≈ mid_col - 5
+        let expected = mid_col.saturating_sub(5);
+        assert_eq!(state.viewport_offset, expected);
     }
 }
