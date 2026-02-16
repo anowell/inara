@@ -88,8 +88,25 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
     // Initialize file-based tracing before entering TUI mode
     init_file_tracing();
 
+    eprintln!("Connecting to {connection_info}...");
     tracing::info!("Connecting to database...");
-    let pool = sqlx::PgPool::connect(database_url).await?;
+    let connect_timeout = Duration::from_secs(5);
+    let connect = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(connect_timeout)
+        .connect(database_url);
+    let pool = match tokio::time::timeout(connect_timeout + Duration::from_secs(1), connect).await {
+        Ok(Ok(pool)) => pool,
+        Ok(Err(e)) => {
+            return Err(color_eyre::eyre::eyre!(
+                "could not connect to {connection_info}: {e}"
+            ));
+        }
+        Err(_) => {
+            return Err(color_eyre::eyre::eyre!(
+                "connection timed out after 5s — could not connect to {connection_info}"
+            ));
+        }
+    };
     tracing::info!("Connected. Loading schema...");
 
     let schema = crate::schema::introspect::introspect(&pool, "public").await?;
