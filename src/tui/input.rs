@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sqlx::PgPool;
 
 use super::app::{
-    AppState, FocusTarget, LlmPreviewKind, LlmPreviewState, MigrationPreviewState, Mode, PendingKey,
+    AppState, FocusTarget, LlmPreviewKind, LlmPreviewState, MigrationPreviewState, Mode,
 };
 use super::edit;
 use super::fuzzy::SearchFilter;
@@ -103,6 +103,7 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
         Mode::Normal => handle_normal(state, key, pool),
         Mode::Command => handle_command(state, key, pool),
         Mode::SpaceMenu => handle_space_menu(state, key, pool),
+        Mode::GotoMenu => HandleResult::state_only(handle_goto_menu(state, key)),
         Mode::Search => HandleResult::state_only(handle_search(state, key)),
         Mode::DefaultPrompt => HandleResult::state_only(edit::handle_default_prompt(state, key)),
         Mode::Rename => HandleResult::state_only(edit::handle_rename(state, key)),
@@ -119,11 +120,6 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
 
 /// Handle key events in Normal mode.
 fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
-    // Check for pending key sequences first
-    if state.pending_key == PendingKey::G {
-        return HandleResult::state_only(handle_g_sequence(state, key));
-    }
-
     match key.code {
         // Movement
         KeyCode::Char('j') | KeyCode::Down => HandleResult::state_only(state.cursor_down(1)),
@@ -132,7 +128,7 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             let last = state.line_count().saturating_sub(1);
             HandleResult::state_only(state.cursor_to(last))
         }
-        KeyCode::Char('g') => HandleResult::state_only(state.with_pending_key(PendingKey::G)),
+        KeyCode::Char('g') => HandleResult::state_only(state.with_mode(Mode::GotoMenu)),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let half = state.viewport_height / 2;
             HandleResult::state_only(state.cursor_down(half.max(1)))
@@ -181,9 +177,13 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
     }
 }
 
-/// Handle the second key in a `g` prefix sequence.
-fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
-    let state = state.with_pending_key(PendingKey::None);
+/// Handle key events in GotoMenu mode.
+///
+/// The goto menu shows available goto targets for the current context.
+/// Pressing a valid goto key executes the goto. Esc or any unrecognized
+/// key dismisses the menu.
+fn handle_goto_menu(state: AppState, key: KeyEvent) -> AppState {
+    let state = state.with_mode(Mode::Normal);
     match key.code {
         KeyCode::Char('g') => state.cursor_to(0), // gg -> first line
         KeyCode::Char(ch) => {
@@ -205,7 +205,7 @@ fn handle_g_sequence(state: AppState, key: KeyEvent) -> AppState {
                 GotoResult::NotAvailable(msg) => state.with_status(msg),
             }
         }
-        _ => state.with_status("unknown goto"), // non-char keys cancel
+        _ => state, // non-char keys dismiss
     }
 }
 
@@ -1120,6 +1120,7 @@ mod tests {
             Mode::Normal => handle_normal_no_pool(state, key),
             Mode::Command => handle_command(state, key, &no_pool()).state,
             Mode::SpaceMenu => handle_space_menu(state, key, &no_pool()).state,
+            Mode::GotoMenu => handle_goto_menu(state, key),
             Mode::Search => handle_search(state, key),
             Mode::DefaultPrompt => edit::handle_default_prompt(state, key),
             Mode::Rename => edit::handle_rename(state, key),
@@ -1139,10 +1140,6 @@ mod tests {
 
     /// Normal mode handler for tests (no pool, no HUD opening, no editor spawn).
     fn handle_normal_no_pool(state: AppState, key: KeyEvent) -> AppState {
-        if state.pending_key == PendingKey::G {
-            return handle_g_sequence(state, key);
-        }
-
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => state.cursor_down(1),
             KeyCode::Char('k') | KeyCode::Up => state.cursor_up(1),
@@ -1150,7 +1147,7 @@ mod tests {
                 let last = state.line_count().saturating_sub(1);
                 state.cursor_to(last)
             }
-            KeyCode::Char('g') => state.with_pending_key(PendingKey::G),
+            KeyCode::Char('g') => state.with_mode(Mode::GotoMenu),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let half = state.viewport_height / 2;
                 state.cursor_down(half.max(1))
@@ -1213,13 +1210,13 @@ mod tests {
     #[test]
     fn normal_gg_jumps_to_first() {
         let state = sample_state().cursor_to(3);
-        // First 'g' sets pending
+        // First 'g' enters GotoMenu mode
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
-        assert_eq!(state.pending_key, PendingKey::G);
-        // Second 'g' jumps to first
+        assert_eq!(state.mode, Mode::GotoMenu);
+        // Second 'g' jumps to first line and returns to Normal
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         assert_eq!(state.cursor, 0);
-        assert_eq!(state.pending_key, PendingKey::None);
+        assert_eq!(state.mode, Mode::Normal);
     }
 
     #[test]
@@ -1374,7 +1371,7 @@ mod tests {
         let state = sample_state().cursor_to(2);
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('x'))); // unknown
-        assert_eq!(state.pending_key, PendingKey::None);
+        assert_eq!(state.mode, Mode::Normal);
         assert_eq!(state.cursor, 2); // unchanged
     }
 
@@ -1678,10 +1675,10 @@ mod tests {
     }
 
     #[test]
-    fn g_enters_pending_state() {
+    fn g_enters_goto_menu() {
         let state = goto_state();
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
-        assert_eq!(state.pending_key, PendingKey::G);
+        assert_eq!(state.mode, Mode::GotoMenu);
     }
 
     #[test]
@@ -1695,7 +1692,7 @@ mod tests {
         let state = state.cursor_to(posts_pos);
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('x')));
-        assert_eq!(state.pending_key, PendingKey::None);
+        assert_eq!(state.mode, Mode::Normal);
         assert!(state.status_message.is_some());
         assert!(state.status_message.as_ref().unwrap().contains("unknown"));
     }
@@ -1712,7 +1709,7 @@ mod tests {
 
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('r')));
-        assert_eq!(state.pending_key, PendingKey::None);
+        assert_eq!(state.mode, Mode::Normal);
         assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
     }
 
@@ -1898,6 +1895,53 @@ mod tests {
 
         let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
         assert!(state.status_message.is_none());
+    }
+
+    // --- GotoMenu mode ---
+
+    #[test]
+    fn goto_menu_esc_returns_to_normal() {
+        let state = goto_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.mode, Mode::GotoMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn goto_menu_nonchar_key_dismisses() {
+        let state = goto_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.mode, Mode::GotoMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Tab));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn goto_menu_g_from_column_context() {
+        let state = goto_state();
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos).toggle_expand();
+        let col_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("posts".into(), "author_id".into()))
+            .unwrap();
+        let state = state.cursor_to(col_pos);
+
+        // g then d should follow FK target
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.mode, Mode::GotoMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Column("users".into(), "id".into()))
+        );
     }
 
     // --- Migration workflow (:w command) ---

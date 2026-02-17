@@ -431,6 +431,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
     // Render overlays on top of the content area
     match state.mode {
         Mode::SpaceMenu => fuzzy::render_space_menu(frame, layout[1]),
+        Mode::GotoMenu => fuzzy::render_goto_menu(frame, layout[1], state),
         Mode::Search => {
             if let Some(ref search) = state.search {
                 fuzzy::render_search_overlay(frame, layout[1], search);
@@ -742,6 +743,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::HUD => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
         Mode::SpaceMenu => Style::default().fg(Color::Black).bg(Color::Cyan),
+        Mode::GotoMenu => Style::default().fg(Color::Black).bg(Color::Cyan),
         Mode::MigrationPreview => Style::default().fg(Color::Black).bg(Color::Green),
         Mode::LlmPending => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::LlmPreview => Style::default().fg(Color::Black).bg(Color::Magenta),

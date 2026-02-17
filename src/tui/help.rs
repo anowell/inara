@@ -245,6 +245,49 @@ const LLM_PREVIEW_BINDINGS: &[Binding] = &[
     },
 ];
 
+const GOTO_MENU_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "g",
+        desc: "First line",
+    },
+    Binding {
+        key: "r",
+        desc: "Incoming refs",
+    },
+    Binding {
+        key: "o",
+        desc: "Outgoing refs (table)",
+    },
+    Binding {
+        key: "d",
+        desc: "FK target (column)",
+    },
+    Binding {
+        key: "i",
+        desc: "Indexes",
+    },
+    Binding {
+        key: "c",
+        desc: "First column (table)",
+    },
+    Binding {
+        key: "t",
+        desc: "Types / parent table",
+    },
+    Binding {
+        key: "y",
+        desc: "Type definition (column)",
+    },
+    Binding {
+        key: "m",
+        desc: "Migrations",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+];
+
 /// Get the keybinding list for a given mode.
 fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
     match mode {
@@ -256,6 +299,7 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
         Mode::Rename => RENAME_BINDINGS,
         Mode::MigrationPreview => MIGRATION_PREVIEW_BINDINGS,
         Mode::SpaceMenu => SPACE_MENU_BINDINGS,
+        Mode::GotoMenu => GOTO_MENU_BINDINGS,
         Mode::LlmPending => LLM_PENDING_BINDINGS,
         Mode::LlmPreview => LLM_PREVIEW_BINDINGS,
     }
@@ -353,6 +397,7 @@ mod tests {
             Mode::HUD,
             Mode::Command,
             Mode::SpaceMenu,
+            Mode::GotoMenu,
             Mode::MigrationPreview,
             Mode::LlmPending,
             Mode::LlmPreview,
