@@ -1,7 +1,7 @@
 // Integration tests for the end-to-end edit → diff → migrate workflow.
 //
 // These tests exercise the full workflow without requiring a database:
-// edit a table in-memory → trigger :w → verify generated SQL file content.
+// mutate a table in-memory → trigger :w → verify generated SQL file content.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
@@ -39,7 +39,7 @@ fn dispatch(state: AppState, key: KeyEvent) -> AppState {
     match state.mode {
         Mode::Normal => match key.code {
             KeyCode::Char(':') => state.with_mode(Mode::Command),
-            KeyCode::Char('e') => edit::enter_edit_mode(state),
+            KeyCode::Char('e') => state, // editor spawning not testable here
             KeyCode::Char('r') => edit::enter_rename_mode(state),
             KeyCode::Enter => state.toggle_expand(),
             KeyCode::Tab => state.next_table(),
@@ -48,7 +48,6 @@ fn dispatch(state: AppState, key: KeyEvent) -> AppState {
             _ => state,
         },
         Mode::Command => inara::tui::input::handle_command_for_test(state, key),
-        Mode::Edit => edit::handle_edit(state, key),
         Mode::Rename => edit::handle_rename(state, key),
         Mode::MigrationPreview => inara::tui::input::handle_migration_preview_for_test(state, key),
         _ => state,
@@ -99,28 +98,23 @@ fn assert_on_table(state: &AppState, name: &str) {
     }
 }
 
-/// Enter edit mode for the current table, insert a column, and exit.
-fn add_column_via_edit(state: AppState, col_text: &str) -> AppState {
+/// Add a column to the currently focused table by directly mutating the schema.
+fn add_column_to_table(state: AppState, col: Column) -> AppState {
+    let table_name = match state.focus() {
+        Some(FocusTarget::Table(name)) => name.to_string(),
+        other => panic!("expected focus on a table, got {other:?}"),
+    };
+
     let state = dispatch(state, key(KeyCode::Enter)); // expand table
-    let state = dispatch(state, key(KeyCode::Char('e'))); // enter edit mode
-    assert_eq!(state.mode, Mode::Edit);
-
-    let mut state = state;
-    let close_idx = state
-        .edit_buffer
-        .iter()
-        .position(|l| l.trim() == "}")
-        .expect("closing brace");
-    state.edit_buffer.insert(close_idx, col_text.to_string());
-
-    let state = dispatch(state, key(KeyCode::Esc));
-    if let Some(ref err) = state.edit_error {
-        panic!(
-            "Parse error after edit: {err}\nBuffer:\n{}",
-            state.edit_buffer.join("\n")
-        );
-    }
-    assert_eq!(state.mode, Mode::Normal);
+    let mut state = state.ensure_original_schema();
+    state
+        .schema
+        .tables
+        .get_mut(&table_name)
+        .unwrap()
+        .add_column(col);
+    state.edited_tables.insert(table_name);
+    state.rebuild_doc();
     state
 }
 
@@ -132,7 +126,7 @@ fn edit_table_add_column_then_write_migration() {
     let state = navigate_to_users(state);
     assert_on_table(&state, "users");
 
-    let state = add_column_via_edit(state, "    bio           text");
+    let state = add_column_to_table(state, Column::new("bio", PgType::Text));
     assert!(state.original_schema.is_some());
     assert!(
         state.edited_tables.contains("users"),
@@ -241,13 +235,13 @@ fn multiple_table_edits_single_migration() {
 
     // Edit posts (first in BTreeMap order): add "author_id" column
     assert_on_table(&state, "posts");
-    let state = add_column_via_edit(state, "    author_id     uuid");
+    let state = add_column_to_table(state, Column::new("author_id", PgType::Uuid));
     assert!(state.edited_tables.contains("posts"));
 
     // Navigate to users table and edit: add "phone" column
     let state = state.next_table();
     assert_on_table(&state, "users");
-    let state = add_column_via_edit(state, "    phone         text");
+    let state = add_column_to_table(state, Column::new("phone", PgType::Text));
     assert!(state.edited_tables.contains("users"));
     assert_eq!(state.edited_tables.len(), 2);
 
@@ -303,7 +297,7 @@ fn cancel_preview_preserves_edit_state() {
     let state = navigate_to_users(state);
 
     // Make an edit
-    let state = add_column_via_edit(state, "    nickname      text");
+    let state = add_column_to_table(state, Column::new("nickname", PgType::Text));
     assert!(state.edited_tables.contains("users"));
 
     // Open preview
@@ -334,7 +328,7 @@ fn auto_generated_description_for_write() {
     let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
     let state = navigate_to_users(state);
 
-    let state = add_column_via_edit(state, "    avatar        text");
+    let state = add_column_to_table(state, Column::new("avatar", PgType::Text));
 
     // :w without description
     let state = dispatch(state, key(KeyCode::Char(':')));
@@ -361,7 +355,7 @@ fn second_write_after_confirm_shows_no_changes() {
     let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
     let state = navigate_to_users(state);
 
-    let state = add_column_via_edit(state, "    tmp           text");
+    let state = add_column_to_table(state, Column::new("tmp", PgType::Text));
 
     // First :w and confirm
     let state = dispatch(state, key(KeyCode::Char(':')));

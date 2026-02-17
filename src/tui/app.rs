@@ -16,8 +16,8 @@ use crate::schema::Schema;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 pub enum Mode {
     Normal,
-    Edit,
     Rename,
+    DefaultPrompt,
     Search,
     HUD,
     Command,
@@ -45,6 +45,15 @@ pub struct RenameMetadata {
 pub enum RenameTarget {
     Table(String),
     Column(String, String),
+}
+
+/// Identifies the column being given a new default value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultPromptTarget {
+    /// The table containing the column.
+    pub table: String,
+    /// The column name.
+    pub column: String,
 }
 
 /// State for the migration preview overlay.
@@ -182,16 +191,10 @@ pub struct AppState {
     pub doc: Vec<DocLine>,
     /// Active search state (present when mode is Search).
     pub search: Option<SearchState>,
-    /// Edit mode: the text buffer being edited.
-    pub edit_buffer: Vec<String>,
-    /// Edit mode: cursor row in the text buffer.
-    pub edit_cursor_row: usize,
-    /// Edit mode: cursor column in the text buffer.
-    pub edit_cursor_col: usize,
-    /// Edit mode: the name of the table being edited.
-    pub edit_table: Option<String>,
-    /// Edit mode: parse error message to display.
-    pub edit_error: Option<String>,
+    /// DefaultPrompt mode: the input buffer for the default expression.
+    pub default_prompt_buf: String,
+    /// DefaultPrompt mode: identifies the column being edited.
+    pub default_prompt_target: Option<DefaultPromptTarget>,
     /// Rename mode: the input buffer for the new name.
     pub rename_buf: String,
     /// Rename mode: what element is being renamed.
@@ -249,11 +252,8 @@ impl AppState {
             expanded,
             doc,
             search: None,
-            edit_buffer: Vec::new(),
-            edit_cursor_row: 0,
-            edit_cursor_col: 0,
-            edit_table: None,
-            edit_error: None,
+            default_prompt_buf: String::new(),
+            default_prompt_target: None,
             rename_buf: String::new(),
             rename_target: None,
             renames: Vec::new(),
@@ -296,6 +296,12 @@ impl AppState {
         }
         if mode == Mode::Rename {
             self.rename_buf = String::new();
+        }
+        if mode == Mode::DefaultPrompt {
+            self.default_prompt_buf = String::new();
+        }
+        if mode != Mode::DefaultPrompt {
+            self.default_prompt_target = None;
         }
         if mode != Mode::HUD {
             self.hud = None;
@@ -649,18 +655,24 @@ impl AppState {
 
         // Try to find the same target in the new doc
         if let Some(ref target) = old_target {
-            // For table-related targets when collapsing, jump to the table header
-            let search_target = match target {
+            // First, try to find the exact same target
+            if let Some(pos) = self.doc.iter().position(|l| &l.target == target) {
+                self.cursor = pos;
+                return;
+            }
+
+            // Fall back: for sub-table targets (e.g. after collapse), jump to the table header
+            let fallback = match target {
                 FocusTarget::Column(t, _)
                 | FocusTarget::Separator(t)
                 | FocusTarget::Constraint(t, _)
                 | FocusTarget::Index(t, _)
                 | FocusTarget::TableClose(t) => Some(FocusTarget::Table(t.clone())),
-                other => Some(other.clone()),
+                _ => None,
             };
 
-            if let Some(ref st) = search_target {
-                if let Some(pos) = self.doc.iter().position(|l| &l.target == st) {
+            if let Some(ref fb) = fallback {
+                if let Some(pos) = self.doc.iter().position(|l| &l.target == fb) {
                     self.cursor = pos;
                     return;
                 }
@@ -965,8 +977,8 @@ mod tests {
     #[test]
     fn mode_display() {
         assert_eq!(Mode::Normal.to_string(), "Normal");
-        assert_eq!(Mode::Edit.to_string(), "Edit");
         assert_eq!(Mode::Rename.to_string(), "Rename");
+        assert_eq!(Mode::DefaultPrompt.to_string(), "DefaultPrompt");
         assert_eq!(Mode::Search.to_string(), "Search");
         assert_eq!(Mode::HUD.to_string(), "HUD");
         assert_eq!(Mode::Command.to_string(), "Command");

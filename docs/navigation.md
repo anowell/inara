@@ -7,10 +7,11 @@ Inara's navigation is inspired by helix editor. This document defines the keybin
 | Mode | Purpose | Enter | Exit |
 |------|---------|-------|------|
 | Normal | Browse schema | Default / `Esc` | — |
-| Edit | Modify schema declarations | `e` on table | `Esc` |
 | Search | Fuzzy find symbols | `Space` submenu | `Esc` / select |
 | HUD | Data glance overlay | `q` | `Esc` |
 | Command | Ex-style commands | `:` | `Enter` / `Esc` |
+| DefaultPrompt | Set column default value | `D` on column | `Enter` / `Esc` |
+| Rename | Rename element | `r` on table/column | `Enter` / `Esc` |
 
 ## Normal Mode
 
@@ -72,9 +73,18 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | Key | Action |
 |-----|--------|
 | `q` | Open Query HUD for focused element |
-| `e` | Enter edit mode on focused table |
+| `e` | Edit focused table in `$EDITOR` |
 | `r` | Rename focused element (explicit) |
 | `:` | Enter command mode |
+
+### Quick Actions (column-focused only)
+
+| Key | Action |
+|-----|--------|
+| `n` | Toggle nullable |
+| `u` | Toggle unique constraint (single-column) |
+| `i` | Toggle index (single-column) |
+| `D` | Set or clear default value (enters DefaultPrompt mode) |
 
 ## Command Mode
 

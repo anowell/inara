@@ -1,240 +1,240 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{AppState, FocusTarget, Mode, RenameMetadata, RenameTarget};
-use crate::schema::parse::parse_single_table;
+use super::app::{AppState, DefaultPromptTarget, FocusTarget, Mode, RenameMetadata, RenameTarget};
 use crate::schema::render::render_single_table;
+use crate::schema::types::Expression;
+use crate::schema::{Constraint, Index};
 
-/// Enter edit mode for the table under the cursor.
+/// An editor request produced by the `e` keybinding.
 ///
-/// Renders the focused table to its declarative text, populates the edit
-/// buffer, and transitions to Edit mode.
-pub fn enter_edit_mode(state: AppState) -> AppState {
-    let table_name = match state.focus() {
-        Some(target) => target.table_name().map(|s| s.to_string()),
-        None => return state,
-    };
+/// The event loop receives this and spawns `$EDITOR` with the rendered text.
+#[derive(Debug, Clone)]
+pub struct EditorRequest {
+    pub table_name: String,
+    pub rendered_text: String,
+}
 
-    let table_name = match table_name {
-        Some(name) => name,
-        None => return state,
-    };
+// ── Quick actions (column-context only) ─────────────────────────
 
-    let table = match state.schema.table(&table_name) {
-        Some(t) => t,
-        None => return state,
+/// Toggle nullable for the focused column.
+pub fn toggle_nullable(state: AppState) -> AppState {
+    let (table_name, col_name) = match state.focus() {
+        Some(FocusTarget::Column(t, c)) => (t.clone(), c.clone()),
+        _ => return state,
     };
-
-    let rendered = render_single_table(table);
-    let lines: Vec<String> = rendered.lines().map(|l| l.to_string()).collect();
 
     let mut state = state.ensure_original_schema();
-    state.edit_buffer = lines;
-    state.edit_cursor_row = 0;
-    state.edit_cursor_col = 0;
-    state.edit_table = Some(table_name);
-    state.edit_error = None;
-    state.mode = Mode::Edit;
+    if let Some(table) = state.schema.tables.get_mut(&table_name) {
+        if let Some(col) = table.columns.iter_mut().find(|c| c.name == col_name) {
+            col.nullable = !col.nullable;
+        }
+    }
+    state.edited_tables.insert(table_name);
+    state.rebuild_doc();
+    state
+}
+
+/// Toggle a single-column UNIQUE constraint for the focused column.
+///
+/// If a single-column UNIQUE already exists on this column, removes it.
+/// Multi-column UNIQUE constraints are never touched.
+pub fn toggle_column_unique(state: AppState) -> AppState {
+    let (table_name, col_name) = match state.focus() {
+        Some(FocusTarget::Column(t, c)) => (t.clone(), c.clone()),
+        _ => return state,
+    };
+
+    let mut state = state.ensure_original_schema();
+    if let Some(table) = state.schema.tables.get_mut(&table_name) {
+        // Check if a single-column UNIQUE exists for this column
+        let existing_idx = table.constraints.iter().position(|c| {
+            matches!(c, Constraint::Unique { columns, .. } if columns.len() == 1 && columns[0] == col_name)
+        });
+
+        if let Some(idx) = existing_idx {
+            table.constraints.remove(idx);
+        } else {
+            let name = format!("{table_name}_{col_name}_key");
+            table.add_constraint(Constraint::Unique {
+                name: Some(name),
+                columns: vec![col_name],
+            });
+        }
+    }
+    state.edited_tables.insert(table_name);
+    state.rebuild_doc();
+    state
+}
+
+/// Toggle a single-column btree index for the focused column.
+///
+/// If a single-column index already exists on this column, removes it.
+/// Multi-column indexes are never touched.
+pub fn toggle_column_index(state: AppState) -> AppState {
+    let (table_name, col_name) = match state.focus() {
+        Some(FocusTarget::Column(t, c)) => (t.clone(), c.clone()),
+        _ => return state,
+    };
+
+    let mut state = state.ensure_original_schema();
+    if let Some(table) = state.schema.tables.get_mut(&table_name) {
+        let existing_idx = table
+            .indexes
+            .iter()
+            .position(|idx| idx.columns.len() == 1 && idx.columns[0] == col_name);
+
+        if let Some(idx) = existing_idx {
+            table.indexes.remove(idx);
+        } else {
+            let name = format!("{table_name}_{col_name}_idx");
+            table.indexes.push(Index {
+                name,
+                columns: vec![col_name],
+                unique: false,
+                partial: None,
+            });
+        }
+    }
+    state.edited_tables.insert(table_name);
+    state.rebuild_doc();
+    state
+}
+
+// ── Default prompt ──────────────────────────────────────────────
+
+/// Enter DefaultPrompt mode for the focused column.
+///
+/// Pre-fills the prompt buffer with the column's current default (if any).
+pub fn enter_default_prompt(state: AppState) -> AppState {
+    let (table_name, col_name) = match state.focus() {
+        Some(FocusTarget::Column(t, c)) => (t.clone(), c.clone()),
+        _ => return state,
+    };
+
+    let current_default = state
+        .schema
+        .table(&table_name)
+        .and_then(|t| t.column(&col_name))
+        .and_then(|c| c.default.as_ref())
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+
+    let mut state = state.ensure_original_schema();
+    state.default_prompt_target = Some(DefaultPromptTarget {
+        table: table_name,
+        column: col_name,
+    });
+    state.default_prompt_buf = current_default;
+    state.mode = Mode::DefaultPrompt;
     state.pending_key = super::app::PendingKey::None;
     state
 }
 
-/// Handle a key event in Edit mode.
-pub fn handle_edit(state: AppState, key: KeyEvent) -> AppState {
+/// Handle a key event in DefaultPrompt mode.
+pub fn handle_default_prompt(state: AppState, key: KeyEvent) -> AppState {
+    // Allow Ctrl-c to propagate (handled at top level)
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return state;
+    }
+
     match key.code {
-        KeyCode::Esc => exit_edit_mode(state),
-        KeyCode::Char(ch) => edit_insert_char(state, ch),
-        KeyCode::Backspace => edit_backspace(state),
-        KeyCode::Delete => edit_delete(state),
-        KeyCode::Enter => edit_newline(state),
-        KeyCode::Left => edit_cursor_left(state),
-        KeyCode::Right => edit_cursor_right(state),
-        KeyCode::Up => edit_cursor_up(state),
-        KeyCode::Down => edit_cursor_down(state),
-        KeyCode::Home => {
+        KeyCode::Esc => cancel_default_prompt(state),
+        KeyCode::Enter => confirm_default_prompt(state),
+        KeyCode::Backspace => {
             let mut state = state;
-            state.edit_cursor_col = 0;
+            state.default_prompt_buf.pop();
             state
         }
-        KeyCode::End => {
+        KeyCode::Char(ch) => {
             let mut state = state;
-            let row = state.edit_cursor_row;
-            state.edit_cursor_col = state.edit_buffer.get(row).map(|l| l.len()).unwrap_or(0);
+            state.default_prompt_buf.push(ch);
             state
         }
         _ => state,
     }
 }
 
-/// Exit edit mode: parse the edited text, update schema if valid.
-fn exit_edit_mode(mut state: AppState) -> AppState {
-    let text = state.edit_buffer.join("\n");
-    let text = if text.ends_with('\n') {
-        text
-    } else {
-        format!("{text}\n")
+fn cancel_default_prompt(mut state: AppState) -> AppState {
+    state.default_prompt_target = None;
+    state.default_prompt_buf.clear();
+    state.with_mode(Mode::Normal)
+}
+
+fn confirm_default_prompt(mut state: AppState) -> AppState {
+    let target = match state.default_prompt_target.take() {
+        Some(t) => t,
+        None => return state.with_mode(Mode::Normal),
     };
 
-    match parse_single_table(&text) {
-        Ok(new_table) => {
-            let table_name = match state.edit_table.take() {
-                Some(name) => name,
-                None => return state.with_mode(Mode::Normal),
-            };
+    let text = state.default_prompt_buf.trim().to_string();
+    state.default_prompt_buf.clear();
 
-            // If the table name changed in the edit, that's a rename
-            if new_table.name != table_name {
-                state.renames.push(RenameMetadata {
-                    table: table_name.clone(),
-                    from: table_name.clone(),
-                    to: new_table.name.clone(),
-                });
-                state.schema.tables.remove(&table_name);
-                state.edited_tables.remove(&table_name);
-                state.edited_tables.insert(new_table.name.clone());
+    if let Some(table) = state.schema.tables.get_mut(&target.table) {
+        if let Some(col) = table.columns.iter_mut().find(|c| c.name == target.column) {
+            if text.is_empty() {
+                col.default = None;
             } else {
-                state.edited_tables.insert(table_name.clone());
-                state.schema.tables.remove(&table_name);
+                col.default = Some(classify_expression(&text));
             }
-
-            state.schema.add_table(new_table);
-            state.edit_buffer.clear();
-            state.edit_error = None;
-            state.rebuild_doc();
-            state.mode = Mode::Normal;
-            state.pending_key = super::app::PendingKey::None;
-            state
-        }
-        Err(e) => {
-            state.edit_error = Some(format!("line {}, col {}: {}", e.line, e.col, e.message));
-            state
         }
     }
+
+    state.edited_tables.insert(target.table);
+    state.rebuild_doc();
+    state.mode = Mode::Normal;
+    state.pending_key = super::app::PendingKey::None;
+    state
 }
 
-fn edit_insert_char(mut state: AppState, ch: char) -> AppState {
-    let row = state.edit_cursor_row;
-    if row >= state.edit_buffer.len() {
-        state.edit_buffer.push(String::new());
+/// Classify a default expression string into an Expression variant.
+///
+/// Reuses the same logic as the parser (parse.rs:370-380).
+fn classify_expression(s: &str) -> Expression {
+    if s.contains('(') && s.ends_with(')') {
+        Expression::FunctionCall(s.to_string())
+    } else if s.starts_with('\'')
+        || s.starts_with('-')
+        || s.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        Expression::Literal(s.to_string())
+    } else {
+        Expression::Raw(s.to_string())
     }
-    let col = state.edit_cursor_col.min(state.edit_buffer[row].len());
-    state.edit_buffer[row].insert(col, ch);
-    state.edit_cursor_col = col + ch.len_utf8();
-    state.edit_error = None;
-    state
 }
 
-fn edit_backspace(mut state: AppState) -> AppState {
-    let row = state.edit_cursor_row;
-    let col = state.edit_cursor_col;
+// ── External editor request ─────────────────────────────────────
 
-    if col > 0 {
-        let line = &state.edit_buffer[row];
-        // Find the byte position of the character before col
-        let prev_char_start = line[..col]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        state.edit_buffer[row].remove(prev_char_start);
-        state.edit_cursor_col = prev_char_start;
-    } else if row > 0 {
-        // Join with previous line
-        let current_line = state.edit_buffer.remove(row);
-        state.edit_cursor_row = row - 1;
-        state.edit_cursor_col = state.edit_buffer[row - 1].len();
-        state.edit_buffer[row - 1].push_str(&current_line);
-    }
-    state.edit_error = None;
-    state
+/// Prepare an editor request for the table under the cursor.
+///
+/// Returns `(state, Some(EditorRequest))` if a table is focused,
+/// or `(state, None)` if no table context is available.
+pub fn prepare_editor_request(state: AppState) -> (AppState, Option<EditorRequest>) {
+    let table_name = match state.focus() {
+        Some(target) => target.table_name().map(|s| s.to_string()),
+        None => return (state, None),
+    };
+
+    let table_name = match table_name {
+        Some(name) => name,
+        None => return (state, None),
+    };
+
+    let table = match state.schema.table(&table_name) {
+        Some(t) => t,
+        None => return (state, None),
+    };
+
+    let rendered = render_single_table(table);
+
+    let request = EditorRequest {
+        table_name,
+        rendered_text: rendered,
+    };
+
+    (state, Some(request))
 }
 
-fn edit_delete(mut state: AppState) -> AppState {
-    let row = state.edit_cursor_row;
-    let col = state.edit_cursor_col;
-    let line_len = state.edit_buffer.get(row).map(|l| l.len()).unwrap_or(0);
-
-    if col < line_len {
-        state.edit_buffer[row].remove(col);
-    } else if row + 1 < state.edit_buffer.len() {
-        // Join with next line
-        let next_line = state.edit_buffer.remove(row + 1);
-        state.edit_buffer[row].push_str(&next_line);
-    }
-    state.edit_error = None;
-    state
-}
-
-fn edit_newline(mut state: AppState) -> AppState {
-    let row = state.edit_cursor_row;
-    let col = state
-        .edit_cursor_col
-        .min(state.edit_buffer.get(row).map(|l| l.len()).unwrap_or(0));
-
-    let rest = state.edit_buffer[row][col..].to_string();
-    state.edit_buffer[row].truncate(col);
-    state.edit_buffer.insert(row + 1, rest);
-    state.edit_cursor_row = row + 1;
-    state.edit_cursor_col = 0;
-    state.edit_error = None;
-    state
-}
-
-fn edit_cursor_left(mut state: AppState) -> AppState {
-    if state.edit_cursor_col > 0 {
-        let line = &state.edit_buffer[state.edit_cursor_row];
-        // Move back one character
-        state.edit_cursor_col = line[..state.edit_cursor_col]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-    }
-    state
-}
-
-fn edit_cursor_right(mut state: AppState) -> AppState {
-    let line_len = state
-        .edit_buffer
-        .get(state.edit_cursor_row)
-        .map(|l| l.len())
-        .unwrap_or(0);
-    if state.edit_cursor_col < line_len {
-        let line = &state.edit_buffer[state.edit_cursor_row];
-        let ch = line[state.edit_cursor_col..]
-            .chars()
-            .next()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
-        state.edit_cursor_col += ch;
-    }
-    state
-}
-
-fn edit_cursor_up(mut state: AppState) -> AppState {
-    if state.edit_cursor_row > 0 {
-        state.edit_cursor_row -= 1;
-        let line_len = state
-            .edit_buffer
-            .get(state.edit_cursor_row)
-            .map(|l| l.len())
-            .unwrap_or(0);
-        state.edit_cursor_col = state.edit_cursor_col.min(line_len);
-    }
-    state
-}
-
-fn edit_cursor_down(mut state: AppState) -> AppState {
-    if state.edit_cursor_row + 1 < state.edit_buffer.len() {
-        state.edit_cursor_row += 1;
-        let line_len = state
-            .edit_buffer
-            .get(state.edit_cursor_row)
-            .map(|l| l.len())
-            .unwrap_or(0);
-        state.edit_cursor_col = state.edit_cursor_col.min(line_len);
-    }
-    state
-}
+// ── Rename mode (unchanged from original) ───────────────────────
 
 /// Enter rename mode for the focused element.
 pub fn enter_rename_mode(state: AppState) -> AppState {
@@ -417,201 +417,357 @@ mod tests {
             .toggle_expand() // expand "users" table
     }
 
-    // ── Edit mode entry/exit ──────────────────────────────────────
+    // ── Quick actions: toggle_nullable ───────────────────────────
 
     #[test]
-    fn enter_edit_on_table_header() {
+    fn toggle_nullable_flips_true_to_false() {
+        let state = state_with_users().cursor_down(2); // "email" column (NOT NULL)
+        assert!(matches!(
+            state.focus(),
+            Some(FocusTarget::Column(_, ref c)) if c == "email"
+        ));
+
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable);
+
+        let state = toggle_nullable(state);
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.nullable);
+        assert!(state.edited_tables.contains("users"));
+        assert!(state.original_schema.is_some());
+    }
+
+    #[test]
+    fn toggle_nullable_flips_false_to_true() {
+        let state = state_with_users().cursor_down(2);
+        let state = toggle_nullable(state); // make nullable
+        let state = toggle_nullable(state); // make NOT NULL again
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable);
+    }
+
+    #[test]
+    fn toggle_nullable_noop_on_non_column() {
+        let state = state_with_users(); // cursor on table header
+        let state = toggle_nullable(state);
+        assert!(state.edited_tables.is_empty());
+    }
+
+    // ── Quick actions: toggle_column_unique ──────────────────────
+
+    #[test]
+    fn toggle_unique_adds_constraint() {
+        // Start with a table that has no unique on "id" (just a PK)
+        let state = state_with_users().cursor_down(1); // "id" column
+        let table = state.schema.table("users").unwrap();
+        let has_unique_on_id = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Unique { columns, .. } if columns == &["id"]));
+        assert!(!has_unique_on_id);
+
+        let state = toggle_column_unique(state);
+        let table = state.schema.table("users").unwrap();
+        let has_unique_on_id = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Unique { columns, .. } if columns == &["id"]));
+        assert!(has_unique_on_id);
+        assert!(state.edited_tables.contains("users"));
+    }
+
+    #[test]
+    fn toggle_unique_removes_existing() {
+        let state = state_with_users().cursor_down(2); // "email" column (has unique)
+        let table = state.schema.table("users").unwrap();
+        let has_unique_on_email = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Unique { columns, .. } if columns == &["email"]));
+        assert!(has_unique_on_email);
+
+        let state = toggle_column_unique(state);
+        let table = state.schema.table("users").unwrap();
+        let has_unique_on_email = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Unique { columns, .. } if columns == &["email"]));
+        assert!(!has_unique_on_email);
+    }
+
+    #[test]
+    fn toggle_unique_preserves_multi_col() {
+        let mut schema = Schema::new();
+        let mut table = Table::new("orders");
+        table.add_column(Column::new("user_id", PgType::Uuid));
+        table.add_column(Column::new("product_id", PgType::Uuid));
+        table.add_constraint(Constraint::Unique {
+            name: Some("orders_user_product_key".into()),
+            columns: vec!["user_id".into(), "product_id".into()],
+        });
+        schema.add_table(table);
+
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1); // "product_id" column (BTreeMap order)
+
+        let state = toggle_column_unique(state);
+        let table = state.schema.table("orders").unwrap();
+        // Multi-col unique should still exist
+        let multi = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Unique { columns, .. } if columns.len() == 2));
+        assert!(multi, "Multi-column unique should be preserved");
+    }
+
+    #[test]
+    fn toggle_unique_noop_on_non_column() {
+        let state = state_with_users(); // table header
+        let state = toggle_column_unique(state);
+        assert!(state.edited_tables.is_empty());
+    }
+
+    // ── Quick actions: toggle_column_index ───────────────────────
+
+    #[test]
+    fn toggle_index_adds_index() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let table = state.schema.table("users").unwrap();
+        let has_idx = table
+            .indexes
+            .iter()
+            .any(|i| i.columns == ["email"] && i.columns.len() == 1);
+        assert!(!has_idx);
+
+        let state = toggle_column_index(state);
+        let table = state.schema.table("users").unwrap();
+        let idx = table
+            .indexes
+            .iter()
+            .find(|i| i.columns == ["email"] && i.columns.len() == 1);
+        assert!(idx.is_some());
+        assert_eq!(idx.unwrap().name, "users_email_idx");
+        assert!(!idx.unwrap().unique);
+        assert!(state.edited_tables.contains("users"));
+    }
+
+    #[test]
+    fn toggle_index_removes_existing() {
+        let state = state_with_users().cursor_down(2);
+        let state = toggle_column_index(state); // add
+        let state = toggle_column_index(state); // remove
+        let table = state.schema.table("users").unwrap();
+        let has_idx = table
+            .indexes
+            .iter()
+            .any(|i| i.columns == ["email"] && i.columns.len() == 1);
+        assert!(!has_idx);
+    }
+
+    #[test]
+    fn toggle_index_noop_on_non_column() {
         let state = state_with_users();
+        let state = toggle_column_index(state);
+        assert!(state.edited_tables.is_empty());
+    }
+
+    #[test]
+    fn quick_actions_all_call_ensure_original_schema() {
+        let state = state_with_users().cursor_down(2);
+        assert!(state.original_schema.is_none());
+
+        let state = toggle_nullable(state);
+        assert!(state.original_schema.is_some());
+    }
+
+    // ── DefaultPrompt mode ──────────────────────────────────────
+
+    #[test]
+    fn enter_default_prompt_on_column() {
+        let state = state_with_users().cursor_down(1); // "id" column (has default)
+        let state = enter_default_prompt(state);
+
+        assert_eq!(state.mode, Mode::DefaultPrompt);
+        assert!(state.default_prompt_target.is_some());
+        let target = state.default_prompt_target.as_ref().unwrap();
+        assert_eq!(target.table, "users");
+        assert_eq!(target.column, "id");
+        // Pre-filled with existing default
+        assert_eq!(state.default_prompt_buf, "gen_random_uuid()");
+    }
+
+    #[test]
+    fn enter_default_prompt_on_column_without_default() {
+        let state = state_with_users().cursor_down(2); // "email" (no default)
+        let state = enter_default_prompt(state);
+
+        assert_eq!(state.mode, Mode::DefaultPrompt);
+        assert!(state.default_prompt_buf.is_empty());
+    }
+
+    #[test]
+    fn enter_default_prompt_noop_on_non_column() {
+        let state = state_with_users(); // table header
+        let state = enter_default_prompt(state);
         assert_eq!(state.mode, Mode::Normal);
-
-        let state = enter_edit_mode(state);
-        assert_eq!(state.mode, Mode::Edit);
-        assert_eq!(state.edit_table, Some("users".into()));
-        assert!(!state.edit_buffer.is_empty());
-        assert!(state.edit_buffer[0].contains("table users"));
     }
 
     #[test]
-    fn enter_edit_on_column_uses_parent_table() {
-        let state = state_with_users().cursor_down(1); // move to first column
-        assert!(matches!(state.focus(), Some(FocusTarget::Column(_, _))));
+    fn default_prompt_confirm_sets_expression() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let state = enter_default_prompt(state);
 
-        let state = enter_edit_mode(state);
-        assert_eq!(state.mode, Mode::Edit);
-        assert_eq!(state.edit_table, Some("users".into()));
+        // Type "now()"
+        let state = handle_default_prompt(state, key(KeyCode::Char('n')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('o')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('w')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('(')));
+        let state = handle_default_prompt(state, key(KeyCode::Char(')')));
+        let state = handle_default_prompt(state, key(KeyCode::Enter));
+
+        assert_eq!(state.mode, Mode::Normal);
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert_eq!(col.default, Some(Expression::FunctionCall("now()".into())));
+        assert!(state.edited_tables.contains("users"));
     }
 
     #[test]
-    fn enter_edit_on_blank_line_does_nothing() {
+    fn default_prompt_confirm_empty_clears_default() {
+        let state = state_with_users().cursor_down(1); // "id" (has default)
+        let col = state.schema.table("users").unwrap().column("id").unwrap();
+        assert!(col.default.is_some());
+
+        let state = enter_default_prompt(state);
+        // Clear the pre-filled buffer
+        let mut state = state;
+        state.default_prompt_buf.clear();
+        let state = handle_default_prompt(state, key(KeyCode::Enter));
+
+        assert_eq!(state.mode, Mode::Normal);
+        let col = state.schema.table("users").unwrap().column("id").unwrap();
+        assert!(col.default.is_none());
+    }
+
+    #[test]
+    fn default_prompt_cancel_returns_unchanged() {
+        let state = state_with_users().cursor_down(2);
+        let state = enter_default_prompt(state);
+        let state = handle_default_prompt(state, key(KeyCode::Char('x')));
+        let state = handle_default_prompt(state, key(KeyCode::Esc));
+
+        assert_eq!(state.mode, Mode::Normal);
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.default.is_none()); // not changed
+    }
+
+    #[test]
+    fn default_prompt_backspace() {
+        let state = state_with_users().cursor_down(2);
+        let state = enter_default_prompt(state);
+        let state = handle_default_prompt(state, key(KeyCode::Char('a')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('b')));
+        assert_eq!(state.default_prompt_buf, "ab");
+        let state = handle_default_prompt(state, key(KeyCode::Backspace));
+        assert_eq!(state.default_prompt_buf, "a");
+    }
+
+    // ── Expression classification ───────────────────────────────
+
+    #[test]
+    fn classify_function_call() {
+        assert_eq!(
+            classify_expression("now()"),
+            Expression::FunctionCall("now()".into())
+        );
+        assert_eq!(
+            classify_expression("gen_random_uuid()"),
+            Expression::FunctionCall("gen_random_uuid()".into())
+        );
+    }
+
+    #[test]
+    fn classify_literal() {
+        assert_eq!(classify_expression("42"), Expression::Literal("42".into()));
+        assert_eq!(
+            classify_expression("'hello'"),
+            Expression::Literal("'hello'".into())
+        );
+        assert_eq!(classify_expression("-1"), Expression::Literal("-1".into()));
+    }
+
+    #[test]
+    fn classify_raw() {
+        assert_eq!(
+            classify_expression("CURRENT_TIMESTAMP"),
+            Expression::Raw("CURRENT_TIMESTAMP".into())
+        );
+        assert_eq!(classify_expression("true"), Expression::Raw("true".into()));
+    }
+
+    // ── Editor request ──────────────────────────────────────────
+
+    #[test]
+    fn prepare_editor_request_on_table() {
+        let state = state_with_users();
+        let (state, request) = prepare_editor_request(state);
+
+        assert!(request.is_some());
+        let req = request.unwrap();
+        assert_eq!(req.table_name, "users");
+        assert!(req.rendered_text.contains("table users"));
+        // original_schema is NOT set until spawn_editor confirms changes
+        assert!(state.original_schema.is_none());
+    }
+
+    #[test]
+    fn prepare_editor_request_on_column() {
+        let state = state_with_users().cursor_down(1);
+        let (_state, request) = prepare_editor_request(state);
+
+        assert!(request.is_some());
+        assert_eq!(request.unwrap().table_name, "users");
+    }
+
+    #[test]
+    fn prepare_editor_request_on_blank_returns_none() {
         let mut schema = Schema::new();
         schema.add_table(Table::new("a"));
         schema.add_table(Table::new("b"));
         let state = AppState::new(schema, String::new())
             .with_viewport_height(20)
-            .cursor_down(1); // blank between tables
-
-        assert!(matches!(state.focus(), Some(FocusTarget::Blank)));
-        let state = enter_edit_mode(state);
-        assert_eq!(state.mode, Mode::Normal);
+            .cursor_down(1); // blank line
+        let (_state, request) = prepare_editor_request(state);
+        assert!(request.is_none());
     }
 
-    #[test]
-    fn edit_sets_original_schema() {
-        let state = state_with_users();
-        assert!(state.original_schema.is_none());
-
-        let state = enter_edit_mode(state);
-        assert!(state.original_schema.is_some());
-    }
-
-    // ── Edit→parse round-trip ─────────────────────────────────────
-
-    #[test]
-    fn edit_exit_without_changes_returns_to_normal() {
-        let state = state_with_users();
-
-        let state = enter_edit_mode(state);
-        // Exit immediately without editing
-        let state = handle_edit(state, key(KeyCode::Esc));
-
-        assert_eq!(state.mode, Mode::Normal);
-        assert!(state.edit_error.is_none());
-        // Table still exists with same structure (constraint names are stripped
-        // by the render→parse roundtrip, but columns and types are preserved)
-        let table = state.schema.table("users").expect("users table");
-        assert_eq!(table.columns.len(), 2);
-        assert_eq!(table.columns[0].name, "id");
-        assert_eq!(table.columns[1].name, "email");
-        assert!(table.primary_key().is_some());
-    }
-
-    #[test]
-    fn edit_add_column_round_trip() {
-        let state = state_with_users();
-        let state = enter_edit_mode(state);
-
-        // Find the closing brace line and insert a new column before it
-        let close_idx = state
-            .edit_buffer
-            .iter()
-            .position(|l| l.trim() == "}")
-            .expect("should have closing brace");
-
-        let mut state = state;
-        // Navigate to just before the closing brace
-        state.edit_cursor_row = close_idx;
-        state.edit_cursor_col = 0;
-
-        // Insert a new column line: "    name  text  NOT NULL\n"
-        let new_line = "    name  text  NOT NULL";
-        state.edit_buffer.insert(close_idx, new_line.to_string());
-
-        // Exit edit mode (parse)
-        let state = handle_edit(state, key(KeyCode::Esc));
-
-        assert_eq!(state.mode, Mode::Normal);
-        assert!(state.edit_error.is_none());
-        let table = state.schema.table("users").expect("users table");
-        assert_eq!(table.columns.len(), 3);
-        assert!(table.column("name").is_some());
-        assert!(state.edited_tables.contains("users"));
-    }
-
-    #[test]
-    fn edit_parse_error_stays_in_edit_mode() {
-        let state = state_with_users();
-        let state = enter_edit_mode(state);
-
-        // Corrupt the buffer
-        let mut state = state;
-        state.edit_buffer[0] = "invalid !!!".to_string();
-
-        let state = handle_edit(state, key(KeyCode::Esc));
-        assert_eq!(state.mode, Mode::Edit);
-        assert!(state.edit_error.is_some());
-    }
-
-    // ── Text editing operations ────────────────────────────────────
-
-    #[test]
-    fn edit_insert_char() {
-        let state = state_with_users();
-        let mut state = enter_edit_mode(state);
-        state.edit_cursor_row = 0;
-        state.edit_cursor_col = 0;
-
-        let state = handle_edit(state, key(KeyCode::Char('x')));
-        assert!(state.edit_buffer[0].starts_with('x'));
-        assert_eq!(state.edit_cursor_col, 1);
-    }
-
-    #[test]
-    fn edit_backspace_within_line() {
-        let state = state_with_users();
-        let mut state = enter_edit_mode(state);
-        state.edit_cursor_row = 0;
-        state.edit_cursor_col = 5;
-
-        let before = state.edit_buffer[0].clone();
-        let state = handle_edit(state, key(KeyCode::Backspace));
-        assert_eq!(state.edit_buffer[0].len(), before.len() - 1);
-        assert_eq!(state.edit_cursor_col, 4);
-    }
-
-    #[test]
-    fn edit_backspace_joins_lines() {
-        let state = state_with_users();
-        let mut state = enter_edit_mode(state);
-        let line_count = state.edit_buffer.len();
-        state.edit_cursor_row = 1;
-        state.edit_cursor_col = 0;
-
-        let state = handle_edit(state, key(KeyCode::Backspace));
-        assert_eq!(state.edit_buffer.len(), line_count - 1);
-        assert_eq!(state.edit_cursor_row, 0);
-    }
-
-    #[test]
-    fn edit_enter_splits_line() {
-        let state = state_with_users();
-        let mut state = enter_edit_mode(state);
-        let line_count = state.edit_buffer.len();
-        state.edit_cursor_row = 0;
-        state.edit_cursor_col = 5;
-
-        let state = handle_edit(state, key(KeyCode::Enter));
-        assert_eq!(state.edit_buffer.len(), line_count + 1);
-        assert_eq!(state.edit_cursor_row, 1);
-        assert_eq!(state.edit_cursor_col, 0);
-    }
-
-    #[test]
-    fn edit_cursor_movement() {
-        let state = state_with_users();
-        let mut state = enter_edit_mode(state);
-        state.edit_cursor_row = 0;
-        state.edit_cursor_col = 3;
-
-        let state = handle_edit(state, key(KeyCode::Left));
-        assert_eq!(state.edit_cursor_col, 2);
-
-        let state = handle_edit(state, key(KeyCode::Right));
-        assert_eq!(state.edit_cursor_col, 3);
-
-        let state = handle_edit(state, key(KeyCode::Down));
-        assert_eq!(state.edit_cursor_row, 1);
-
-        let state = handle_edit(state, key(KeyCode::Up));
-        assert_eq!(state.edit_cursor_row, 0);
-
-        let state = handle_edit(state, key(KeyCode::Home));
-        assert_eq!(state.edit_cursor_col, 0);
-
-        let state = handle_edit(state, key(KeyCode::End));
-        assert_eq!(state.edit_cursor_col, state.edit_buffer[0].len());
-    }
-
-    // ── Rename mode ──────────────────────────────────────────────
+    // ── Rename mode (preserved tests) ───────────────────────────
 
     #[test]
     fn rename_table() {
@@ -625,14 +781,9 @@ mod tests {
         assert_eq!(state.mode, Mode::Rename);
 
         // Type "accounts"
-        let state = handle_rename(state, key(KeyCode::Char('a')));
-        let state = handle_rename(state, key(KeyCode::Char('c')));
-        let state = handle_rename(state, key(KeyCode::Char('c')));
-        let state = handle_rename(state, key(KeyCode::Char('o')));
-        let state = handle_rename(state, key(KeyCode::Char('u')));
-        let state = handle_rename(state, key(KeyCode::Char('n')));
-        let state = handle_rename(state, key(KeyCode::Char('t')));
-        let state = handle_rename(state, key(KeyCode::Char('s')));
+        let state = "accounts"
+            .chars()
+            .fold(state, |s, ch| handle_rename(s, key(KeyCode::Char(ch))));
         let state = handle_rename(state, key(KeyCode::Enter));
 
         assert_eq!(state.mode, Mode::Normal);
@@ -655,7 +806,6 @@ mod tests {
         let state = enter_rename_mode(state);
         assert_eq!(state.mode, Mode::Rename);
 
-        // Type "user_id"
         let state = "user_id"
             .chars()
             .fold(state, |s, ch| handle_rename(s, key(KeyCode::Char(ch))));
@@ -718,14 +868,13 @@ mod tests {
         let state = state_with_users();
         let state = enter_rename_mode(state);
 
-        // Type the same name "users"
         let state = "users"
             .chars()
             .fold(state, |s, ch| handle_rename(s, key(KeyCode::Char(ch))));
         let state = handle_rename(state, key(KeyCode::Enter));
 
         assert_eq!(state.mode, Mode::Normal);
-        assert!(state.renames.is_empty()); // no rename recorded
+        assert!(state.renames.is_empty());
     }
 
     #[test]
@@ -738,66 +887,6 @@ mod tests {
             .cursor_down(1); // blank line
 
         let state = enter_rename_mode(state);
-        assert_eq!(state.mode, Mode::Normal); // Can't rename blank
-    }
-
-    // ── Multiple edits accumulate ─────────────────────────────────
-
-    #[test]
-    fn multiple_edits_accumulate() {
-        let mut schema = Schema::new();
-        let mut alpha = Table::new("alpha");
-        alpha.add_column(Column::new("id", PgType::Uuid));
-        schema.add_table(alpha);
-
-        let mut bravo = Table::new("bravo");
-        bravo.add_column(Column::new("id", PgType::Uuid));
-        schema.add_table(bravo);
-
-        let state = AppState::new(schema, String::new()).with_viewport_height(20);
-        // BTreeMap orders: alpha(0), blank(1), bravo(2)
-        assert!(matches!(
-            state.focus(),
-            Some(FocusTarget::Table(ref n)) if n == "alpha"
-        ));
-
-        // Edit first table (alpha)
-        let state = enter_edit_mode(state);
-        let state = handle_edit(state, key(KeyCode::Esc));
-        assert!(state.edited_tables.contains("alpha"));
-
-        // Navigate to second table and edit
-        let state = state.next_table();
-        assert!(matches!(
-            state.focus(),
-            Some(FocusTarget::Table(ref n)) if n == "bravo"
-        ));
-        let state = enter_edit_mode(state);
-        let state = handle_edit(state, key(KeyCode::Esc));
-        assert!(state.edited_tables.contains("bravo"));
-
-        // Both should be marked as edited
-        assert_eq!(state.edited_tables.len(), 2);
-        // Original schema should be set only once
-        assert!(state.original_schema.is_some());
-    }
-
-    // ── Original schema tracking ──────────────────────────────────
-
-    #[test]
-    fn original_schema_set_once() {
-        let state = state_with_users();
-        let original = state.schema.clone();
-
-        let state = enter_edit_mode(state);
-        let state = handle_edit(state, key(KeyCode::Esc));
-
-        // Original should match what we started with
-        assert_eq!(state.original_schema.as_ref(), Some(&original));
-
-        // Second edit shouldn't change original
-        let state = enter_edit_mode(state);
-        let state = handle_edit(state, key(KeyCode::Esc));
-        assert_eq!(state.original_schema.as_ref(), Some(&original));
+        assert_eq!(state.mode, Mode::Normal);
     }
 }

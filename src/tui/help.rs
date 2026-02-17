@@ -60,11 +60,27 @@ const NORMAL_BINDINGS: &[Binding] = &[
     },
     Binding {
         key: "e",
-        desc: "Edit table",
+        desc: "Edit in $EDITOR",
     },
     Binding {
         key: "r",
         desc: "Rename element",
+    },
+    Binding {
+        key: "n",
+        desc: "Toggle nullable",
+    },
+    Binding {
+        key: "u",
+        desc: "Toggle unique",
+    },
+    Binding {
+        key: "i",
+        desc: "Toggle index",
+    },
+    Binding {
+        key: "D",
+        desc: "Set/clear default",
     },
     Binding {
         key: "q",
@@ -129,10 +145,20 @@ const HUD_BINDINGS: &[Binding] = &[
     },
 ];
 
-const EDIT_BINDINGS: &[Binding] = &[Binding {
-    key: "Esc",
-    desc: "Exit edit mode",
-}];
+const DEFAULT_PROMPT_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Confirm default",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+    Binding {
+        key: "Backspace",
+        desc: "Delete character",
+    },
+];
 
 const RENAME_BINDINGS: &[Binding] = &[
     Binding {
@@ -226,7 +252,7 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
         Mode::Command => COMMAND_BINDINGS,
         Mode::Search => SEARCH_BINDINGS,
         Mode::HUD => HUD_BINDINGS,
-        Mode::Edit => EDIT_BINDINGS,
+        Mode::DefaultPrompt => DEFAULT_PROMPT_BINDINGS,
         Mode::Rename => RENAME_BINDINGS,
         Mode::MigrationPreview => MIGRATION_PREVIEW_BINDINGS,
         Mode::SpaceMenu => SPACE_MENU_BINDINGS,
@@ -321,7 +347,7 @@ mod tests {
     fn all_modes_have_bindings() {
         let modes = [
             Mode::Normal,
-            Mode::Edit,
+            Mode::DefaultPrompt,
             Mode::Rename,
             Mode::Search,
             Mode::HUD,

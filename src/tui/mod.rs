@@ -49,6 +49,115 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }
 
+/// Spawn an external editor for the given table, then apply changes.
+///
+/// 1. Write rendered text to a temp file.
+/// 2. Suspend the TUI and launch `$EDITOR` (falling back to `$VISUAL`, then `hx`).
+/// 3. Resume the TUI.
+/// 4. Parse the edited file and update the schema.
+fn spawn_editor(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    state: AppState,
+    req: edit::EditorRequest,
+) -> Result<AppState> {
+    use std::io::Write;
+
+    // Write to temp file (include PID to avoid collisions between concurrent instances)
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!(
+        "inara-{}-{}.inara",
+        req.table_name,
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(req.rendered_text.as_bytes())?;
+    }
+
+    // Determine editor
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "hx".to_string());
+
+    // Suspend TUI
+    restore_terminal();
+
+    // Launch editor
+    let status = std::process::Command::new(&editor).arg(&tmp_path).status();
+
+    // Resume TUI
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+    terminal.clear()?;
+
+    // Check editor exit status
+    match status {
+        Ok(s) if !s.success() => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(state.with_status(format!("{editor} exited with {s}")));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(state.with_status(format!("Failed to launch {editor}: {e}")));
+        }
+        _ => {}
+    }
+
+    // Read back and clean up
+    let edited_text = match std::fs::read_to_string(&tmp_path) {
+        Ok(text) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            text
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(state.with_status(format!("Failed to read temp file: {e}")));
+        }
+    };
+
+    // No changes?
+    if edited_text.trim() == req.rendered_text.trim() {
+        return Ok(state.with_status("No changes"));
+    }
+
+    // Parse the edited text
+    let text = if edited_text.ends_with('\n') {
+        edited_text
+    } else {
+        format!("{edited_text}\n")
+    };
+
+    match crate::schema::parse::parse_single_table(&text) {
+        Ok(new_table) => {
+            let mut state = state.ensure_original_schema();
+            let table_name = req.table_name;
+
+            // Handle rename
+            if new_table.name != table_name {
+                state.renames.push(app::RenameMetadata {
+                    table: table_name.clone(),
+                    from: table_name.clone(),
+                    to: new_table.name.clone(),
+                });
+                state.schema.tables.remove(&table_name);
+                state.edited_tables.remove(&table_name);
+                state.edited_tables.insert(new_table.name.clone());
+            } else {
+                state.edited_tables.insert(table_name.clone());
+                state.schema.tables.remove(&table_name);
+            }
+
+            state.schema.add_table(new_table);
+            state.rebuild_doc();
+            Ok(state)
+        }
+        Err(e) => Ok(state.with_status(format!(
+            "Parse error: line {}, col {}: {}",
+            e.line, e.col, e.message
+        ))),
+    }
+}
+
 /// Install a color-eyre panic hook that restores the terminal before printing.
 ///
 /// Without this, a panic would leave the terminal in raw mode with the
@@ -276,6 +385,10 @@ fn run_event_loop(
                         if let Some(h) = result.llm_handle {
                             llm_handle = Some(h);
                         }
+                        // Spawn external editor if requested
+                        if let Some(req) = result.editor_request {
+                            state = spawn_editor(terminal, state, req)?;
+                        }
                         // Clear handles when leaving respective modes
                         if state.mode != Mode::HUD {
                             hud_handle = None;
@@ -364,82 +477,18 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState)
     frame.render_widget(Paragraph::new(header), area);
 }
 
-/// Render the main content area with the schema document or edit buffer.
+/// Render the main content area with the schema document.
 fn draw_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    if state.mode == Mode::Edit {
-        draw_edit_content(frame, area, state);
-    } else {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Schema ");
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let visible_lines = view::render_document(state);
-        let content = Paragraph::new(visible_lines);
-        frame.render_widget(content, inner);
-    }
-}
-
-/// Render the edit mode content area with the text buffer.
-fn draw_edit_content(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let title = match &state.edit_table {
-        Some(name) => format!(" Editing: {name} "),
-        None => " Editing ".to_string(),
-    };
-
-    let border_color = if state.edit_error.is_some() {
-        Color::Red
-    } else {
-        Color::Yellow
-    };
-
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(title);
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Schema ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> = state
-        .edit_buffer
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            if i == state.edit_cursor_row {
-                // Show cursor position with a highlighted character
-                let col = state.edit_cursor_col.min(line.len());
-                let before = &line[..col];
-                let cursor_char = line.get(col..col + 1).unwrap_or(" ");
-                let after = if col < line.len() {
-                    &line[col + 1..]
-                } else {
-                    ""
-                };
-                Line::from(vec![
-                    Span::styled(before.to_string(), Style::default().fg(Color::White)),
-                    Span::styled(
-                        cursor_char.to_string(),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
-                ])
-            } else {
-                Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::White),
-                ))
-            }
-        })
-        .collect();
-
-    let content = Paragraph::new(lines);
+    let visible_lines = view::render_document(state);
+    let content = Paragraph::new(visible_lines);
     frame.render_widget(content, inner);
 }
 
@@ -687,8 +736,8 @@ fn render_llm_preview(
 fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let mode_style = match state.mode {
         Mode::Normal => Style::default().fg(Color::Black).bg(Color::Blue),
-        Mode::Edit => Style::default().fg(Color::Black).bg(Color::Yellow),
         Mode::Rename => Style::default().fg(Color::Black).bg(Color::Yellow),
+        Mode::DefaultPrompt => Style::default().fg(Color::Black).bg(Color::Yellow),
         Mode::Search => Style::default().fg(Color::Black).bg(Color::Green),
         Mode::HUD => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Command => Style::default().fg(Color::Black).bg(Color::Red),
@@ -739,11 +788,15 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         ));
     }
 
-    // Show edit error
-    if let Some(ref err) = state.edit_error {
+    // Show default prompt
+    if state.mode == Mode::DefaultPrompt {
         spans.push(Span::styled(
-            format!(" Error: {err}"),
-            Style::default().fg(Color::Red),
+            " Set default: ",
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::styled(
+            &state.default_prompt_buf,
+            Style::default().fg(Color::White),
         ));
     }
 
