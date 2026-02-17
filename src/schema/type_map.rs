@@ -96,6 +96,18 @@ impl TypeMapper {
         &self.features
     }
 
+    /// Look up the Rust type string for a given PgType, wrapping in `Option<T>` if nullable.
+    ///
+    /// Returns `"Option<T>"` when `nullable` is true, `"T"` otherwise.
+    pub fn rust_type_annotation(&self, pg_type: &PgType, nullable: bool) -> String {
+        let base = self.rust_type(pg_type);
+        if nullable {
+            format!("Option<{base}>")
+        } else {
+            base
+        }
+    }
+
     /// Look up the Rust type string for a given PgType.
     ///
     /// Priority: user overrides → feature-aware mapping → static defaults → fallback.
@@ -750,6 +762,52 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
         let mapper = TypeMapper::from_cargo_toml(Path::new("/nonexistent/Cargo.toml"));
         // Should still work with defaults
         assert_eq!(mapper.rust_type(&PgType::Integer), "i32");
+    }
+
+    // --- Nullable-aware annotation ---
+
+    #[test]
+    fn annotation_non_nullable() {
+        let mapper = TypeMapper::new();
+        assert_eq!(mapper.rust_type_annotation(&PgType::Text, false), "String");
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Uuid, false),
+            "uuid::Uuid"
+        );
+    }
+
+    #[test]
+    fn annotation_nullable_wraps_option() {
+        let mapper = TypeMapper::new();
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Text, true),
+            "Option<String>"
+        );
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Uuid, true),
+            "Option<uuid::Uuid>"
+        );
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Jsonb, true),
+            "Option<serde_json::Value>"
+        );
+    }
+
+    #[test]
+    fn annotation_nullable_with_features() {
+        let mapper = TypeMapper::with_features(DetectedFeatures {
+            chrono: true,
+            time: false,
+            jiff: false,
+        });
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Timestamptz, true),
+            "Option<chrono::DateTime<Utc>>"
+        );
+        assert_eq!(
+            mapper.rust_type_annotation(&PgType::Timestamptz, false),
+            "chrono::DateTime<Utc>"
+        );
     }
 
     // --- All common types covered ---

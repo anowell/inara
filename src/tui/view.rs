@@ -189,14 +189,20 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
     if let CustomTypeKind::Composite { fields } = &custom_type.kind {
         if let Some((field_name, pg_type)) = fields.get(idx) {
             let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-            let mut spans = vec![
-                Span::styled(format!("    {field_name:<max_name_len$}  "), NAME_STYLE),
-                Span::styled(pg_type.to_string(), TYPE_STYLE),
-            ];
-            if state.show_rust_types {
+            let spans = if state.show_rust_types {
                 let rust_type = state.type_mapper.rust_type(pg_type);
-                spans.push(Span::styled(format!("  // {rust_type}"), DIM_STYLE));
-            }
+                let name_part = format!("{field_name}: ");
+                let name_width = max_name_len + 2; // +2 for ": "
+                vec![
+                    Span::styled(format!("    {name_part:<name_width$}"), NAME_STYLE),
+                    Span::styled(rust_type, TYPE_STYLE),
+                ]
+            } else {
+                vec![
+                    Span::styled(format!("    {field_name:<max_name_len$}  "), NAME_STYLE),
+                    Span::styled(pg_type.to_string(), TYPE_STYLE),
+                ]
+            };
             return spans;
         }
     }
@@ -271,14 +277,6 @@ fn render_column_line(state: &AppState, table_name: &str, col_name: &str) -> Vec
         .map(|c| c.name.len())
         .max()
         .unwrap_or(0);
-    let max_type_len = table
-        .columns
-        .iter()
-        .map(|c| c.pg_type.to_string().len())
-        .max()
-        .unwrap_or(0);
-
-    let type_str = col.pg_type.to_string();
 
     // Build suffix parts
     let has_suffix = !col.nullable
@@ -286,22 +284,57 @@ fn render_column_line(state: &AppState, table_name: &str, col_name: &str) -> Vec
         || single_pk_cols.contains(&col.name)
         || single_unique_cols.contains(&col.name);
 
-    let padded_type = if has_suffix {
-        format!("{type_str:<max_type_len$}")
+    let mut spans = if state.show_rust_types {
+        // Struct field syntax: "    name: RustType"
+        let rust_type = state
+            .type_mapper
+            .rust_type_annotation(&col.pg_type, col.nullable);
+        let max_type_len = table
+            .columns
+            .iter()
+            .map(|c| {
+                state
+                    .type_mapper
+                    .rust_type_annotation(&c.pg_type, c.nullable)
+                    .len()
+            })
+            .max()
+            .unwrap_or(0);
+
+        let padded_type = if has_suffix {
+            format!("{rust_type:<max_type_len$}")
+        } else {
+            rust_type
+        };
+
+        // Pad "name: " so types align vertically (colon stays adjacent to name)
+        let name_part = format!("{}: ", col.name);
+        let name_width = max_name_len + 2; // +2 for ": "
+        vec![
+            Span::styled(format!("    {name_part:<name_width$}"), NAME_STYLE),
+            Span::styled(padded_type, TYPE_STYLE),
+        ]
     } else {
-        type_str.clone()
+        // PG type syntax: "    name  pg_type"
+        let type_str = col.pg_type.to_string();
+        let max_type_len = table
+            .columns
+            .iter()
+            .map(|c| c.pg_type.to_string().len())
+            .max()
+            .unwrap_or(0);
+
+        let padded_type = if has_suffix {
+            format!("{type_str:<max_type_len$}")
+        } else {
+            type_str
+        };
+
+        vec![
+            Span::styled(format!("    {:<max_name_len$}  ", col.name), NAME_STYLE),
+            Span::styled(padded_type, TYPE_STYLE),
+        ]
     };
-
-    let mut spans = vec![
-        Span::styled(format!("    {:<max_name_len$}  ", col.name), NAME_STYLE),
-        Span::styled(padded_type, TYPE_STYLE),
-    ];
-
-    // Rust type annotation (shown when toggled on)
-    if state.show_rust_types {
-        let rust_type = state.type_mapper.rust_type(&col.pg_type);
-        spans.push(Span::styled(format!("  // {rust_type}"), DIM_STYLE));
-    }
 
     if !col.nullable {
         spans.push(Span::styled("  NOT NULL", KEYWORD_STYLE));
@@ -690,17 +723,19 @@ mod tests {
         let lines = render_document(&state);
 
         let id_text = spans_to_string(&lines[1]);
-        assert!(id_text.contains("uuid"), "should show PG type");
         assert!(
-            id_text.contains("// uuid::Uuid"),
-            "should show Rust type annotation, got: {id_text}"
+            id_text.contains("id:") && id_text.contains("uuid::Uuid"),
+            "should show struct field syntax, got: {id_text}"
+        );
+        assert!(
+            !id_text.contains("//"),
+            "should not use comment syntax, got: {id_text}"
         );
 
         let email_text = spans_to_string(&lines[2]);
-        assert!(email_text.contains("text"), "should show PG type");
         assert!(
-            email_text.contains("// String"),
-            "should show Rust type annotation, got: {email_text}"
+            email_text.contains("email:") && email_text.contains("String"),
+            "should show struct field syntax, got: {email_text}"
         );
     }
 
@@ -756,8 +791,8 @@ mod tests {
         let lines = render_document(&state);
         let text = spans_to_string(&lines[1]);
         assert!(
-            text.contains("// chrono::DateTime<Utc>"),
-            "should show chrono type, got: {text}"
+            text.contains("created_at:") && text.contains("chrono::DateTime<Utc>"),
+            "should show chrono type as struct field, got: {text}"
         );
     }
 
@@ -780,14 +815,66 @@ mod tests {
 
         let street_text = spans_to_string(&lines[1]);
         assert!(
-            street_text.contains("// String"),
-            "composite field should show Rust type, got: {street_text}"
+            street_text.contains("street:") && street_text.contains("String"),
+            "composite field should show struct field syntax, got: {street_text}"
         );
 
         let zip_text = spans_to_string(&lines[2]);
         assert!(
-            zip_text.contains("// i32"),
-            "composite field should show Rust type, got: {zip_text}"
+            zip_text.contains("zip:") && zip_text.contains("i32"),
+            "composite field should show struct field syntax, got: {zip_text}"
+        );
+    }
+
+    #[test]
+    fn nullable_column_shows_option_type() {
+        let mut schema = Schema::new();
+        let mut table = Table::new("posts");
+        table.add_column(Column::new("id", PgType::Uuid));
+        table.add_column(Column::new("title", PgType::Text));
+        table.add_column(Column::new("body", PgType::Text).nullable());
+        table.add_column(Column::new("metadata", PgType::Jsonb).nullable());
+        table.add_constraint(Constraint::PrimaryKey {
+            name: Some("posts_pkey".into()),
+            columns: vec!["id".into()],
+        });
+        schema.add_table(table);
+
+        let state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand()
+            .toggle_rust_types();
+
+        let lines = render_document(&state);
+
+        // Non-nullable columns: plain type
+        let id_text = spans_to_string(&lines[1]);
+        assert!(
+            id_text.contains("id:") && id_text.contains("uuid::Uuid"),
+            "non-nullable should show plain type, got: {id_text}"
+        );
+        assert!(
+            !id_text.contains("Option"),
+            "non-nullable should not have Option, got: {id_text}"
+        );
+
+        let title_text = spans_to_string(&lines[2]);
+        assert!(
+            title_text.contains("title:") && title_text.contains("String"),
+            "non-nullable should show plain type, got: {title_text}"
+        );
+
+        // Nullable columns: Option<T>
+        let body_text = spans_to_string(&lines[3]);
+        assert!(
+            body_text.contains("body:") && body_text.contains("Option<String>"),
+            "nullable should show Option<T>, got: {body_text}"
+        );
+
+        let meta_text = spans_to_string(&lines[4]);
+        assert!(
+            meta_text.contains("metadata:") && meta_text.contains("Option<serde_json::Value>"),
+            "nullable should show Option<T>, got: {meta_text}"
         );
     }
 
