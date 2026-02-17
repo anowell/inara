@@ -14,6 +14,44 @@ const NAME_STYLE: Style = Style::new().fg(Color::White);
 const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
 const NORMAL_STYLE: Style = Style::new().fg(Color::White);
 
+/// Search match highlight background color.
+const SEARCH_MATCH_BG: Color = Color::Indexed(58); // dark olive/yellow
+/// Current search match highlight background color.
+const SEARCH_CURRENT_BG: Color = Color::Indexed(94); // orange/brown
+
+/// Extract plain text from a document line for search matching.
+///
+/// Returns the concatenated content of all spans that would be rendered
+/// for this line, without focus highlighting or overlay markers.
+pub fn line_plain_text(state: &AppState, target: &FocusTarget) -> String {
+    let spans = match target {
+        FocusTarget::Enum(name) => render_enum_header(state, name),
+        FocusTarget::EnumVariant(name, idx) => render_enum_variant(state, name, *idx),
+        FocusTarget::EnumClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+        FocusTarget::Type(name) => render_type_header(state, name),
+        FocusTarget::TypeField(name, idx) => render_type_field(state, name, *idx),
+        FocusTarget::TypeClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+        FocusTarget::Table(name) => render_table_header(state, name),
+        FocusTarget::Column(table, col) => render_column_line(state, table, col),
+        FocusTarget::Separator(_) => vec![Span::raw("")],
+        FocusTarget::Constraint(table, idx) => render_constraint_line(state, table, *idx),
+        FocusTarget::Index(table, idx) => render_index_line(state, table, *idx),
+        FocusTarget::TableClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+        FocusTarget::Blank => vec![Span::raw("")],
+    };
+    spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Apply a background color to all spans in a line (for search highlighting).
+fn apply_bg(line: Line<'static>, bg: Color) -> Line<'static> {
+    let spans: Vec<Span> = line
+        .spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style.bg(bg)))
+        .collect();
+    Line::from(spans)
+}
+
 /// Render visible document lines as styled ratatui Lines.
 ///
 /// Reads from AppState to determine what to render and where the cursor is.
@@ -28,13 +66,36 @@ pub fn render_document(state: &AppState) -> Vec<Line<'static>> {
 
     let viewport_end = (state.viewport_offset + state.viewport_height).min(state.doc.len());
 
+    // Pre-compute search match sets for highlighting
+    let search_matches: Option<&[usize]> = state
+        .in_doc_search
+        .as_ref()
+        .filter(|s| !s.matches.is_empty())
+        .map(|s| s.matches.as_slice());
+    let current_match_line: Option<usize> = state
+        .in_doc_search
+        .as_ref()
+        .and_then(|s| s.current.and_then(|c| s.matches.get(c).copied()));
+
     state.doc[state.viewport_offset..viewport_end]
         .iter()
         .enumerate()
         .map(|(i, doc_line)| {
             let line_index = state.viewport_offset + i;
             let is_focused = line_index == state.cursor;
-            render_line(state, &doc_line.target, is_focused)
+            let line = render_line(state, &doc_line.target, is_focused);
+
+            // Apply search match highlighting (focus style takes priority)
+            if !is_focused {
+                if let Some(matches) = search_matches {
+                    if Some(line_index) == current_match_line {
+                        return apply_bg(line, SEARCH_CURRENT_BG);
+                    } else if matches.binary_search(&line_index).is_ok() {
+                        return apply_bg(line, SEARCH_MATCH_BG);
+                    }
+                }
+            }
+            line
         })
         .collect()
 }
@@ -982,5 +1043,87 @@ mod tests {
         assert_eq!(marker_style(ChangeMarker::Added).fg, Some(Color::Green));
         assert_eq!(marker_style(ChangeMarker::Removed).fg, Some(Color::Red));
         assert_eq!(marker_style(ChangeMarker::Modified).fg, Some(Color::Yellow));
+    }
+
+    // --- line_plain_text tests ---
+
+    #[test]
+    fn line_plain_text_table_collapsed() {
+        let state = simple_state().with_viewport_height(10);
+        let text = line_plain_text(&state, &FocusTarget::Table("users".into()));
+        assert!(text.contains("table"), "should contain 'table' keyword");
+        assert!(text.contains("users"), "should contain table name");
+        assert!(
+            text.contains("columns"),
+            "collapsed table should mention columns"
+        );
+    }
+
+    #[test]
+    fn line_plain_text_table_expanded() {
+        let state = simple_state().with_viewport_height(10).toggle_expand();
+        let text = line_plain_text(&state, &FocusTarget::Table("users".into()));
+        assert!(text.contains("table"), "should contain 'table' keyword");
+        assert!(text.contains("users"), "should contain table name");
+        assert!(
+            !text.contains("columns"),
+            "expanded table should not mention columns"
+        );
+    }
+
+    #[test]
+    fn line_plain_text_column() {
+        let state = simple_state().with_viewport_height(10).toggle_expand();
+        let text = line_plain_text(&state, &FocusTarget::Column("users".into(), "email".into()));
+        assert!(text.contains("email"), "should contain column name");
+        assert!(text.contains("text"), "should contain type name");
+    }
+
+    #[test]
+    fn line_plain_text_enum() {
+        let mut schema = Schema::new();
+        schema.add_enum(EnumType {
+            name: "mood".into(),
+            variants: vec!["happy".into(), "sad".into()],
+        });
+        let state = AppState::new(schema, String::new()).with_viewport_height(10);
+        let text = line_plain_text(&state, &FocusTarget::Enum("mood".into()));
+        assert!(text.contains("enum"), "should contain 'enum' keyword");
+        assert!(text.contains("mood"), "should contain enum name");
+    }
+
+    #[test]
+    fn line_plain_text_blank() {
+        let state = simple_state();
+        let text = line_plain_text(&state, &FocusTarget::Blank);
+        assert!(text.is_empty(), "blank line should have empty text");
+    }
+
+    // --- Search highlighting tests ---
+
+    #[test]
+    fn search_highlight_applied_to_matching_lines() {
+        use crate::tui::app::{InDocSearchState, SearchDirection};
+
+        let mut state = simple_state().with_viewport_height(10);
+        // Doc: just "users" table header (collapsed), 1 line
+        state.in_doc_search = Some(InDocSearchState {
+            query: "users".into(),
+            direction: SearchDirection::Forward,
+            matches: vec![0],
+            current: Some(0),
+            origin_cursor: 0,
+        });
+        // Move cursor away so focus highlight doesn't override
+        state.cursor = 999;
+        let lines = render_document(&state);
+        // Line 0 should have search highlight background
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(SEARCH_CURRENT_BG)),
+            "current match should have search highlight bg"
+        );
     }
 }

@@ -748,6 +748,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::LlmPending => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::LlmPreview => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Help => Style::default().fg(Color::Black).bg(Color::Blue),
+        Mode::InDocSearch => Style::default().fg(Color::Black).bg(Color::Green),
     };
 
     let mode_label = format!(" {} ", state.mode);
@@ -788,6 +789,34 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
             &state.rename_buf,
             Style::default().fg(Color::White),
         ));
+    }
+
+    // Show in-document search prompt
+    if state.mode == Mode::InDocSearch {
+        if let Some(ref search) = state.in_doc_search {
+            let prefix = match search.direction {
+                app::SearchDirection::Forward => "/",
+                app::SearchDirection::Backward => "?",
+            };
+            spans.push(Span::raw(format!(" {prefix}")));
+            spans.push(Span::styled(
+                &search.query,
+                Style::default().fg(Color::White),
+            ));
+            if !search.matches.is_empty() {
+                let idx = search.current.map(|c| c + 1).unwrap_or(0);
+                let total = search.matches.len();
+                spans.push(Span::styled(
+                    format!(" [{idx}/{total}]"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else if !search.query.is_empty() {
+                spans.push(Span::styled(
+                    " [no matches]",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
     }
 
     // Show default prompt

@@ -12,6 +12,7 @@ Inara's navigation is inspired by helix editor. This document defines the keybin
 | Command | Ex-style commands | `:` | `Enter` / `Esc` |
 | DefaultPrompt | Set column default value | `D` on column | `Enter` / `Esc` |
 | Rename | Rename element | `r` on table/column | `Enter` / `Esc` |
+| InDocSearch | In-document text search | `/` or `?` | `Enter` / `Esc` |
 
 ## Normal Mode
 
@@ -78,6 +79,10 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | `e` | Edit focused table in `$EDITOR` |
 | `r` | Rename focused element (explicit) |
 | `:` | Enter command mode |
+| `/` | Forward in-document search |
+| `?` | Backward in-document search |
+| `n` | Next search match (when search active) |
+| `N` | Previous search match |
 
 ### Quick Actions (column-focused only)
 

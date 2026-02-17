@@ -27,6 +27,7 @@ pub enum Mode {
     LlmPending,
     LlmPreview,
     Help,
+    InDocSearch,
 }
 
 /// Metadata for a rename operation. Recorded so the diff engine can
@@ -106,6 +107,28 @@ pub enum LlmPreviewKind {
 pub enum PendingKey {
     None,
     G,
+}
+
+/// Direction for in-document search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+/// State for in-document text search (`/` and `?`).
+#[derive(Debug, Clone)]
+pub struct InDocSearchState {
+    /// The search query string.
+    pub query: String,
+    /// Search direction (forward or backward).
+    pub direction: SearchDirection,
+    /// Document line indices that match the query (sorted ascending).
+    pub matches: Vec<usize>,
+    /// Index into `matches` for the current/highlighted match.
+    pub current: Option<usize>,
+    /// Cursor position when search was initiated (for relative navigation).
+    pub origin_cursor: usize,
 }
 
 /// What type of schema element is currently focused.
@@ -231,6 +254,8 @@ pub struct AppState {
     /// The mode the user was in before entering Help mode (for showing
     /// the correct keybindings).
     pub help_source_mode: Mode,
+    /// In-document search state (persists across mode transitions for n/N navigation).
+    pub in_doc_search: Option<InDocSearchState>,
 }
 
 impl AppState {
@@ -272,6 +297,7 @@ impl AppState {
             llm_preview: None,
             llm_pending_message: None,
             help_source_mode: Mode::Normal,
+            in_doc_search: None,
         }
     }
 
@@ -597,6 +623,169 @@ impl AppState {
     pub fn toggle_rust_types(mut self) -> Self {
         self.show_rust_types = !self.show_rust_types;
         self
+    }
+
+    /// Enter in-document search mode.
+    pub fn enter_in_doc_search(mut self, direction: SearchDirection) -> Self {
+        self.in_doc_search = Some(InDocSearchState {
+            query: String::new(),
+            direction,
+            matches: Vec::new(),
+            current: None,
+            origin_cursor: self.cursor,
+        });
+        self.mode = Mode::InDocSearch;
+        self.pending_key = PendingKey::None;
+        self
+    }
+
+    /// Compute search match line indices for the given query (case-insensitive).
+    fn compute_search_matches(&self, query: &str) -> Vec<usize> {
+        let query_lower = query.to_lowercase();
+        self.doc
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let text = super::view::line_plain_text(self, &line.target);
+                text.to_lowercase().contains(&query_lower)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Recompute in-document search matches after query changes.
+    ///
+    /// Uses `view::line_plain_text` to extract searchable text from each line.
+    pub fn recompute_search_matches(mut self) -> Self {
+        let search = match self.in_doc_search.take() {
+            Some(s) => s,
+            None => return self,
+        };
+
+        if search.query.is_empty() {
+            self.in_doc_search = Some(InDocSearchState {
+                matches: Vec::new(),
+                current: None,
+                ..search
+            });
+            return self;
+        }
+
+        let matches = self.compute_search_matches(&search.query);
+
+        let current = if matches.is_empty() {
+            None
+        } else {
+            match search.direction {
+                SearchDirection::Forward => {
+                    let idx = matches
+                        .iter()
+                        .position(|&m| m >= search.origin_cursor)
+                        .unwrap_or(0);
+                    Some(idx)
+                }
+                SearchDirection::Backward => {
+                    let idx = matches
+                        .iter()
+                        .rposition(|&m| m <= search.origin_cursor)
+                        .unwrap_or(matches.len() - 1);
+                    Some(idx)
+                }
+            }
+        };
+
+        // Move cursor to current match for incremental feedback
+        if let Some(idx) = current {
+            if let Some(&line_pos) = matches.get(idx) {
+                self.cursor = line_pos;
+            }
+        }
+
+        self.in_doc_search = Some(InDocSearchState {
+            matches,
+            current,
+            ..search
+        });
+        self.scroll_to_cursor()
+    }
+
+    /// Jump to the next in-document search match (wrapping).
+    pub fn next_search_match(mut self) -> Self {
+        let search = match self.in_doc_search.take() {
+            Some(s) => s,
+            None => return self,
+        };
+
+        if search.query.is_empty() {
+            self.in_doc_search = Some(search);
+            return self;
+        }
+
+        let matches = self.compute_search_matches(&search.query);
+
+        if matches.is_empty() {
+            self.in_doc_search = Some(InDocSearchState {
+                matches,
+                current: None,
+                ..search
+            });
+            return self.with_status("pattern not found");
+        }
+
+        // Find next match after cursor (wrapping)
+        let next = matches.iter().position(|&m| m > self.cursor).unwrap_or(0);
+        self.cursor = matches[next];
+
+        let match_num = next + 1;
+        let total = matches.len();
+        self.in_doc_search = Some(InDocSearchState {
+            matches,
+            current: Some(next),
+            ..search
+        });
+        self.with_status(format!("[{match_num}/{total}]"))
+            .scroll_to_focus()
+    }
+
+    /// Jump to the previous in-document search match (wrapping).
+    pub fn prev_search_match(mut self) -> Self {
+        let search = match self.in_doc_search.take() {
+            Some(s) => s,
+            None => return self,
+        };
+
+        if search.query.is_empty() {
+            self.in_doc_search = Some(search);
+            return self;
+        }
+
+        let matches = self.compute_search_matches(&search.query);
+
+        if matches.is_empty() {
+            self.in_doc_search = Some(InDocSearchState {
+                matches,
+                current: None,
+                ..search
+            });
+            return self.with_status("pattern not found");
+        }
+
+        // Find previous match before cursor (wrapping)
+        let prev = matches
+            .iter()
+            .rposition(|&m| m < self.cursor)
+            .unwrap_or(matches.len() - 1);
+        self.cursor = matches[prev];
+
+        let match_num = prev + 1;
+        let total = matches.len();
+        self.in_doc_search = Some(InDocSearchState {
+            matches,
+            current: Some(prev),
+            ..search
+        });
+        self.with_status(format!("[{match_num}/{total}]"))
+            .scroll_to_focus()
     }
 
     /// Set the pending overlay data.
@@ -995,6 +1184,7 @@ mod tests {
         assert_eq!(Mode::LlmPending.to_string(), "LlmPending");
         assert_eq!(Mode::LlmPreview.to_string(), "LlmPreview");
         assert_eq!(Mode::Help.to_string(), "Help");
+        assert_eq!(Mode::InDocSearch.to_string(), "InDocSearch");
     }
 
     #[test]

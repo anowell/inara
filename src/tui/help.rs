@@ -99,6 +99,22 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Goto...",
     },
     Binding {
+        key: "/",
+        desc: "Search forward",
+    },
+    Binding {
+        key: "?",
+        desc: "Search backward",
+    },
+    Binding {
+        key: "n",
+        desc: "Next match",
+    },
+    Binding {
+        key: "N",
+        desc: "Previous match",
+    },
+    Binding {
         key: "Ctrl-t",
         desc: "Toggle Rust types",
     },
@@ -296,6 +312,21 @@ const GOTO_MENU_BINDINGS: &[Binding] = &[
     },
 ];
 
+const IN_DOC_SEARCH_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "Enter",
+        desc: "Confirm search",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel search",
+    },
+    Binding {
+        key: "Backspace",
+        desc: "Delete character",
+    },
+];
+
 /// Get the keybinding list for a given mode.
 fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
     match mode {
@@ -310,6 +341,7 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
         Mode::GotoMenu => GOTO_MENU_BINDINGS,
         Mode::LlmPending => LLM_PENDING_BINDINGS,
         Mode::LlmPreview => LLM_PREVIEW_BINDINGS,
+        Mode::InDocSearch => IN_DOC_SEARCH_BINDINGS,
     }
 }
 
@@ -410,6 +442,7 @@ mod tests {
             Mode::LlmPending,
             Mode::LlmPreview,
             Mode::Help,
+            Mode::InDocSearch,
         ];
         for mode in modes {
             let bindings = bindings_for_mode(mode);

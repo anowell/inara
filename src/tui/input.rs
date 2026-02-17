@@ -115,6 +115,7 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
         Mode::LlmPending => HandleResult::state_only(handle_llm_pending(state, key)),
         Mode::LlmPreview => HandleResult::state_only(handle_llm_preview(state, key)),
         Mode::Help => HandleResult::state_only(handle_help(state, key)),
+        Mode::InDocSearch => HandleResult::state_only(handle_in_doc_search(state, key)),
     }
 }
 
@@ -165,11 +166,35 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             HandleResult::with_hud(state, handle)
         }
 
+        // In-document search
+        KeyCode::Char('/') => HandleResult::state_only(
+            state.enter_in_doc_search(super::app::SearchDirection::Forward),
+        ),
+        KeyCode::Char('?') => HandleResult::state_only(
+            state.enter_in_doc_search(super::app::SearchDirection::Backward),
+        ),
+
         // Quick actions (column-context only)
-        KeyCode::Char('n') => HandleResult::state_only(edit::toggle_nullable(state)),
+        // `n` is context-aware: navigates search matches when a search is active,
+        // otherwise toggles nullable.
+        KeyCode::Char('n') => {
+            if state.in_doc_search.is_some() {
+                HandleResult::state_only(state.next_search_match())
+            } else {
+                HandleResult::state_only(edit::toggle_nullable(state))
+            }
+        }
+        KeyCode::Char('N') => HandleResult::state_only(state.prev_search_match()),
         KeyCode::Char('u') => HandleResult::state_only(edit::toggle_column_unique(state)),
         KeyCode::Char('i') => HandleResult::state_only(edit::toggle_column_index(state)),
         KeyCode::Char('D') => HandleResult::state_only(edit::enter_default_prompt(state)),
+
+        // Clear in-document search highlighting
+        KeyCode::Esc => {
+            let mut state = state;
+            state.in_doc_search = None;
+            HandleResult::state_only(state)
+        }
 
         // External editor
         KeyCode::Char('e') => {
@@ -861,6 +886,53 @@ fn handle_search(state: AppState, key: KeyEvent) -> AppState {
     }
 }
 
+/// Handle key events in InDocSearch mode.
+///
+/// Captures typed characters into the search query, recomputes matches
+/// incrementally, and jumps to the nearest match. Enter confirms and
+/// returns to Normal mode (preserving search state for n/N). Esc cancels
+/// and clears the search.
+fn handle_in_doc_search(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => {
+            let mut state = state;
+            state.in_doc_search = None;
+            state.with_mode(Mode::Normal)
+        }
+        KeyCode::Enter => {
+            // Confirm search — cursor is already on the current match
+            // (from incremental search). Just switch back to Normal mode.
+            // Search state persists for n/N navigation.
+            state.with_mode(Mode::Normal)
+        }
+        KeyCode::Backspace => {
+            let should_exit = state
+                .in_doc_search
+                .as_ref()
+                .map(|s| s.query.is_empty())
+                .unwrap_or(true);
+            if should_exit {
+                let mut state = state;
+                state.in_doc_search = None;
+                return state.with_mode(Mode::Normal);
+            }
+            let mut state = state;
+            if let Some(ref mut search) = state.in_doc_search {
+                search.query.pop();
+            }
+            state.recompute_search_matches()
+        }
+        KeyCode::Char(ch) => {
+            let mut state = state;
+            if let Some(ref mut search) = state.in_doc_search {
+                search.query.push(ch);
+            }
+            state.recompute_search_matches()
+        }
+        _ => state,
+    }
+}
+
 /// Handle key events in HUD mode.
 fn handle_hud(
     state: AppState,
@@ -1152,6 +1224,7 @@ mod tests {
             Mode::LlmPending => handle_llm_pending(state, key),
             Mode::LlmPreview => handle_llm_preview(state, key),
             Mode::Help => handle_help(state, key),
+            Mode::InDocSearch => handle_in_doc_search(state, key),
         }
     }
 
@@ -1190,13 +1263,33 @@ mod tests {
                 state.toggle_rust_types()
             }
             KeyCode::Char('r') => edit::enter_rename_mode(state),
+            // In-document search
+            KeyCode::Char('/') => {
+                state.enter_in_doc_search(crate::tui::app::SearchDirection::Forward)
+            }
+            KeyCode::Char('?') => {
+                state.enter_in_doc_search(crate::tui::app::SearchDirection::Backward)
+            }
             // Quick actions (column-context only)
-            KeyCode::Char('n') => edit::toggle_nullable(state),
+            KeyCode::Char('n') => {
+                if state.in_doc_search.is_some() {
+                    state.next_search_match()
+                } else {
+                    edit::toggle_nullable(state)
+                }
+            }
+            KeyCode::Char('N') => state.prev_search_match(),
             KeyCode::Char('u') => edit::toggle_column_unique(state),
             KeyCode::Char('i') => edit::toggle_column_index(state),
             KeyCode::Char('D') => edit::enter_default_prompt(state),
             // 'e' produces an editor request — in tests we just prepare the request and ignore it
             KeyCode::Char('e') => edit::prepare_editor_request(state).0,
+            // Clear in-document search
+            KeyCode::Esc => {
+                let mut state = state;
+                state.in_doc_search = None;
+                state
+            }
             _ => state,
         }
     }
@@ -2065,14 +2158,6 @@ mod tests {
 
     #[test]
     fn command_w_with_description() {
-        let state = edited_state().with_mode(Mode::Command);
-        // Type "w add_bio_to_users"
-        for ch in "w add_bio_to_users".chars() {
-            let state_inner = handle_key_no_pool(state.clone(), key(KeyCode::Char(ch)));
-            // We need to chain properly
-            let _ = state_inner;
-        }
-        // Simpler: manually set command_buf and execute
         let mut state = edited_state();
         state.mode = Mode::Command;
         state.command_buf = "w add_bio_to_users".to_string();
@@ -2424,5 +2509,263 @@ mod tests {
         state.mode = Mode::Help;
         let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
         assert_eq!(state.mode, Mode::Help, "Help mode should ignore j");
+    }
+
+    // --- In-document search ---
+
+    /// Create a search-friendly state with named tables and columns.
+    fn in_doc_search_state() -> AppState {
+        use crate::schema::types::PgType;
+        use crate::schema::Column;
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+
+        let mut posts = Table::new("posts");
+        posts.add_column(Column::new("id", PgType::Uuid));
+        posts.add_column(Column::new("title", PgType::Text));
+        schema.add_table(posts);
+
+        AppState::new(schema, "test".into()).with_viewport_height(20)
+    }
+
+    #[test]
+    fn slash_enters_forward_search() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        assert_eq!(state.mode, Mode::InDocSearch);
+        let search = state.in_doc_search.as_ref().unwrap();
+        assert_eq!(search.direction, crate::tui::app::SearchDirection::Forward);
+        assert!(search.query.is_empty());
+    }
+
+    #[test]
+    fn question_mark_enters_backward_search() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('?')));
+        assert_eq!(state.mode, Mode::InDocSearch);
+        let search = state.in_doc_search.as_ref().unwrap();
+        assert_eq!(search.direction, crate::tui::app::SearchDirection::Backward);
+    }
+
+    #[test]
+    fn in_doc_search_typing_updates_query() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        assert_eq!(state.in_doc_search.as_ref().unwrap().query, "u");
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        assert_eq!(state.in_doc_search.as_ref().unwrap().query, "us");
+    }
+
+    #[test]
+    fn in_doc_search_finds_matches() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        // Type "table" — should match both "table posts" and "table users"
+        let mut state = state;
+        for ch in "table".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+        let search = state.in_doc_search.as_ref().unwrap();
+        // Both "posts" and "users" table lines contain "table"
+        assert_eq!(search.matches.len(), 2, "should match both table headers");
+        assert!(search.current.is_some());
+    }
+
+    #[test]
+    fn in_doc_search_esc_cancels_and_clears() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        assert_eq!(state.mode, Mode::InDocSearch);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.in_doc_search.is_none(), "Esc should clear search");
+    }
+
+    #[test]
+    fn in_doc_search_enter_preserves_state() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('p')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('o')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(
+            state.in_doc_search.is_some(),
+            "Enter should preserve search state"
+        );
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("posts".into())),
+            "cursor should be on 'posts' table"
+        );
+    }
+
+    #[test]
+    fn in_doc_search_backspace_removes_char() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        let state = handle_key_no_pool(state, key(KeyCode::Backspace));
+        assert_eq!(state.in_doc_search.as_ref().unwrap().query, "u");
+    }
+
+    #[test]
+    fn in_doc_search_backspace_empty_exits() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Backspace));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.in_doc_search.is_none());
+    }
+
+    #[test]
+    fn n_navigates_next_match() {
+        let state = in_doc_search_state();
+        // Search for "table" and confirm
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let mut state = state;
+        for ch in "table".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+
+        // First table is "posts" (BTreeMap order: posts < users)
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("posts".into())),
+            "should be on posts table"
+        );
+
+        // Press n to go to next match
+        let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("users".into())),
+            "n should jump to users table"
+        );
+
+        // Press n again to wrap
+        let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("posts".into())),
+            "n should wrap to posts"
+        );
+    }
+
+    #[test]
+    fn big_n_navigates_prev_match() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let mut state = state;
+        for ch in "table".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        // Navigate to users first
+        let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Press N to go back
+        let state = handle_key_no_pool(state, key(KeyCode::Char('N')));
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("posts".into())),
+            "N should go back to posts"
+        );
+    }
+
+    #[test]
+    fn n_without_search_toggles_nullable() {
+        // When no search is active, n should toggle nullable (existing behavior)
+        let state = in_doc_search_state();
+        assert!(state.in_doc_search.is_none());
+        // n on a non-column target is a no-op but shouldn't crash
+        let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
+        assert_eq!(state.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn esc_in_normal_clears_search() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert!(state.in_doc_search.is_some());
+
+        // Esc in normal mode clears the search
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert!(
+            state.in_doc_search.is_none(),
+            "Esc in Normal should clear search"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_search() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        // Search for "USERS" (uppercase) should match "users" table
+        let mut state = state;
+        for ch in "USERS".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+        let search = state.in_doc_search.as_ref().unwrap();
+        assert!(
+            !search.matches.is_empty(),
+            "case-insensitive search should match"
+        );
+    }
+
+    #[test]
+    fn backward_search_finds_match_before_cursor() {
+        let state = in_doc_search_state();
+        // Move cursor past "posts" to "users" table
+        // Doc: posts(0) blank(1) users(2)
+        let state = state.cursor_to(2);
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Backward search for "posts"
+        let state = handle_key_no_pool(state, key(KeyCode::Char('?')));
+        let mut state = state;
+        for ch in "posts".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+
+        // Should find "posts" which is before cursor
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("posts".into())),
+            "backward search should find match before cursor"
+        );
+    }
+
+    #[test]
+    fn search_no_match_shows_status() {
+        let state = in_doc_search_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('/')));
+        let mut state = state;
+        for ch in "zzz".chars() {
+            state = handle_key_no_pool(state, key(KeyCode::Char(ch)));
+        }
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        // n should show "pattern not found"
+        let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
+        assert!(state.status_message.is_some());
+        assert!(state.status_message.as_ref().unwrap().contains("not found"));
     }
 }
