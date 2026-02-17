@@ -562,9 +562,15 @@ impl AppState {
         self
     }
 
-    /// Returns true if any tables have been edited.
+    /// Returns true if the schema has diverged from the original.
+    ///
+    /// Uses structural comparison so the check is robust regardless of
+    /// how edits were made (quick actions, external editor, AI, etc.).
     pub fn has_edits(&self) -> bool {
-        !self.edited_tables.is_empty()
+        match &self.original_schema {
+            Some(original) => original != &self.schema,
+            None => false,
+        }
     }
 
     /// Clear edit tracking state after a migration has been written.

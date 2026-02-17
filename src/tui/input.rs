@@ -265,6 +265,15 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
     let state = state.with_mode(Mode::Normal);
 
     if cmd == "q" {
+        if state.has_edits() {
+            return HandleResult::state_only(
+                state.with_status("Unsaved changes. Use :q! to quit without saving."),
+            );
+        }
+        return HandleResult::state_only(state.quit());
+    }
+
+    if cmd == "q!" {
         return HandleResult::state_only(state.quit());
     }
 
@@ -1274,6 +1283,28 @@ mod tests {
         let state = sample_state().with_mode(Mode::Command);
         let state = handle_key_no_pool(state, key(KeyCode::Char('q')));
         assert_eq!(state.command_buf, "q");
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn command_q_blocked_with_pending_edits() {
+        let state = edited_state().with_mode(Mode::Command);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('q')));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert!(!state.should_quit);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Unsaved changes. Use :q! to quit without saving.")
+        );
+    }
+
+    #[test]
+    fn command_q_force_quits_with_pending_edits() {
+        let state = edited_state().with_mode(Mode::Command);
+        // Type "q!"
+        let state = handle_key_no_pool(state, key(KeyCode::Char('q')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('!')));
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert!(state.should_quit);
     }
