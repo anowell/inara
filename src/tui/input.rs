@@ -147,12 +147,20 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             HandleResult::state_only(state.cursor_up(page.max(1)))
         }
 
+        // Jump list navigation
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            HandleResult::state_only(state.jump_back())
+        }
+        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            HandleResult::state_only(state.jump_forward())
+        }
+
         // Expand/collapse
         KeyCode::Enter => HandleResult::state_only(state.toggle_expand()),
 
         // Table jumping
-        KeyCode::Tab => HandleResult::state_only(state.next_table()),
-        KeyCode::BackTab => HandleResult::state_only(state.prev_table()),
+        KeyCode::Tab => HandleResult::state_only(state.record_jump().next_table()),
+        KeyCode::BackTab => HandleResult::state_only(state.record_jump().prev_table()),
 
         // Mode transitions
         KeyCode::Char(':') => HandleResult::state_only(state.with_mode(Mode::Command)),
@@ -218,7 +226,7 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
 fn handle_goto_menu(state: AppState, key: KeyEvent) -> AppState {
     let state = state.with_mode(Mode::Normal);
     match key.code {
-        KeyCode::Char('g') => state.cursor_to(0), // gg -> first line
+        KeyCode::Char('g') => state.record_jump().cursor_to(0), // gg -> first line
         KeyCode::Char(ch) => {
             let focus = match state.focus().cloned() {
                 Some(f) => f,
@@ -232,7 +240,9 @@ fn handle_goto_menu(state: AppState, key: KeyEvent) -> AppState {
                 &state.migration_index,
             );
             match result {
-                GotoResult::Jump(target) => state.clear_status().jump_to_goto(&target),
+                GotoResult::Jump(target) => {
+                    state.record_jump().clear_status().jump_to_goto(&target)
+                }
                 GotoResult::Pick(targets) => state.clear_status().enter_goto_picker(targets),
                 GotoResult::NoResults(msg) => state.with_status(msg),
                 GotoResult::NotAvailable(msg) => state.with_status(msg),
@@ -820,7 +830,7 @@ fn handle_search(state: AppState, key: KeyEvent) -> AppState {
                 .and_then(|s| s.selected_goto_target().cloned());
             if let Some(target) = goto_target {
                 let state = state.with_mode(Mode::Normal);
-                return state.jump_to_goto(&target);
+                return state.record_jump().jump_to_goto(&target);
             }
             // Standard search: select the current result and jump to it
             let symbol = state
@@ -830,7 +840,7 @@ fn handle_search(state: AppState, key: KeyEvent) -> AppState {
                 .map(|r| r.symbol.clone());
             let state = state.with_mode(Mode::Normal);
             if let Some(sym) = symbol {
-                state.jump_to_symbol(&sym)
+                state.record_jump().jump_to_symbol(&sym)
             } else {
                 state
             }
@@ -1254,9 +1264,15 @@ mod tests {
                 let page = state.viewport_height;
                 state.cursor_up(page.max(1))
             }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.jump_back()
+            }
+            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.jump_forward()
+            }
             KeyCode::Enter => state.toggle_expand(),
-            KeyCode::Tab => state.next_table(),
-            KeyCode::BackTab => state.prev_table(),
+            KeyCode::Tab => state.record_jump().next_table(),
+            KeyCode::BackTab => state.record_jump().prev_table(),
             KeyCode::Char(':') => state.with_mode(Mode::Command),
             KeyCode::Char(' ') => state.with_mode(Mode::SpaceMenu),
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2767,5 +2783,179 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Char('n')));
         assert!(state.status_message.is_some());
         assert!(state.status_message.as_ref().unwrap().contains("not found"));
+    }
+
+    // --- Jump list (Ctrl-o / Ctrl-i) ---
+
+    #[test]
+    fn ctrl_o_back_after_tab() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Tab));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn ctrl_i_forward_after_back() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // bravo
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ); // alpha
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('i'), KeyModifiers::CONTROL),
+        ); // bravo
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+    }
+
+    #[test]
+    fn ctrl_o_with_no_history_stays() {
+        let state = sample_state();
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_i_with_no_forward_stays() {
+        let state = sample_state();
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('i'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn jump_back_through_multiple_tabs() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // bravo
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // charlie
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // delta
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn new_jump_from_middle_truncates_forward() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // bravo
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // charlie
+
+        // Go back to bravo
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        // New jump from bravo — should truncate forward history
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // charlie
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+
+        // Forward should have nothing (truncated)
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('i'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            state.focus(),
+            Some(&FocusTarget::Table("charlie".into())),
+            "forward should be empty after new jump from middle"
+        );
+    }
+
+    #[test]
+    fn gg_records_jump() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // bravo
+        let state = handle_key_no_pool(state, key(KeyCode::Tab)); // charlie
+
+        // gg jumps to first line
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.cursor, 0);
+
+        // Ctrl-o should go back to charlie
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+    }
+
+    #[test]
+    fn goto_jump_records_history() {
+        let state = goto_state();
+        // Navigate to posts table
+        let posts_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("posts".into()))
+            .unwrap();
+        let state = state.cursor_to(posts_pos);
+
+        // g o should jump to outgoing FK target (users)
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('o')));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Ctrl-o should go back to posts
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
+    }
+
+    #[test]
+    fn search_select_records_jump() {
+        let state = search_state();
+        // Type "users" to filter
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('r')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+
+        // Select — should record jump and go to users
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Ctrl-o should go back to the original position (before search)
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        // Original position was cursor 0 (users table header, which is where we started)
+        // Since search_state() starts at cursor 0 on "users" table, and we jump to "users",
+        // the jump back goes to cursor 0 which is also "users" — this is expected
+        assert_eq!(state.cursor, 0);
     }
 }

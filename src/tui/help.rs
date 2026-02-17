@@ -59,6 +59,14 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Previous table",
     },
     Binding {
+        key: "Ctrl-o",
+        desc: "Jump back",
+    },
+    Binding {
+        key: "Ctrl-i",
+        desc: "Jump forward",
+    },
+    Binding {
         key: "Space",
         desc: "Command palette",
     },

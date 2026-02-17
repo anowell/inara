@@ -131,6 +131,88 @@ pub struct InDocSearchState {
     pub origin_cursor: usize,
 }
 
+/// Maximum number of entries in the jump list.
+const JUMP_LIST_MAX: usize = 100;
+
+/// An entry in the navigation jump list.
+#[derive(Debug, Clone)]
+pub struct JumpEntry {
+    /// Cursor position at the time of the jump.
+    pub cursor: usize,
+    /// Focus target at the time of the jump (for robust restoration after doc rebuilds).
+    pub target: FocusTarget,
+}
+
+/// Navigation history for jump-back/forward (like vim's jump list).
+///
+/// Tracks positions visited via jump operations (goto, search, tab).
+/// `cursor` is always in `0..=entries.len()`. When `cursor == entries.len()`,
+/// the user is at the "present" position (not in the history).
+#[derive(Debug, Clone)]
+pub struct JumpList {
+    entries: Vec<JumpEntry>,
+    cursor: usize,
+}
+
+impl Default for JumpList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JumpList {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    /// Record the current position before a jump.
+    ///
+    /// If in the middle of the list, forward entries are truncated
+    /// (like browser history when navigating to a new page).
+    pub fn record(&mut self, entry: JumpEntry) {
+        self.entries.truncate(self.cursor);
+        self.entries.push(entry);
+        if self.entries.len() > JUMP_LIST_MAX {
+            self.entries.remove(0);
+        }
+        self.cursor = self.entries.len();
+    }
+
+    /// Move backward in the jump list.
+    ///
+    /// On first backward from the present, saves `current` so Ctrl-i can return.
+    pub fn go_back(&mut self, current: JumpEntry) -> Option<JumpEntry> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if self.cursor == self.entries.len() {
+            // At the present — save current position so forward can return here
+            self.entries.push(current);
+            if self.entries.len() < 2 {
+                return None;
+            }
+            self.cursor = self.entries.len() - 2;
+        } else if self.cursor > 0 {
+            self.cursor -= 1;
+        } else {
+            return None;
+        }
+        Some(self.entries[self.cursor].clone())
+    }
+
+    /// Move forward in the jump list.
+    pub fn go_forward(&mut self) -> Option<JumpEntry> {
+        if self.cursor + 1 < self.entries.len() {
+            self.cursor += 1;
+            Some(self.entries[self.cursor].clone())
+        } else {
+            None
+        }
+    }
+}
 /// What type of schema element is currently focused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocusTarget {
@@ -256,6 +338,8 @@ pub struct AppState {
     pub help_source_mode: Mode,
     /// In-document search state (persists across mode transitions for n/N navigation).
     pub in_doc_search: Option<InDocSearchState>,
+    /// Navigation jump list for Ctrl-o (back) / Ctrl-i (forward).
+    pub jump_list: JumpList,
 }
 
 impl AppState {
@@ -298,6 +382,7 @@ impl AppState {
             llm_pending_message: None,
             help_source_mode: Mode::Normal,
             in_doc_search: None,
+            jump_list: JumpList::new(),
         }
     }
 
@@ -798,6 +883,61 @@ impl AppState {
     pub fn toggle_pending_overlay(mut self) -> Self {
         self.show_pending_overlay = !self.show_pending_overlay;
         self
+    }
+
+    /// Record the current position as a jump point (call before executing a jump).
+    pub fn record_jump(mut self) -> Self {
+        if let Some(target) = self.focus().cloned() {
+            self.jump_list.record(JumpEntry {
+                cursor: self.cursor,
+                target,
+            });
+        }
+        self
+    }
+
+    /// Jump backward in the jump list (Ctrl-o).
+    pub fn jump_back(mut self) -> Self {
+        let current = match self.focus().cloned() {
+            Some(target) => JumpEntry {
+                cursor: self.cursor,
+                target,
+            },
+            None => return self,
+        };
+        if let Some(entry) = self.jump_list.go_back(current) {
+            self.restore_jump(&entry)
+        } else {
+            self
+        }
+    }
+
+    /// Jump forward in the jump list (Ctrl-i).
+    pub fn jump_forward(mut self) -> Self {
+        if let Some(entry) = self.jump_list.go_forward() {
+            self.restore_jump(&entry)
+        } else {
+            self
+        }
+    }
+
+    /// Restore cursor position from a jump entry.
+    fn restore_jump(mut self, entry: &JumpEntry) -> Self {
+        // For Blank targets, use cursor position directly (all Blanks are identical)
+        if entry.target == FocusTarget::Blank {
+            let max = self.line_count().saturating_sub(1);
+            self.cursor = entry.cursor.min(max);
+            return self.scroll_to_cursor();
+        }
+        // Try to find the target in the current doc
+        if let Some(pos) = self.doc.iter().position(|l| l.target == entry.target) {
+            self.cursor = pos;
+        } else {
+            // Fallback to cursor position, clamped
+            let max = self.line_count().saturating_sub(1);
+            self.cursor = entry.cursor.min(max);
+        }
+        self.scroll_to_cursor()
     }
 
     /// Toggle expand/collapse for the table under the cursor.
@@ -1595,5 +1735,168 @@ mod tests {
         // Should center cursor: offset ≈ mid_col - 5
         let expected = mid_col.saturating_sub(5);
         assert_eq!(state.viewport_offset, expected);
+    }
+
+    // --- JumpList unit tests ---
+
+    #[test]
+    fn jump_list_new_is_empty() {
+        let jl = JumpList::new();
+        assert!(jl.entries.is_empty());
+        assert_eq!(jl.cursor, 0);
+    }
+
+    #[test]
+    fn jump_list_record_adds_entries() {
+        let mut jl = JumpList::new();
+        jl.record(JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Table("alpha".into()),
+        });
+        jl.record(JumpEntry {
+            cursor: 2,
+            target: FocusTarget::Table("bravo".into()),
+        });
+        assert_eq!(jl.entries.len(), 2);
+        assert_eq!(jl.cursor, 2);
+    }
+
+    #[test]
+    fn jump_list_back_empty_returns_none() {
+        let mut jl = JumpList::new();
+        let current = JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Table("alpha".into()),
+        };
+        assert!(jl.go_back(current).is_none());
+    }
+
+    #[test]
+    fn jump_list_forward_at_end_returns_none() {
+        let mut jl = JumpList::new();
+        jl.record(JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Table("alpha".into()),
+        });
+        assert!(jl.go_forward().is_none());
+    }
+
+    #[test]
+    fn jump_list_back_and_forward() {
+        let mut jl = JumpList::new();
+        jl.record(JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Table("alpha".into()),
+        });
+        jl.record(JumpEntry {
+            cursor: 2,
+            target: FocusTarget::Table("bravo".into()),
+        });
+
+        // Go back from present (charlie)
+        let current = JumpEntry {
+            cursor: 4,
+            target: FocusTarget::Table("charlie".into()),
+        };
+        let entry = jl.go_back(current).unwrap();
+        assert_eq!(entry.cursor, 2); // bravo
+
+        let entry = jl.go_back(JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Blank,
+        });
+        assert_eq!(entry.unwrap().cursor, 0); // alpha
+
+        // Forward back to bravo
+        let entry = jl.go_forward().unwrap();
+        assert_eq!(entry.cursor, 2); // bravo
+
+        // Forward to charlie (saved by first go_back)
+        let entry = jl.go_forward().unwrap();
+        assert_eq!(entry.cursor, 4); // charlie
+
+        // No more forward
+        assert!(jl.go_forward().is_none());
+    }
+
+    #[test]
+    fn jump_list_new_jump_truncates_forward() {
+        let mut jl = JumpList::new();
+        jl.record(JumpEntry {
+            cursor: 0,
+            target: FocusTarget::Table("alpha".into()),
+        });
+        jl.record(JumpEntry {
+            cursor: 2,
+            target: FocusTarget::Table("bravo".into()),
+        });
+
+        // Go back to bravo
+        let current = JumpEntry {
+            cursor: 4,
+            target: FocusTarget::Table("charlie".into()),
+        };
+        let _ = jl.go_back(current);
+        assert_eq!(jl.cursor, 1); // pointing at bravo
+
+        // New jump from bravo — truncates charlie
+        jl.record(JumpEntry {
+            cursor: 2,
+            target: FocusTarget::Table("bravo".into()),
+        });
+        assert_eq!(jl.entries.len(), 2); // [alpha, bravo]
+        assert!(jl.go_forward().is_none());
+    }
+
+    // --- AppState jump list integration ---
+
+    #[test]
+    fn record_jump_and_jump_back() {
+        let state = sample_state();
+        // Record alpha position, then move to bravo
+        let state = state.record_jump().next_table();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+
+        // Jump back to alpha
+        let state = state.jump_back();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn jump_forward_after_back() {
+        let state = sample_state();
+        let state = state.record_jump().next_table(); // bravo
+        let state = state.jump_back(); // alpha
+        let state = state.jump_forward(); // bravo
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+    }
+
+    #[test]
+    fn jump_back_with_no_history_stays() {
+        let state = sample_state();
+        let state = state.jump_back();
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn jump_forward_with_no_forward_stays() {
+        let state = sample_state();
+        let state = state.jump_forward();
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn jump_back_through_multiple_jumps() {
+        let state = sample_state();
+        let state = state.record_jump().next_table(); // bravo
+        let state = state.record_jump().next_table(); // charlie
+        let state = state.record_jump().next_table(); // delta
+
+        let state = state.jump_back();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+        let state = state.jump_back();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+        let state = state.jump_back();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
     }
 }
