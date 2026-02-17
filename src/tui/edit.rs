@@ -758,11 +758,17 @@ mod tests {
     #[test]
     fn prepare_editor_request_on_blank_returns_none() {
         let mut schema = Schema::new();
-        schema.add_table(Table::new("a"));
+        let mut table_a = Table::new("a");
+        table_a.add_column(Column::new("id", PgType::Uuid));
+        schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        let state = AppState::new(schema, String::new())
-            .with_viewport_height(20)
-            .cursor_down(1); // blank line
+        // Expand "a" so there is a blank line between the two tables.
+        // Doc: a(0) id(1) close(2) blank(3) b(4)
+        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        state.expanded.insert("a".into());
+        state.rebuild_doc();
+        let state = state.cursor_to(3); // blank line
+        assert!(matches!(state.focus(), Some(FocusTarget::Blank)));
         let (_state, request) = prepare_editor_request(state);
         assert!(request.is_none());
     }
@@ -880,11 +886,16 @@ mod tests {
     #[test]
     fn rename_on_blank_does_nothing() {
         let mut schema = Schema::new();
-        schema.add_table(Table::new("a"));
+        let mut table_a = Table::new("a");
+        table_a.add_column(Column::new("id", PgType::Uuid));
+        schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        let state = AppState::new(schema, String::new())
-            .with_viewport_height(20)
-            .cursor_down(1); // blank line
+        // Expand "a" so there is a blank line between the two tables.
+        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        state.expanded.insert("a".into());
+        state.rebuild_doc();
+        let state = state.cursor_to(3); // blank line
+        assert!(matches!(state.focus(), Some(FocusTarget::Blank)));
 
         let state = enter_rename_mode(state);
         assert_eq!(state.mode, Mode::Normal);

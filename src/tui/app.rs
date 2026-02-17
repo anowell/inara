@@ -1086,6 +1086,12 @@ impl AppState {
             return (pos, pos);
         }
 
+        // A collapsed table/enum/type (single-line header with no expanded body)
+        // forms its own single-line block even without surrounding blanks.
+        if self.is_single_line_block(pos) {
+            return (pos, pos);
+        }
+
         // Search backward for block start (line after a Blank, or start of doc)
         let start = (0..pos)
             .rev()
@@ -1101,6 +1107,36 @@ impl AppState {
 
         (start, end)
     }
+
+    /// Returns true when the line at `pos` is a single-line block header
+    /// (e.g. a collapsed table, empty enum, or single-line type).
+    fn is_single_line_block(&self, pos: usize) -> bool {
+        match &self.doc[pos].target {
+            FocusTarget::Table(name) => {
+                // Collapsed if the next line is NOT part of this table's body
+                pos + 1 >= self.doc.len()
+                    || !matches!(
+                        &self.doc[pos + 1].target,
+                        FocusTarget::Column(n, _) | FocusTarget::TableClose(n) if n == name
+                    )
+            }
+            FocusTarget::Enum(name) => {
+                pos + 1 >= self.doc.len()
+                    || !matches!(
+                        &self.doc[pos + 1].target,
+                        FocusTarget::EnumVariant(n, _) if n == name
+                    )
+            }
+            FocusTarget::Type(name) => {
+                pos + 1 >= self.doc.len()
+                    || !matches!(
+                        &self.doc[pos + 1].target,
+                        FocusTarget::TypeField(n, _) if n == name
+                    )
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Build the flat document model from a schema and expanded set.
@@ -1110,16 +1146,23 @@ impl AppState {
 /// Enums and custom types are always expanded (they're typically short).
 pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLine> {
     let mut lines = Vec::new();
-    let mut first = true;
+    // Track whether the previous block spanned multiple lines.
+    // A blank separator is inserted only when either the previous or current
+    // block is multi-line, so consecutive collapsed (single-line) items pack
+    // tightly together.
+    let mut prev_multiline: Option<bool> = None;
 
     // Enums
     for enum_type in schema.enums.values() {
-        if !first {
-            lines.push(DocLine {
-                target: FocusTarget::Blank,
-            });
+        let is_multiline = !enum_type.variants.is_empty();
+        if let Some(prev) = prev_multiline {
+            if prev || is_multiline {
+                lines.push(DocLine {
+                    target: FocusTarget::Blank,
+                });
+            }
         }
-        first = false;
+        prev_multiline = Some(is_multiline);
         lines.push(DocLine {
             target: FocusTarget::Enum(enum_type.name.clone()),
         });
@@ -1139,12 +1182,18 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
 
     // Custom types
     for custom_type in schema.types.values() {
-        if !first {
-            lines.push(DocLine {
-                target: FocusTarget::Blank,
-            });
+        let is_multiline = matches!(
+            &custom_type.kind,
+            crate::schema::CustomTypeKind::Composite { fields } if !fields.is_empty()
+        );
+        if let Some(prev) = prev_multiline {
+            if prev || is_multiline {
+                lines.push(DocLine {
+                    target: FocusTarget::Blank,
+                });
+            }
         }
-        first = false;
+        prev_multiline = Some(is_multiline);
 
         lines.push(DocLine {
             target: FocusTarget::Type(custom_type.name.clone()),
@@ -1166,21 +1215,24 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
 
     // Tables
     for table in schema.tables.values() {
-        if !first {
-            lines.push(DocLine {
-                target: FocusTarget::Blank,
-            });
+        let is_expanded = expanded.contains(&table.name);
+        let is_empty =
+            table.columns.is_empty() && table.constraints.is_empty() && table.indexes.is_empty();
+        let is_multiline = is_expanded && !is_empty;
+        if let Some(prev) = prev_multiline {
+            if prev || is_multiline {
+                lines.push(DocLine {
+                    target: FocusTarget::Blank,
+                });
+            }
         }
-        first = false;
+        prev_multiline = Some(is_multiline);
 
         lines.push(DocLine {
             target: FocusTarget::Table(table.name.clone()),
         });
 
-        if expanded.contains(&table.name) {
-            let is_empty = table.columns.is_empty()
-                && table.constraints.is_empty()
-                && table.indexes.is_empty();
+        if is_expanded {
             if is_empty {
                 // Empty table shows as `table name { }` — single line, no close
             } else {
@@ -1330,14 +1382,14 @@ mod tests {
     #[test]
     fn cursor_down_clamps() {
         let state = sample_state();
-        // 5 tables with blank separators between them = 9 lines
-        assert_eq!(state.line_count(), 9);
+        // 5 collapsed tables with no separators = 5 lines
+        assert_eq!(state.line_count(), 5);
 
         let state = state.cursor_down(1);
         assert_eq!(state.cursor, 1);
 
         let state = state.cursor_down(100);
-        assert_eq!(state.cursor, 8); // clamped to last
+        assert_eq!(state.cursor, 4); // clamped to last
     }
 
     #[test]
@@ -1356,7 +1408,7 @@ mod tests {
     fn cursor_to_clamps() {
         let state = sample_state();
         let state = state.cursor_to(100);
-        assert_eq!(state.cursor, 8);
+        assert_eq!(state.cursor, 4);
 
         let state = state.cursor_to(2);
         assert_eq!(state.cursor, 2);
@@ -1452,14 +1504,56 @@ mod tests {
     #[test]
     fn focus_target_on_collapsed_tables() {
         let state = sample_state();
-        // All tables start collapsed. Doc should have table headers with blank lines between.
+        // All tables start collapsed. No blank lines between collapsed tables.
         assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
 
         let state = state.cursor_down(1);
-        assert_eq!(state.focus(), Some(&FocusTarget::Blank));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
 
         let state = state.cursor_down(1);
-        assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+    }
+
+    #[test]
+    fn collapsed_tables_have_no_blank_separators() {
+        let state = sample_state();
+        // All 5 tables collapsed → no blank lines at all
+        assert_eq!(state.line_count(), 5);
+        for line in &state.doc {
+            assert!(
+                !matches!(line.target, FocusTarget::Blank),
+                "collapsed-only doc should have no blank lines"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_table_gets_blank_separators() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        schema.add_table(Table::new("aaa"));
+        let mut mid = Table::new("bbb");
+        mid.add_column(Column::new("id", PgType::Uuid));
+        schema.add_table(mid);
+        schema.add_table(Table::new("ccc"));
+
+        let mut state = AppState::new(schema, String::new());
+        // All collapsed: aaa(0) bbb(1) ccc(2) — no blanks
+        assert_eq!(state.line_count(), 3);
+
+        // Expand bbb: aaa(0) blank(1) bbb(2) id(3) close(4) blank(5) ccc(6)
+        state.expanded.insert("bbb".into());
+        state.rebuild_doc();
+        assert_eq!(state.line_count(), 7);
+        assert_eq!(state.doc[0].target, FocusTarget::Table("aaa".into()));
+        assert_eq!(state.doc[1].target, FocusTarget::Blank);
+        assert_eq!(state.doc[2].target, FocusTarget::Table("bbb".into()));
+        assert!(matches!(state.doc[3].target, FocusTarget::Column(_, _)));
+        assert_eq!(state.doc[4].target, FocusTarget::TableClose("bbb".into()));
+        assert_eq!(state.doc[5].target, FocusTarget::Blank);
+        assert_eq!(state.doc[6].target, FocusTarget::Table("ccc".into()));
     }
 
     #[test]
@@ -1583,11 +1677,11 @@ mod tests {
     #[test]
     fn node_range_collapsed_tables() {
         let state = sample_state();
-        // Doc: alpha(0) blank(1) bravo(2) blank(3) charlie(4) blank(5) delta(6) blank(7) echo(8)
+        // Doc: alpha(0) bravo(1) charlie(2) delta(3) echo(4) — no blanks between collapsed tables
         assert_eq!(state.node_range_at(0), (0, 0)); // alpha alone
-        assert_eq!(state.node_range_at(1), (1, 1)); // blank
-        assert_eq!(state.node_range_at(2), (2, 2)); // bravo alone
-        assert_eq!(state.node_range_at(8), (8, 8)); // echo alone
+        assert_eq!(state.node_range_at(1), (1, 1)); // bravo alone
+        assert_eq!(state.node_range_at(2), (2, 2)); // charlie alone
+        assert_eq!(state.node_range_at(4), (4, 4)); // echo alone
     }
 
     #[test]

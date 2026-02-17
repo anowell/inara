@@ -1337,8 +1337,8 @@ mod tests {
     #[test]
     fn normal_big_g_jumps_to_last() {
         let state = handle_key_no_pool(sample_state(), key(KeyCode::Char('G')));
-        // 5 tables with 4 blank separators = 9 lines, last at index 8
-        assert_eq!(state.cursor, 8);
+        // 5 collapsed tables with no separators = 5 lines, last at index 4
+        assert_eq!(state.cursor, 4);
     }
 
     #[test]
@@ -1385,12 +1385,13 @@ mod tests {
 
     #[test]
     fn normal_ctrl_b_full_page_up() {
-        let state = sample_state().with_viewport_height(4).cursor_to(6);
+        // 5 collapsed tables = 5 lines; start at last line (4), page up by viewport_height (4)
+        let state = sample_state().with_viewport_height(4).cursor_to(4);
         let state = handle_key_no_pool(
             state,
             key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
         );
-        assert_eq!(state.cursor, 2);
+        assert_eq!(state.cursor, 0);
     }
 
     // --- Ctrl-c quits from any mode ---
