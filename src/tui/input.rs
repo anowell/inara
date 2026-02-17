@@ -137,6 +137,14 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             let half = state.viewport_height / 2;
             HandleResult::state_only(state.cursor_up(half.max(1)))
         }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let page = state.viewport_height;
+            HandleResult::state_only(state.cursor_down(page.max(1)))
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let page = state.viewport_height;
+            HandleResult::state_only(state.cursor_up(page.max(1)))
+        }
 
         // Expand/collapse
         KeyCode::Enter => HandleResult::state_only(state.toggle_expand()),
@@ -1165,6 +1173,14 @@ mod tests {
                 let half = state.viewport_height / 2;
                 state.cursor_up(half.max(1))
             }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let page = state.viewport_height;
+                state.cursor_down(page.max(1))
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let page = state.viewport_height;
+                state.cursor_up(page.max(1))
+            }
             KeyCode::Enter => state.toggle_expand(),
             KeyCode::Tab => state.next_table(),
             KeyCode::BackTab => state.prev_table(),
@@ -1244,6 +1260,26 @@ mod tests {
         let state = handle_key_no_pool(
             state,
             key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn normal_ctrl_f_full_page_down() {
+        let state = sample_state().with_viewport_height(4);
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.cursor, 4); // full viewport_height
+    }
+
+    #[test]
+    fn normal_ctrl_b_full_page_up() {
+        let state = sample_state().with_viewport_height(4).cursor_to(6);
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
         );
         assert_eq!(state.cursor, 2);
     }

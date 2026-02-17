@@ -39,6 +39,14 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Half-page up",
     },
     Binding {
+        key: "Ctrl-f",
+        desc: "Full-page down",
+    },
+    Binding {
+        key: "Ctrl-b",
+        desc: "Full-page up",
+    },
+    Binding {
         key: "Enter",
         desc: "Toggle expand/collapse",
     },

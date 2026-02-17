@@ -25,6 +25,8 @@ Inara's navigation is inspired by helix editor. This document defines the keybin
 | `G` | Jump to last element |
 | `Ctrl-d` | Half-page down |
 | `Ctrl-u` | Half-page up |
+| `Ctrl-f` | Full-page down |
+| `Ctrl-b` | Full-page up |
 | `Enter` | Toggle expand/collapse on focused table |
 | `Tab` | Next table |
 | `Shift-Tab` | Previous table |
