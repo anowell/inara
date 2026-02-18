@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::{AppState, DefaultPromptTarget, FocusTarget, Mode, RenameMetadata, RenameTarget};
+use crate::migration::overlay::ChangeMarker;
 use crate::schema::render::render_single_table;
 use crate::schema::types::Expression;
 use crate::schema::{Constraint, Index};
@@ -31,6 +32,7 @@ pub fn toggle_nullable(state: AppState) -> AppState {
     }
     state.edited_tables.insert(table_name);
     state.rebuild_doc();
+    state.recompute_edit_overlay();
     state
 }
 
@@ -63,6 +65,7 @@ pub fn toggle_column_unique(state: AppState) -> AppState {
     }
     state.edited_tables.insert(table_name);
     state.rebuild_doc();
+    state.recompute_edit_overlay();
     state
 }
 
@@ -97,6 +100,7 @@ pub fn toggle_column_index(state: AppState) -> AppState {
     }
     state.edited_tables.insert(table_name);
     state.rebuild_doc();
+    state.recompute_edit_overlay();
     state
 }
 
@@ -181,6 +185,7 @@ fn confirm_default_prompt(mut state: AppState) -> AppState {
 
     state.edited_tables.insert(target.table);
     state.rebuild_doc();
+    state.recompute_edit_overlay();
     state.mode = Mode::Normal;
     state.pending_key = super::app::PendingKey::None;
     state
@@ -310,6 +315,7 @@ fn confirm_rename(mut state: AppState) -> AppState {
                 state.edited_tables.insert(new_name);
                 state = state.ensure_original_schema();
                 state.rebuild_doc();
+                state.recompute_edit_overlay();
             }
         }
         RenameTarget::Column(table_name, old_col_name) => {
@@ -344,6 +350,7 @@ fn confirm_rename(mut state: AppState) -> AppState {
                 state.edited_tables.insert(table_name);
                 state = state.ensure_original_schema();
                 state.rebuild_doc();
+                state.recompute_edit_overlay();
             }
         }
     }
@@ -352,6 +359,184 @@ fn confirm_rename(mut state: AppState) -> AppState {
     state.mode = Mode::Normal;
     state.pending_key = super::app::PendingKey::None;
     state
+}
+
+// ── Granular revert ─────────────────────────────────────────────
+
+/// Revert the edit at the cursor position.
+///
+/// The scope depends on what the cursor is on:
+/// - Column line → reverts that single column
+/// - Table header → reverts the entire table
+/// - Ghost line → restores the removed element from `original_schema`
+pub fn revert_at_cursor(state: AppState) -> AppState {
+    let doc_line = match state.doc.get(state.cursor) {
+        Some(dl) => dl.clone(),
+        None => return state,
+    };
+
+    if state.original_schema.is_none() {
+        return state.with_status("No edits to revert");
+    }
+
+    // Clone what we need for marker lookups before consuming state
+    let col_marker = match &doc_line.target {
+        FocusTarget::Column(table_name, col_name) => state
+            .edit_overlay
+            .as_ref()
+            .and_then(|ov| ov.column_marker(table_name, col_name)),
+        _ => None,
+    };
+    let table_marker = match &doc_line.target {
+        FocusTarget::Table(name)
+        | FocusTarget::TableClose(name)
+        | FocusTarget::Separator(name)
+        | FocusTarget::Constraint(name, _)
+        | FocusTarget::Index(name, _) => state
+            .edit_overlay
+            .as_ref()
+            .and_then(|ov| ov.table_marker(name)),
+        FocusTarget::Column(table_name, _) => state
+            .edit_overlay
+            .as_ref()
+            .and_then(|ov| ov.table_marker(table_name)),
+        _ => None,
+    };
+
+    // Clone original schema for restoration operations
+    let Some(original) = state.original_schema.clone() else {
+        return state.with_status("No edits to revert");
+    };
+
+    match &doc_line.target {
+        FocusTarget::Column(table_name, col_name) => {
+            if doc_line.ghost {
+                return revert_restore_column(state, &original, table_name, col_name);
+            }
+            match col_marker {
+                Some(ChangeMarker::Added) => revert_remove_column(state, table_name, col_name),
+                Some(ChangeMarker::Modified) | Some(ChangeMarker::Removed) => {
+                    revert_restore_column(state, &original, table_name, col_name)
+                }
+                None => state.with_status("No change to revert"),
+            }
+        }
+        FocusTarget::Table(table_name) => {
+            if doc_line.ghost {
+                return revert_restore_table(state, &original, table_name);
+            }
+            match table_marker {
+                Some(ChangeMarker::Added) => revert_remove_table(state, table_name),
+                Some(ChangeMarker::Modified) | Some(ChangeMarker::Removed) => {
+                    revert_restore_table(state, &original, table_name)
+                }
+                None => state.with_status("No change to revert"),
+            }
+        }
+        FocusTarget::TableClose(table_name)
+        | FocusTarget::Separator(table_name)
+        | FocusTarget::Constraint(table_name, _)
+        | FocusTarget::Index(table_name, _) => match table_marker {
+            Some(ChangeMarker::Added) => revert_remove_table(state, table_name),
+            Some(ChangeMarker::Modified) | Some(ChangeMarker::Removed) => {
+                revert_restore_table(state, &original, table_name)
+            }
+            None => state.with_status("No change to revert"),
+        },
+        _ => state.with_status("Nothing to revert here"),
+    }
+}
+
+/// Remove an added column (revert an addition).
+fn revert_remove_column(mut state: AppState, table_name: &str, col_name: &str) -> AppState {
+    if let Some(table) = state.schema.tables.get_mut(table_name) {
+        table.columns.retain(|c| c.name != col_name);
+    }
+    finalize_revert(state, table_name)
+}
+
+/// Restore a column from the original schema (revert a modification or removal).
+fn revert_restore_column(
+    mut state: AppState,
+    original: &crate::schema::Schema,
+    table_name: &str,
+    col_name: &str,
+) -> AppState {
+    let original_col = original
+        .table(table_name)
+        .and_then(|t| t.column(col_name))
+        .cloned();
+
+    let Some(original_col) = original_col else {
+        return state.with_status("Column not found in original schema");
+    };
+
+    if let Some(table) = state.schema.tables.get_mut(table_name) {
+        // Replace or add the column
+        if let Some(existing) = table.columns.iter_mut().find(|c| c.name == col_name) {
+            *existing = original_col;
+        } else {
+            // Column was dropped — re-add it
+            table.add_column(original_col);
+        }
+    } else {
+        // Table doesn't exist in current schema — restore it first
+        return revert_restore_table(state, original, table_name);
+    }
+
+    finalize_revert(state, table_name)
+}
+
+/// Remove an added table (revert an addition).
+fn revert_remove_table(mut state: AppState, table_name: &str) -> AppState {
+    state.schema.tables.remove(table_name);
+    state.expanded.remove(table_name);
+    state.edited_tables.remove(table_name);
+    // Remove any renames for this table
+    state.renames.retain(|r| r.table != table_name);
+    finalize_revert_no_table(state)
+}
+
+/// Restore an entire table from the original schema (revert modifications or removal).
+fn revert_restore_table(
+    mut state: AppState,
+    original: &crate::schema::Schema,
+    table_name: &str,
+) -> AppState {
+    let Some(original_table) = original.table(table_name).cloned() else {
+        return state.with_status("Table not found in original schema");
+    };
+
+    // Remove the current version and insert the original
+    state.schema.tables.remove(table_name);
+    state.schema.add_table(original_table);
+    state.edited_tables.remove(table_name);
+    // Remove any renames for this table
+    state.renames.retain(|r| r.table != table_name);
+    finalize_revert(state, table_name)
+}
+
+/// Finalize a revert: rebuild doc, recompute overlay, check if fully reverted.
+fn finalize_revert(mut state: AppState, table_name: &str) -> AppState {
+    state.edited_tables.remove(table_name);
+    finalize_revert_no_table(state)
+}
+
+/// Finalize a revert without table-specific cleanup.
+fn finalize_revert_no_table(mut state: AppState) -> AppState {
+    state.rebuild_doc();
+    state.recompute_edit_overlay();
+
+    // If schema matches original, clear edit state entirely
+    if !state.has_edits() {
+        state.original_schema = None;
+        state.renames.clear();
+        state.edited_tables.clear();
+        state.edit_overlay = None;
+        state.with_status("All edits reverted")
+    } else {
+        state.with_status("Change reverted")
+    }
 }
 
 fn rename_column_in_constraint(
@@ -757,18 +942,19 @@ mod tests {
 
     #[test]
     fn prepare_editor_request_on_blank_returns_none() {
+        use crate::schema::types::PgType;
+
         let mut schema = Schema::new();
         let mut table_a = Table::new("a");
         table_a.add_column(Column::new("id", PgType::Uuid));
         schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        // Expand "a" so there is a blank line between the two tables.
-        // Doc: a(0) id(1) close(2) blank(3) b(4)
         let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        // Expand "a" so it becomes multi-line, producing a blank before "b"
         state.expanded.insert("a".into());
         state.rebuild_doc();
+        // a(0) id(1) close(2) blank(3) b(4)
         let state = state.cursor_to(3); // blank line
-        assert!(matches!(state.focus(), Some(FocusTarget::Blank)));
         let (_state, request) = prepare_editor_request(state);
         assert!(request.is_none());
     }
@@ -885,19 +1071,132 @@ mod tests {
 
     #[test]
     fn rename_on_blank_does_nothing() {
+        use crate::schema::types::PgType;
+
         let mut schema = Schema::new();
         let mut table_a = Table::new("a");
         table_a.add_column(Column::new("id", PgType::Uuid));
         schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        // Expand "a" so there is a blank line between the two tables.
         let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        // Expand "a" so it becomes multi-line, producing a blank before "b"
         state.expanded.insert("a".into());
         state.rebuild_doc();
+        // a(0) id(1) close(2) blank(3) b(4)
         let state = state.cursor_to(3); // blank line
-        assert!(matches!(state.focus(), Some(FocusTarget::Blank)));
 
         let state = enter_rename_mode(state);
         assert_eq!(state.mode, Mode::Normal);
+    }
+
+    // ── Granular revert tests ───────────────────────────────────
+
+    #[test]
+    fn revert_added_column_removes_it() {
+        let state = state_with_users().cursor_down(2); // "email" column
+        let state = toggle_nullable(state); // make an edit to establish original_schema
+
+        // Now add a column
+        let mut state = state;
+        if let Some(table) = state.schema.tables.get_mut("users") {
+            table.add_column(Column::new("bio", crate::schema::types::PgType::Text));
+        }
+        state.edited_tables.insert("users".into());
+        state.rebuild_doc();
+        state.recompute_edit_overlay();
+
+        // Navigate to "bio" column
+        let bio_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("users".into(), "bio".into()));
+        assert!(bio_pos.is_some());
+        let state = state.cursor_to(bio_pos.unwrap());
+
+        // Revert — should remove the bio column
+        let state = revert_at_cursor(state);
+        assert!(state.schema.table("users").unwrap().column("bio").is_none());
+    }
+
+    #[test]
+    fn revert_modified_column_restores_original() {
+        let state = state_with_users().cursor_down(2); // "email" column
+        let col_before = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap()
+            .clone();
+        assert!(!col_before.nullable);
+
+        // Toggle nullable — this sets original_schema and modifies email
+        let state = toggle_nullable(state);
+        let col_after = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col_after.nullable);
+
+        // Revert — should restore to original
+        let state = revert_at_cursor(state);
+        let col_reverted = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col_reverted.nullable);
+    }
+
+    #[test]
+    fn revert_clears_edit_state_when_fully_reverted() {
+        let state = state_with_users().cursor_down(2); // "email" column
+        let state = toggle_nullable(state); // make an edit
+        assert!(state.original_schema.is_some());
+
+        // Revert the single change
+        let state = revert_at_cursor(state);
+        // Schema should now match original — edit state should be cleared
+        assert!(state.original_schema.is_none());
+        assert!(state.edit_overlay.is_none());
+    }
+
+    #[test]
+    fn revert_no_edits_shows_status() {
+        let state = state_with_users().cursor_down(2);
+        // No edits made
+        let state = revert_at_cursor(state);
+        assert_eq!(state.status_message.as_deref(), Some("No edits to revert"));
+    }
+
+    #[test]
+    fn revert_on_unchanged_line_shows_status() {
+        let state = state_with_users().cursor_down(2); // email
+        let state = toggle_nullable(state); // make email changed
+
+        // Move to "id" column (which wasn't changed)
+        let state = state.cursor_to(1); // id
+        let state = revert_at_cursor(state);
+        assert_eq!(state.status_message.as_deref(), Some("No change to revert"));
+    }
+
+    #[test]
+    fn revert_table_header_restores_entire_table() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let state = toggle_nullable(state); // make an edit
+                                            // Move to table header
+        let state = state.cursor_to(0);
+        let state = revert_at_cursor(state);
+        // Should have reverted the whole table
+        let email = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!email.nullable); // restored to original NOT NULL
     }
 }

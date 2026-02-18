@@ -7,7 +7,7 @@ use super::fuzzy::SearchState;
 use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
 use crate::migration::loader::MigrationIndex;
-use crate::migration::overlay::PendingOverlay;
+use crate::migration::overlay::{EditOverlay, PendingOverlay};
 use crate::schema::relations::RelationMap;
 use crate::schema::type_map::TypeMapper;
 use crate::schema::Schema;
@@ -28,6 +28,7 @@ pub enum Mode {
     LlmPreview,
     Help,
     InDocSearch,
+    ChangePreview,
 }
 
 /// Metadata for a rename operation. Recorded so the diff engine can
@@ -102,11 +103,26 @@ pub enum LlmPreviewKind {
     },
 }
 
-/// Pending key state for multi-key sequences (e.g. `gg`, `g r`).
+/// State for the change preview overlay (Space d).
+#[derive(Debug, Clone)]
+pub struct ChangePreviewState {
+    /// Human-readable summary lines of changes.
+    pub summary: Vec<String>,
+    /// Generated migration SQL (if any).
+    pub sql: Option<String>,
+    /// Whether to show SQL view (toggled with `s`).
+    pub show_sql: bool,
+    /// Scroll offset.
+    pub scroll: usize,
+}
+
+/// Pending key state for multi-key sequences (e.g. `gg`, `g r`, `]g`, `[g`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingKey {
     None,
     G,
+    CloseBracket,
+    OpenBracket,
 }
 
 /// Direction for in-document search.
@@ -213,6 +229,7 @@ impl JumpList {
         }
     }
 }
+
 /// What type of schema element is currently focused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocusTarget {
@@ -282,6 +299,8 @@ impl FocusTarget {
 #[derive(Debug, Clone)]
 pub struct DocLine {
     pub target: FocusTarget,
+    /// Whether this line represents a removed element (ghost line).
+    pub ghost: bool,
 }
 
 /// The single application state struct passed to all renderers.
@@ -359,6 +378,12 @@ pub struct AppState {
     pub in_doc_search: Option<InDocSearchState>,
     /// Navigation jump list for Ctrl-o (back) / Ctrl-i (forward).
     pub jump_list: JumpList,
+    /// Change preview state (present when mode is ChangePreview).
+    pub change_preview: Option<ChangePreviewState>,
+    /// Edit overlay — computed from diff(original_schema, current_schema).
+    pub edit_overlay: Option<EditOverlay>,
+    /// Whether to show edit change markers in the gutter (default: true).
+    pub show_edit_changes: bool,
 }
 
 impl AppState {
@@ -402,6 +427,9 @@ impl AppState {
             help_source_mode: Mode::Normal,
             in_doc_search: None,
             jump_list: JumpList::new(),
+            change_preview: None,
+            edit_overlay: None,
+            show_edit_changes: true,
         }
     }
 
@@ -445,6 +473,9 @@ impl AppState {
         }
         if mode != Mode::LlmPending {
             self.llm_pending_message = None;
+        }
+        if mode != Mode::ChangePreview {
+            self.change_preview = None;
         }
         // Clear status message on any mode transition
         self.status_message = None;
@@ -725,7 +756,26 @@ impl AppState {
         self.original_schema = Some(self.schema.clone());
         self.renames.clear();
         self.edited_tables.clear();
+        self.edit_overlay = None;
         self
+    }
+
+    /// Recompute the edit overlay from the diff between original and current schema.
+    pub fn recompute_edit_overlay(&mut self) {
+        use crate::schema::diff::Rename;
+
+        self.edit_overlay = self.original_schema.as_ref().map(|original| {
+            let renames: Vec<Rename> = self
+                .renames
+                .iter()
+                .map(|r| Rename {
+                    table: r.table.clone(),
+                    from: r.from.clone(),
+                    to: r.to.clone(),
+                })
+                .collect();
+            EditOverlay::compute(original, &self.schema, &renames)
+        });
     }
 
     /// Set a transient status message for the status bar (alias for `with_status`).
@@ -992,6 +1042,73 @@ impl AppState {
         self
     }
 
+    /// Jump cursor to the next line with an edit change marker.
+    pub fn next_change(mut self) -> Self {
+        if self.edit_overlay.is_none() {
+            return self.with_status("No edit changes");
+        }
+        for i in (self.cursor + 1)..self.doc.len() {
+            if self.has_edit_marker(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        // Wrap to beginning
+        for i in 0..self.cursor {
+            if self.has_edit_marker(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self.with_status("No more changes")
+    }
+
+    /// Jump cursor to the previous line with an edit change marker.
+    pub fn prev_change(mut self) -> Self {
+        if self.edit_overlay.is_none() {
+            return self.with_status("No edit changes");
+        }
+        if self.cursor > 0 {
+            for i in (0..self.cursor).rev() {
+                if self.has_edit_marker(i) {
+                    self.cursor = i;
+                    return self.scroll_to_focus();
+                }
+            }
+        }
+        // Wrap to end
+        for i in (self.cursor + 1..self.doc.len()).rev() {
+            if self.has_edit_marker(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self.with_status("No more changes")
+    }
+
+    /// Check if a document line has an edit change marker.
+    fn has_edit_marker(&self, index: usize) -> bool {
+        let Some(doc_line) = self.doc.get(index) else {
+            return false;
+        };
+        if doc_line.ghost {
+            return true;
+        }
+        let Some(overlay) = &self.edit_overlay else {
+            return false;
+        };
+        match &doc_line.target {
+            FocusTarget::Table(name)
+            | FocusTarget::TableClose(name)
+            | FocusTarget::Separator(name) => overlay.table_marker(name).is_some(),
+            FocusTarget::Column(table, col) => overlay.column_marker(table, col).is_some(),
+            FocusTarget::Constraint(table, _) | FocusTarget::Index(table, _) => {
+                overlay.table_marker(table).is_some()
+            }
+            _ => false,
+        }
+    }
+
     /// Jump cursor to the next table header.
     pub fn next_table(mut self) -> Self {
         for i in (self.cursor + 1)..self.doc.len() {
@@ -1021,7 +1138,15 @@ impl AppState {
     /// Rebuild the document after expand/collapse or schema changes, preserving cursor context.
     pub fn rebuild_doc(&mut self) {
         let old_target = self.focus().cloned();
-        self.doc = build_document(&self.schema, &self.expanded);
+        if self.show_edit_changes {
+            self.doc = build_document_with_ghosts(
+                &self.schema,
+                &self.expanded,
+                self.edit_overlay.as_ref(),
+            );
+        } else {
+            self.doc = build_document(&self.schema, &self.expanded);
+        }
         self.relation_map = RelationMap::build(&self.schema);
 
         // Try to find the same target in the new doc
@@ -1185,7 +1310,22 @@ impl AppState {
 /// The document is a list of lines, one per visible element. Collapsed nodes
 /// show a single summary line. Expanded nodes show all internal lines.
 /// All node types (enums, types, tables) support collapse/expand.
+///
+/// Blank separators are inserted only when the previous block was multi-line,
+/// so expanding a node doesn't shift its header down.
 pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLine> {
+    build_document_with_ghosts(schema, expanded, None)
+}
+
+/// Build the document model, optionally inserting ghost lines for removed elements.
+///
+/// When `edit_overlay` is provided, ghost lines are inserted for dropped columns
+/// and dropped tables so the user can see (and revert) removals.
+pub fn build_document_with_ghosts(
+    schema: &Schema,
+    expanded: &BTreeSet<String>,
+    edit_overlay: Option<&EditOverlay>,
+) -> Vec<DocLine> {
     let mut lines = Vec::new();
     // Track whether the previous block spanned multiple lines.
     // A blank separator is inserted only when the previous block was
@@ -1200,12 +1340,14 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
             if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
+                    ghost: false,
                 });
             }
         }
         prev_multiline = Some(is_multiline);
         lines.push(DocLine {
             target: FocusTarget::Enum(enum_type.name.clone()),
+            ghost: false,
         });
         if is_expanded {
             if enum_type.variants.is_empty() {
@@ -1214,10 +1356,12 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
                 for (i, _variant) in enum_type.variants.iter().enumerate() {
                     lines.push(DocLine {
                         target: FocusTarget::EnumVariant(enum_type.name.clone(), i),
+                        ghost: false,
                     });
                 }
                 lines.push(DocLine {
                     target: FocusTarget::EnumClose(enum_type.name.clone()),
+                    ghost: false,
                 });
             }
         }
@@ -1235,6 +1379,7 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
             if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
+                    ghost: false,
                 });
             }
         }
@@ -1242,6 +1387,7 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
 
         lines.push(DocLine {
             target: FocusTarget::Type(custom_type.name.clone()),
+            ghost: false,
         });
 
         if is_expanded {
@@ -1250,15 +1396,27 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
                     for (i, _) in fields.iter().enumerate() {
                         lines.push(DocLine {
                             target: FocusTarget::TypeField(custom_type.name.clone(), i),
+                            ghost: false,
                         });
                     }
                     lines.push(DocLine {
                         target: FocusTarget::TypeClose(custom_type.name.clone()),
+                        ghost: false,
                     });
                 }
             }
         }
     }
+
+    // Collect dropped table names from edit overlay for ghost table headers
+    let dropped_tables: Vec<String> = edit_overlay
+        .iter()
+        .flat_map(|ov| ov.changes.iter())
+        .filter_map(|c| match c {
+            crate::schema::diff::Change::DropTable(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
 
     // Tables
     for table in schema.tables.values() {
@@ -1270,6 +1428,7 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
             if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
+                    ghost: false,
                 });
             }
         }
@@ -1277,6 +1436,7 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
 
         lines.push(DocLine {
             target: FocusTarget::Table(table.name.clone()),
+            ghost: false,
         });
 
         if is_expanded {
@@ -1291,7 +1451,26 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
                 for col in &table.columns {
                     lines.push(DocLine {
                         target: FocusTarget::Column(table.name.clone(), col.name.clone()),
+                        ghost: false,
                     });
+                }
+
+                // Ghost lines for dropped columns (from edit overlay)
+                if let Some(overlay) = edit_overlay {
+                    for change in &overlay.changes {
+                        if let crate::schema::diff::Change::DropColumn {
+                            table: t,
+                            column: c,
+                        } = change
+                        {
+                            if t == &table.name {
+                                lines.push(DocLine {
+                                    target: FocusTarget::Column(table.name.clone(), c.clone()),
+                                    ghost: true,
+                                });
+                            }
+                        }
+                    }
                 }
 
                 // Separate constraints
@@ -1308,10 +1487,12 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
                 if !separate_constraints.is_empty() {
                     lines.push(DocLine {
                         target: FocusTarget::Separator(table.name.clone()),
+                        ghost: false,
                     });
                     for &ci in &separate_constraints {
                         lines.push(DocLine {
                             target: FocusTarget::Constraint(table.name.clone(), ci),
+                            ghost: false,
                         });
                     }
                 }
@@ -1321,20 +1502,41 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
                     if separate_constraints.is_empty() {
                         lines.push(DocLine {
                             target: FocusTarget::Separator(table.name.clone()),
+                            ghost: false,
                         });
                     }
                     for (i, _) in table.indexes.iter().enumerate() {
                         lines.push(DocLine {
                             target: FocusTarget::Index(table.name.clone(), i),
+                            ghost: false,
                         });
                     }
                 }
 
                 lines.push(DocLine {
                     target: FocusTarget::TableClose(table.name.clone()),
+                    ghost: false,
                 });
             }
         }
+    }
+
+    // Ghost lines for dropped tables
+    for dropped_name in &dropped_tables {
+        // Ghost tables are single-line; use same prev_multiline logic
+        if let Some(prev) = prev_multiline {
+            if prev {
+                lines.push(DocLine {
+                    target: FocusTarget::Blank,
+                    ghost: false,
+                });
+            }
+        }
+        prev_multiline = Some(false);
+        lines.push(DocLine {
+            target: FocusTarget::Table(dropped_name.clone()),
+            ghost: true,
+        });
     }
 
     lines
@@ -1424,6 +1626,7 @@ mod tests {
         assert_eq!(Mode::LlmPreview.to_string(), "LlmPreview");
         assert_eq!(Mode::Help.to_string(), "Help");
         assert_eq!(Mode::InDocSearch.to_string(), "InDocSearch");
+        assert_eq!(Mode::ChangePreview.to_string(), "ChangePreview");
     }
 
     #[test]
@@ -2043,5 +2246,176 @@ mod tests {
         assert_eq!(state.focus(), Some(&FocusTarget::Table("bravo".into())));
         let state = state.jump_back();
         assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    // --- Ghost lines (build_document_with_ghosts) ---
+
+    #[test]
+    fn ghost_lines_for_dropped_column() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::Change;
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        schema.add_table(users);
+
+        let overlay = EditOverlay {
+            changes: vec![Change::DropColumn {
+                table: "users".into(),
+                column: "legacy".into(),
+            }],
+        };
+
+        let mut expanded = BTreeSet::new();
+        expanded.insert("users".into());
+
+        let doc = build_document_with_ghosts(&schema, &expanded, Some(&overlay));
+        // Expected: users(0) id(1) ghost-legacy(2) close(3)
+        assert_eq!(doc.len(), 4);
+        assert!(!doc[0].ghost); // table header
+        assert!(!doc[1].ghost); // id column
+        assert!(doc[2].ghost); // ghost: dropped "legacy"
+        assert_eq!(
+            doc[2].target,
+            FocusTarget::Column("users".into(), "legacy".into())
+        );
+        assert!(!doc[3].ghost); // close brace
+    }
+
+    #[test]
+    fn ghost_lines_for_dropped_table() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::Change;
+
+        let schema = Schema::new();
+
+        let overlay = EditOverlay {
+            changes: vec![Change::DropTable("legacy_table".into())],
+        };
+
+        let doc = build_document_with_ghosts(&schema, &BTreeSet::new(), Some(&overlay));
+        // Should have a single ghost table line
+        assert_eq!(doc.len(), 1);
+        assert!(doc[0].ghost);
+        assert_eq!(doc[0].target, FocusTarget::Table("legacy_table".into()));
+    }
+
+    #[test]
+    fn no_ghost_lines_without_overlay() {
+        let mut schema = Schema::new();
+        schema.add_table(crate::schema::Table::new("users"));
+
+        let doc = build_document_with_ghosts(&schema, &BTreeSet::new(), None);
+        for line in &doc {
+            assert!(!line.ghost);
+        }
+    }
+
+    // --- next_change / prev_change ---
+
+    #[test]
+    fn next_change_finds_modified_line() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::{Change, ColumnChanges};
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+
+        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        state.expanded.insert("users".into());
+        state.edit_overlay = Some(EditOverlay {
+            changes: vec![Change::AlterColumn {
+                table: "users".into(),
+                column: "email".into(),
+                changes: ColumnChanges {
+                    nullable: Some(true),
+                    ..Default::default()
+                },
+            }],
+        });
+        state.rebuild_doc();
+
+        // Cursor starts at 0 (table header, which is modified)
+        let state = state.next_change();
+        // Should find email column (which is the altered column)
+        assert!(matches!(
+            state.focus(),
+            Some(FocusTarget::Column(ref t, ref c)) if t == "users" && c == "email"
+        ));
+    }
+
+    #[test]
+    fn next_change_wraps_around() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::Change;
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("bio", PgType::Text));
+        schema.add_table(users);
+
+        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        state.expanded.insert("users".into());
+        state.edit_overlay = Some(EditOverlay {
+            changes: vec![Change::AddColumn {
+                table: "users".into(),
+                column: Column::new("bio", PgType::Text),
+            }],
+        });
+        state.rebuild_doc();
+
+        // Move to the last line (close brace)
+        let last = state.line_count().saturating_sub(1);
+        let state = state.cursor_to(last);
+        // next_change should wrap to the table header or bio column
+        let state = state.next_change();
+        // Should have wrapped to an earlier position
+        assert!(state.cursor < last);
+    }
+
+    #[test]
+    fn prev_change_wraps_around() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::Change;
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("bio", PgType::Text));
+        schema.add_table(users);
+
+        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        state.expanded.insert("users".into());
+        state.edit_overlay = Some(EditOverlay {
+            changes: vec![Change::AddColumn {
+                table: "users".into(),
+                column: Column::new("bio", PgType::Text),
+            }],
+        });
+        state.rebuild_doc();
+
+        // Cursor at 0, prev_change should wrap to a later position
+        let state = state.prev_change();
+        assert!(state.cursor > 0);
+    }
+
+    #[test]
+    fn next_change_no_overlay_shows_status() {
+        let state = sample_state();
+        let state = state.next_change();
+        assert_eq!(state.status_message.as_deref(), Some("No edit changes"));
     }
 }

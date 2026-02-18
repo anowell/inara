@@ -83,7 +83,11 @@ pub fn render_document(state: &AppState) -> Vec<Line<'static>> {
         .map(|(i, doc_line)| {
             let line_index = state.viewport_offset + i;
             let is_focused = line_index == state.cursor;
-            let line = render_line(state, &doc_line.target, is_focused);
+            let line = if doc_line.ghost {
+                render_ghost_line(state, &doc_line.target, is_focused)
+            } else {
+                render_line(state, &doc_line.target, is_focused)
+            };
 
             // Apply search match highlighting (focus style takes priority)
             if !is_focused {
@@ -118,6 +122,24 @@ fn overlay_marker(state: &AppState, target: &FocusTarget) -> Option<ChangeMarker
     }
 }
 
+/// Get the edit change marker for a focus target, if any.
+fn edit_marker(state: &AppState, target: &FocusTarget) -> Option<ChangeMarker> {
+    if !state.show_edit_changes {
+        return None;
+    }
+    let overlay = state.edit_overlay.as_ref()?;
+    match target {
+        FocusTarget::Table(name) | FocusTarget::TableClose(name) | FocusTarget::Separator(name) => {
+            overlay.table_marker(name)
+        }
+        FocusTarget::Column(table, col) => overlay.column_marker(table, col),
+        FocusTarget::Constraint(table, _) | FocusTarget::Index(table, _) => {
+            overlay.table_marker(table)
+        }
+        _ => None,
+    }
+}
+
 /// Get the style for a change marker.
 fn marker_style(marker: ChangeMarker) -> Style {
     match marker {
@@ -129,22 +151,46 @@ fn marker_style(marker: ChangeMarker) -> Style {
 
 /// Render a single document line based on its FocusTarget.
 fn render_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line<'static> {
-    let marker = overlay_marker(state, target);
+    render_line_inner(state, target, is_focused, false)
+}
 
-    let mut spans = match target {
-        FocusTarget::Enum(name) => render_enum_header(state, name),
-        FocusTarget::EnumVariant(name, idx) => render_enum_variant(state, name, *idx),
-        FocusTarget::EnumClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
-        FocusTarget::Type(name) => render_type_header(state, name),
-        FocusTarget::TypeField(name, idx) => render_type_field(state, name, *idx),
-        FocusTarget::TypeClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
-        FocusTarget::Table(name) => render_table_header(state, name),
-        FocusTarget::Column(table, col) => render_column_line(state, table, col),
-        FocusTarget::Separator(_) => vec![Span::raw("")],
-        FocusTarget::Constraint(table, idx) => render_constraint_line(state, table, *idx),
-        FocusTarget::Index(table, idx) => render_index_line(state, table, *idx),
-        FocusTarget::TableClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
-        FocusTarget::Blank => vec![Span::raw("")],
+/// Render a ghost line (removed element) with dim+strikethrough styling.
+fn render_ghost_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line<'static> {
+    render_line_inner(state, target, is_focused, true)
+}
+
+/// Inner render function that handles both normal and ghost lines.
+fn render_line_inner(
+    state: &AppState,
+    target: &FocusTarget,
+    is_focused: bool,
+    is_ghost: bool,
+) -> Line<'static> {
+    let marker = if is_ghost {
+        Some(ChangeMarker::Removed)
+    } else {
+        edit_marker(state, target).or_else(|| overlay_marker(state, target))
+    };
+
+    let mut spans = if is_ghost {
+        // Ghost lines render from original_schema data with dim+strikethrough
+        render_ghost_spans(state, target)
+    } else {
+        match target {
+            FocusTarget::Enum(name) => render_enum_header(state, name),
+            FocusTarget::EnumVariant(name, idx) => render_enum_variant(state, name, *idx),
+            FocusTarget::EnumClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+            FocusTarget::Type(name) => render_type_header(state, name),
+            FocusTarget::TypeField(name, idx) => render_type_field(state, name, *idx),
+            FocusTarget::TypeClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+            FocusTarget::Table(name) => render_table_header(state, name),
+            FocusTarget::Column(table, col) => render_column_line(state, table, col),
+            FocusTarget::Separator(_) => vec![Span::raw("")],
+            FocusTarget::Constraint(table, idx) => render_constraint_line(state, table, *idx),
+            FocusTarget::Index(table, idx) => render_index_line(state, table, *idx),
+            FocusTarget::TableClose(_) => vec![Span::styled("}", NORMAL_STYLE)],
+            FocusTarget::Blank => vec![Span::raw("")],
+        }
     };
 
     // Prepend overlay marker if applicable
@@ -152,7 +198,27 @@ fn render_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line
         spans.insert(0, Span::styled(m.prefix().to_string(), marker_style(m)));
     }
 
-    if is_focused {
+    if is_ghost {
+        // Apply dim+strikethrough to all spans for ghost lines
+        let spans: Vec<Span> = spans
+            .into_iter()
+            .map(|s| {
+                Span::styled(
+                    s.content.into_owned(),
+                    DIM_STYLE.add_modifier(Modifier::CROSSED_OUT),
+                )
+            })
+            .collect();
+        if is_focused {
+            let spans: Vec<Span> = spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), s.style.bg(Color::Indexed(236))))
+                .collect();
+            Line::from(spans)
+        } else {
+            Line::from(spans)
+        }
+    } else if is_focused {
         // Apply focus background to all spans
         let spans: Vec<Span> = spans
             .into_iter()
@@ -292,9 +358,6 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
     vec![Span::raw("")]
 }
 
-/// Style for the edit indicator on modified tables.
-const EDITED_STYLE: Style = Style::new().fg(Color::Yellow);
-
 /// Overlay marker styles.
 const OVERLAY_ADDED_STYLE: Style = Style::new().fg(Color::Green);
 const OVERLAY_REMOVED_STYLE: Style = Style::new().fg(Color::Red);
@@ -314,13 +377,8 @@ fn render_table_header(state: &AppState, name: &str) -> Vec<Span<'static>> {
     let is_expanded = state.expanded.contains(name);
     let is_empty =
         table.columns.is_empty() && table.constraints.is_empty() && table.indexes.is_empty();
-    let is_edited = state.edited_tables.contains(name);
 
     let mut spans = Vec::new();
-
-    if is_edited {
-        spans.push(Span::styled("~ ", EDITED_STYLE));
-    }
 
     spans.push(Span::styled("table ", KEYWORD_STYLE));
     spans.push(Span::styled(name.to_string(), NAME_STYLE));
@@ -527,6 +585,46 @@ fn render_index_line(state: &AppState, table_name: &str, idx: usize) -> Vec<Span
     }
 
     spans
+}
+
+/// Render spans for a ghost line, looking up data from original_schema.
+fn render_ghost_spans(state: &AppState, target: &FocusTarget) -> Vec<Span<'static>> {
+    let original = match &state.original_schema {
+        Some(s) => s,
+        None => return vec![Span::styled("  (removed)", DIM_STYLE)],
+    };
+
+    match target {
+        FocusTarget::Table(name) => {
+            // Ghost table header: render from original schema
+            let table = original.table(name);
+            let col_count = table.map(|t| t.columns.len()).unwrap_or(0);
+            vec![
+                Span::styled("table ", KEYWORD_STYLE),
+                Span::styled(name.to_string(), NAME_STYLE),
+                Span::styled(format!(" {{ ... {col_count} columns ... }}"), DIM_STYLE),
+            ]
+        }
+        FocusTarget::Column(table_name, col_name) => {
+            // Ghost column: render from original schema
+            let col = original.table(table_name).and_then(|t| t.column(col_name));
+            match col {
+                Some(col) => {
+                    let type_str = col.pg_type.to_string();
+                    let mut spans = vec![
+                        Span::styled(format!("    {}  ", col.name), NAME_STYLE),
+                        Span::styled(type_str, TYPE_STYLE),
+                    ];
+                    if !col.nullable {
+                        spans.push(Span::styled("  NOT NULL", KEYWORD_STYLE));
+                    }
+                    spans
+                }
+                None => vec![Span::styled(format!("    {col_name}"), DIM_STYLE)],
+            }
+        }
+        _ => vec![Span::styled("  (removed)", DIM_STYLE)],
+    }
 }
 
 /// Collect single-column PK column names.

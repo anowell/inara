@@ -126,6 +126,18 @@ const NORMAL_BINDINGS: &[Binding] = &[
         key: "Ctrl-t",
         desc: "Toggle Rust types",
     },
+    Binding {
+        key: "]g",
+        desc: "Next change",
+    },
+    Binding {
+        key: "[g",
+        desc: "Previous change",
+    },
+    Binding {
+        key: "Ctrl-z",
+        desc: "Revert change at cursor",
+    },
 ];
 
 const COMMAND_BINDINGS: &[Binding] = &[
@@ -244,6 +256,14 @@ const SPACE_MENU_BINDINGS: &[Binding] = &[
         desc: "Pending migrations",
     },
     Binding {
+        key: "g",
+        desc: "Toggle edit markers",
+    },
+    Binding {
+        key: "d",
+        desc: "Change preview",
+    },
+    Binding {
         key: "?",
         desc: "Help",
     },
@@ -320,6 +340,25 @@ const GOTO_MENU_BINDINGS: &[Binding] = &[
     },
 ];
 
+const CHANGE_PREVIEW_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "s",
+        desc: "Toggle SQL view",
+    },
+    Binding {
+        key: "j / Down",
+        desc: "Scroll down",
+    },
+    Binding {
+        key: "k / Up",
+        desc: "Scroll up",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Close",
+    },
+];
+
 const IN_DOC_SEARCH_BINDINGS: &[Binding] = &[
     Binding {
         key: "Enter",
@@ -350,6 +389,7 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
         Mode::LlmPending => LLM_PENDING_BINDINGS,
         Mode::LlmPreview => LLM_PREVIEW_BINDINGS,
         Mode::InDocSearch => IN_DOC_SEARCH_BINDINGS,
+        Mode::ChangePreview => CHANGE_PREVIEW_BINDINGS,
     }
 }
 
@@ -451,6 +491,7 @@ mod tests {
             Mode::LlmPreview,
             Mode::Help,
             Mode::InDocSearch,
+            Mode::ChangePreview,
         ];
         for mode in modes {
             let bindings = bindings_for_mode(mode);

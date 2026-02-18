@@ -384,6 +384,107 @@ fn filename_display(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Edit overlay — computed from diff(original_schema, current_schema).
+///
+/// Provides the same `column_marker`/`table_marker` interface as `PendingOverlay`
+/// but tracks user edits rather than pending migrations.
+#[derive(Debug, Clone)]
+pub struct EditOverlay {
+    /// The structural changes between the original and current schema.
+    pub changes: Vec<Change>,
+}
+
+impl EditOverlay {
+    /// Compute an edit overlay from the diff between original and current schema.
+    pub fn compute(
+        original: &crate::schema::Schema,
+        current: &crate::schema::Schema,
+        renames: &[crate::schema::diff::Rename],
+    ) -> Self {
+        let changes = diff::diff(original, current, renames);
+        Self { changes }
+    }
+
+    /// Returns true if there are no edit changes.
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Get the change marker for a specific column.
+    pub fn column_marker(&self, table: &str, column: &str) -> Option<ChangeMarker> {
+        for change in &self.changes {
+            match change {
+                Change::AddTable(t) if t.name == table => {
+                    return Some(ChangeMarker::Added);
+                }
+                Change::DropTable(n) if n == table => {
+                    return Some(ChangeMarker::Removed);
+                }
+                Change::AddColumn {
+                    table: t,
+                    column: c,
+                } if t == table && c.name == column => {
+                    return Some(ChangeMarker::Added);
+                }
+                Change::DropColumn {
+                    table: t,
+                    column: c,
+                } if t == table && c == column => {
+                    return Some(ChangeMarker::Removed);
+                }
+                Change::AlterColumn {
+                    table: t,
+                    column: c,
+                    ..
+                } if t == table && c == column => {
+                    return Some(ChangeMarker::Modified);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Get the change marker for a table header.
+    pub fn table_marker(&self, name: &str) -> Option<ChangeMarker> {
+        let mut is_added = false;
+        let mut is_dropped = false;
+        let mut is_modified = false;
+
+        for change in &self.changes {
+            match change {
+                Change::AddTable(t) if t.name == name => {
+                    is_added = true;
+                }
+                Change::DropTable(n) if n == name => {
+                    is_dropped = true;
+                }
+                Change::AddColumn { table, .. }
+                | Change::DropColumn { table, .. }
+                | Change::AlterColumn { table, .. }
+                | Change::AddConstraint { table, .. }
+                | Change::DropConstraint { table, .. }
+                | Change::AddIndex { table, .. }
+                    if table == name =>
+                {
+                    is_modified = true;
+                }
+                _ => {}
+            }
+        }
+
+        if is_added {
+            Some(ChangeMarker::Added)
+        } else if is_dropped {
+            Some(ChangeMarker::Removed)
+        } else if is_modified {
+            Some(ChangeMarker::Modified)
+        } else {
+            None
+        }
+    }
+}
+
 /// Errors that can occur when computing the overlay.
 #[derive(Debug, thiserror::Error)]
 pub enum OverlayError {
@@ -611,5 +712,87 @@ mod tests {
             unparseable: vec!["bad_migration.up.sql".into()],
         };
         assert!(!overlay.is_empty());
+    }
+
+    // --- EditOverlay tests ---
+
+    #[test]
+    fn edit_overlay_compute_empty_when_same() {
+        let mut schema = crate::schema::Schema::new();
+        schema.add_table(Table::new("users"));
+        let overlay = EditOverlay::compute(&schema, &schema, &[]);
+        assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn edit_overlay_compute_detects_added_column() {
+        let mut original = crate::schema::Schema::new();
+        original.add_table(Table::new("users"));
+
+        let mut current = crate::schema::Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("bio", PgType::Text));
+        current.add_table(t);
+
+        let overlay = EditOverlay::compute(&original, &current, &[]);
+        assert!(!overlay.is_empty());
+        assert_eq!(
+            overlay.column_marker("users", "bio"),
+            Some(ChangeMarker::Added)
+        );
+        assert_eq!(overlay.table_marker("users"), Some(ChangeMarker::Modified));
+    }
+
+    #[test]
+    fn edit_overlay_compute_detects_dropped_column() {
+        let mut original = crate::schema::Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("legacy", PgType::Text));
+        original.add_table(t);
+
+        let mut current = crate::schema::Schema::new();
+        current.add_table(Table::new("users"));
+
+        let overlay = EditOverlay::compute(&original, &current, &[]);
+        assert_eq!(
+            overlay.column_marker("users", "legacy"),
+            Some(ChangeMarker::Removed)
+        );
+    }
+
+    #[test]
+    fn edit_overlay_compute_detects_added_table() {
+        let original = crate::schema::Schema::new();
+        let mut current = crate::schema::Schema::new();
+        current.add_table(Table::new("posts"));
+
+        let overlay = EditOverlay::compute(&original, &current, &[]);
+        assert_eq!(overlay.table_marker("posts"), Some(ChangeMarker::Added));
+    }
+
+    #[test]
+    fn edit_overlay_compute_detects_dropped_table() {
+        let mut original = crate::schema::Schema::new();
+        original.add_table(Table::new("legacy"));
+        let current = crate::schema::Schema::new();
+
+        let overlay = EditOverlay::compute(&original, &current, &[]);
+        assert_eq!(overlay.table_marker("legacy"), Some(ChangeMarker::Removed));
+    }
+
+    #[test]
+    fn edit_overlay_unaffected_returns_none() {
+        let mut original = crate::schema::Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("id", PgType::Uuid));
+        original.add_table(t.clone());
+
+        let mut current = crate::schema::Schema::new();
+        current.add_table(t);
+
+        let overlay = EditOverlay::compute(&original, &current, &[]);
+        assert!(overlay.is_empty());
+        assert_eq!(overlay.table_marker("users"), None);
+        assert_eq!(overlay.column_marker("users", "id"), None);
     }
 }

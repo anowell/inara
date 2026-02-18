@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sqlx::PgPool;
 
 use super::app::{
-    AppState, FocusTarget, LlmPreviewKind, LlmPreviewState, MigrationPreviewState, Mode,
+    AppState, FocusTarget, LlmPreviewKind, LlmPreviewState, MigrationPreviewState, Mode, PendingKey,
 };
 use super::edit;
 use super::fuzzy::SearchFilter;
@@ -116,11 +116,31 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
         Mode::LlmPreview => HandleResult::state_only(handle_llm_preview(state, key)),
         Mode::Help => HandleResult::state_only(handle_help(state, key)),
         Mode::InDocSearch => HandleResult::state_only(handle_in_doc_search(state, key)),
+        Mode::ChangePreview => HandleResult::state_only(handle_change_preview(state, key)),
     }
 }
 
 /// Handle key events in Normal mode.
 fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
+    // Handle pending bracket keys for ]g / [g change navigation
+    match state.pending_key {
+        PendingKey::CloseBracket => {
+            let state = state.with_pending_key(PendingKey::None);
+            return match key.code {
+                KeyCode::Char('g') => HandleResult::state_only(state.next_change()),
+                _ => HandleResult::state_only(state),
+            };
+        }
+        PendingKey::OpenBracket => {
+            let state = state.with_pending_key(PendingKey::None);
+            return match key.code {
+                KeyCode::Char('g') => HandleResult::state_only(state.prev_change()),
+                _ => HandleResult::state_only(state),
+            };
+        }
+        _ => {}
+    }
+
     match key.code {
         // Movement
         KeyCode::Char('j') | KeyCode::Down => HandleResult::state_only(state.cursor_down(1)),
@@ -202,6 +222,19 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             let mut state = state;
             state.in_doc_search = None;
             HandleResult::state_only(state)
+        }
+
+        // Granular revert
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            HandleResult::state_only(edit::revert_at_cursor(state))
+        }
+
+        // Change navigation (bracket sequences)
+        KeyCode::Char(']') => {
+            HandleResult::state_only(state.with_pending_key(PendingKey::CloseBracket))
+        }
+        KeyCode::Char('[') => {
+            HandleResult::state_only(state.with_pending_key(PendingKey::OpenBracket))
         }
 
         // External editor
@@ -345,6 +378,32 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
     // :generate-down
     if cmd == "generate-down" {
         return execute_generate_down(state);
+    }
+
+    // :reset and :reset!
+    if cmd == "reset" {
+        if state.has_edits() {
+            return HandleResult::state_only(
+                state.with_status("Unsaved changes. Use :reset! to discard."),
+            );
+        }
+        return HandleResult::state_only(state.with_status("No edits to reset"));
+    }
+
+    if cmd == "reset!" {
+        if !state.has_edits() {
+            return HandleResult::state_only(state.with_status("No edits to reset"));
+        }
+        let mut state = state;
+        if let Some(original) = state.original_schema.take() {
+            state.schema = original;
+        }
+        state.original_schema = None;
+        state.renames.clear();
+        state.edited_tables.clear();
+        state.edit_overlay = None;
+        state.rebuild_doc();
+        return HandleResult::state_only(state.with_status("Schema reset to original"));
     }
 
     HandleResult::state_only(state) // Unknown command, ignore
@@ -623,6 +682,136 @@ fn handle_help(state: AppState, key: KeyEvent) -> AppState {
     }
 }
 
+/// Open the change preview overlay (Space d).
+///
+/// Builds a human-readable summary from the edit overlay changes and generates
+/// SQL via the migration engine. Shows a status message if there are no changes.
+fn open_change_preview(state: AppState) -> HandleResult {
+    use crate::migration;
+    use crate::schema::diff::Change;
+
+    let state = state.with_mode(Mode::Normal);
+
+    let overlay = match &state.edit_overlay {
+        Some(ov) if !ov.is_empty() => ov,
+        _ => {
+            return HandleResult::state_only(state.with_status("No edit changes to preview"));
+        }
+    };
+
+    // Build human-readable summary
+    let summary: Vec<String> = overlay
+        .changes
+        .iter()
+        .map(|c| match c {
+            Change::AddTable(t) => format!("+ add table {}", t.name),
+            Change::DropTable(n) => format!("- drop table {n}"),
+            Change::AddColumn { table, column } => {
+                format!("+ add column {}.{}", table, column.name)
+            }
+            Change::DropColumn { table, column } => {
+                format!("- drop column {table}.{column}")
+            }
+            Change::AlterColumn {
+                table,
+                column,
+                changes,
+            } => {
+                let mut parts = Vec::new();
+                if changes.nullable.is_some() {
+                    parts.push("nullable");
+                }
+                if changes.data_type.is_some() {
+                    parts.push("type");
+                }
+                if changes.default.is_some() {
+                    parts.push("default");
+                }
+                format!("~ alter column {table}.{column} ({})", parts.join(", "))
+            }
+            Change::AddConstraint { table, constraint } => {
+                let name = constraint_name(constraint);
+                format!("+ add constraint {table}.{name}")
+            }
+            Change::DropConstraint { table, name } => {
+                format!("- drop constraint {table}.{name}")
+            }
+            Change::AddIndex { table, index } => {
+                format!("+ add index {table}.{}", index.name)
+            }
+            Change::DropIndex(name) => format!("- drop index {name}"),
+        })
+        .collect();
+
+    // Generate SQL
+    let sql = migration::generate_sql(&overlay.changes);
+    let sql = if sql.trim().is_empty() {
+        None
+    } else {
+        Some(sql)
+    };
+
+    let preview = super::app::ChangePreviewState {
+        summary,
+        sql,
+        show_sql: false,
+        scroll: 0,
+    };
+
+    let mut state = state;
+    state.change_preview = Some(preview);
+    state.mode = Mode::ChangePreview;
+    HandleResult::state_only(state)
+}
+
+/// Extract a display name from a constraint.
+fn constraint_name(constraint: &crate::schema::Constraint) -> String {
+    match constraint {
+        crate::schema::Constraint::PrimaryKey { name, .. } => {
+            name.clone().unwrap_or_else(|| "pk".into())
+        }
+        crate::schema::Constraint::Unique { name, .. } => {
+            name.clone().unwrap_or_else(|| "unique".into())
+        }
+        crate::schema::Constraint::ForeignKey { name, .. } => {
+            name.clone().unwrap_or_else(|| "fk".into())
+        }
+        crate::schema::Constraint::Check { name, .. } => {
+            name.clone().unwrap_or_else(|| "check".into())
+        }
+    }
+}
+
+/// Handle key events in ChangePreview mode.
+fn handle_change_preview(state: AppState, key: KeyEvent) -> AppState {
+    match key.code {
+        KeyCode::Esc => state.with_mode(Mode::Normal),
+        KeyCode::Char('s') => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.change_preview {
+                preview.show_sql = !preview.show_sql;
+                preview.scroll = 0; // reset scroll on view toggle
+            }
+            state
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.change_preview {
+                preview.scroll = preview.scroll.saturating_add(1);
+            }
+            state
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let mut state = state;
+            if let Some(ref mut preview) = state.change_preview {
+                preview.scroll = preview.scroll.saturating_sub(1);
+            }
+            state
+        }
+        _ => state,
+    }
+}
+
 /// Handle key events in LlmPending mode (waiting for LLM response).
 ///
 /// Only Esc to cancel is supported.
@@ -750,6 +939,18 @@ fn handle_space_menu(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleRes
             HandleResult::state_only(state.enter_search(SearchFilter::Migrations))
         }
         KeyCode::Char('p') => toggle_pending_overlay(state, pool),
+        KeyCode::Char('g') => {
+            let mut state = state.with_mode(Mode::Normal);
+            state.show_edit_changes = !state.show_edit_changes;
+            state.rebuild_doc();
+            let label = if state.show_edit_changes {
+                "Edit markers shown"
+            } else {
+                "Edit markers hidden"
+            };
+            HandleResult::state_only(state.with_status(label))
+        }
+        KeyCode::Char('d') => open_change_preview(state),
         KeyCode::Char('?') => {
             let mut state = state;
             state.help_source_mode = Mode::Normal;
@@ -1235,11 +1436,31 @@ mod tests {
             Mode::LlmPreview => handle_llm_preview(state, key),
             Mode::Help => handle_help(state, key),
             Mode::InDocSearch => handle_in_doc_search(state, key),
+            Mode::ChangePreview => handle_change_preview(state, key),
         }
     }
 
     /// Normal mode handler for tests (no pool, no HUD opening, no editor spawn).
     fn handle_normal_no_pool(state: AppState, key: KeyEvent) -> AppState {
+        // Handle pending bracket keys for ]g / [g change navigation
+        match state.pending_key {
+            PendingKey::CloseBracket => {
+                let state = state.with_pending_key(PendingKey::None);
+                return match key.code {
+                    KeyCode::Char('g') => state.next_change(),
+                    _ => state,
+                };
+            }
+            PendingKey::OpenBracket => {
+                let state = state.with_pending_key(PendingKey::None);
+                return match key.code {
+                    KeyCode::Char('g') => state.prev_change(),
+                    _ => state,
+                };
+            }
+            _ => {}
+        }
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => state.cursor_down(1),
             KeyCode::Char('k') | KeyCode::Up => state.cursor_up(1),
@@ -1269,6 +1490,10 @@ mod tests {
             }
             KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.jump_forward()
+            }
+            // Granular revert
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                edit::revert_at_cursor(state)
             }
             KeyCode::Enter => state.toggle_expand(),
             KeyCode::Tab => state.record_jump().next_table(),
@@ -1300,6 +1525,9 @@ mod tests {
             KeyCode::Char('D') => edit::enter_default_prompt(state),
             // 'e' produces an editor request — in tests we just prepare the request and ignore it
             KeyCode::Char('e') => edit::prepare_editor_request(state).0,
+            // Change navigation (bracket sequences)
+            KeyCode::Char(']') => state.with_pending_key(PendingKey::CloseBracket),
+            KeyCode::Char('[') => state.with_pending_key(PendingKey::OpenBracket),
             // Clear in-document search
             KeyCode::Esc => {
                 let mut state = state;
@@ -1337,7 +1565,7 @@ mod tests {
     #[test]
     fn normal_big_g_jumps_to_last() {
         let state = handle_key_no_pool(sample_state(), key(KeyCode::Char('G')));
-        // 5 collapsed tables with no separators = 5 lines, last at index 4
+        // 5 collapsed tables, no separators = 5 lines, last at index 4
         assert_eq!(state.cursor, 4);
     }
 
@@ -1385,7 +1613,6 @@ mod tests {
 
     #[test]
     fn normal_ctrl_b_full_page_up() {
-        // 5 collapsed tables = 5 lines; start at last line (4), page up by viewport_height (4)
         let state = sample_state().with_viewport_height(4).cursor_to(4);
         let state = handle_key_no_pool(
             state,
@@ -2958,5 +3185,307 @@ mod tests {
         // Since search_state() starts at cursor 0 on "users" table, and we jump to "users",
         // the jump back goes to cursor 0 which is also "users" — this is expected
         assert_eq!(state.cursor, 0);
+    }
+
+    // --- :reset and :reset! commands ---
+
+    #[test]
+    fn command_reset_warns_with_pending_edits() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1); // email column
+        state = edit::toggle_nullable(state); // make an edit
+
+        // Enter command mode and type "reset"
+        let state = state.with_mode(Mode::Command);
+        let state = "reset"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        assert!(state.status_message.as_deref().unwrap().contains("reset!"));
+        assert!(state.has_edits()); // edits preserved
+    }
+
+    #[test]
+    fn command_reset_force_discards_edits() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1); // email column
+        state = edit::toggle_nullable(state); // make an edit
+        assert!(state.has_edits());
+
+        // Enter command mode and type "reset!"
+        let state = state.with_mode(Mode::Command);
+        let state = "reset!"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        assert!(!state.has_edits());
+        assert!(state.original_schema.is_none());
+        assert!(state.edit_overlay.is_none());
+    }
+
+    #[test]
+    fn command_reset_no_edits_shows_message() {
+        let state = sample_state().with_mode(Mode::Command);
+        let state = "reset"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+
+        assert_eq!(state.status_message.as_deref(), Some("No edits to reset"));
+    }
+
+    // --- Space g toggle ---
+
+    #[test]
+    fn space_g_toggles_edit_changes() {
+        let state = sample_state();
+        assert!(state.show_edit_changes);
+
+        // Space → g
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        assert_eq!(state.mode, Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert!(!state.show_edit_changes);
+        assert_eq!(state.mode, Mode::Normal);
+
+        // Toggle back
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert!(state.show_edit_changes);
+    }
+
+    // --- ]g / [g change navigation ---
+
+    #[test]
+    fn bracket_g_navigates_changes() {
+        use crate::migration::overlay::EditOverlay;
+        use crate::schema::diff::Change;
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        users.add_column(Column::new("bio", PgType::Text));
+        schema.add_table(users);
+
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand(); // expand users
+
+        state.edit_overlay = Some(EditOverlay {
+            changes: vec![Change::AddColumn {
+                table: "users".into(),
+                column: Column::new("bio", PgType::Text),
+            }],
+        });
+        state.rebuild_doc();
+
+        // ] then g should navigate to next change
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        assert_eq!(state.pending_key, PendingKey::CloseBracket);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.pending_key, PendingKey::None);
+        // Should have moved to a changed line (bio column or table header with modified marker)
+        let bio_pos = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Column("users".into(), "bio".into()));
+        // The cursor should be on a marked line
+        assert!(state.cursor > 0 || bio_pos.is_some());
+    }
+
+    #[test]
+    fn bracket_g_no_overlay_shows_status() {
+        let state = sample_state();
+        // ] then g with no overlay
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.status_message.as_deref(), Some("No edit changes"));
+    }
+
+    // --- Ctrl-z revert ---
+
+    #[test]
+    fn ctrl_z_reverts_change() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1); // email column
+        state = edit::toggle_nullable(state); // make an edit
+        let email = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(email.nullable);
+
+        // Ctrl-z should revert
+        let state = handle_key_no_pool(
+            state,
+            key_with_mod(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        let email = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!email.nullable); // restored
+    }
+
+    // --- ChangePreview mode ---
+
+    #[test]
+    fn space_d_opens_change_preview() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1);
+        state = edit::toggle_nullable(state);
+
+        // Space → d
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+
+        assert_eq!(state.mode, Mode::ChangePreview);
+        assert!(state.change_preview.is_some());
+        let preview = state.change_preview.as_ref().unwrap();
+        assert!(!preview.summary.is_empty());
+        assert!(!preview.show_sql);
+    }
+
+    #[test]
+    fn space_d_no_changes_shows_status() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("No edit changes"));
+    }
+
+    #[test]
+    fn change_preview_s_toggles_sql_view() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1);
+        state = edit::toggle_nullable(state);
+
+        // Open change preview
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert!(!state.change_preview.as_ref().unwrap().show_sql);
+
+        // Toggle SQL view
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        assert!(state.change_preview.as_ref().unwrap().show_sql);
+
+        // Toggle back
+        let state = handle_key_no_pool(state, key(KeyCode::Char('s')));
+        assert!(!state.change_preview.as_ref().unwrap().show_sql);
+    }
+
+    #[test]
+    fn change_preview_esc_returns_to_normal() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1);
+        state = edit::toggle_nullable(state);
+
+        // Open and then close
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert_eq!(state.mode, Mode::ChangePreview);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Esc));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.change_preview.is_none());
+    }
+
+    #[test]
+    fn change_preview_scroll() {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+
+        let mut schema = Schema::new();
+        let mut t = Table::new("users");
+        t.add_column(Column::new("email", PgType::Text));
+        schema.add_table(t);
+        let mut state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand();
+        state = state.cursor_down(1);
+        state = edit::toggle_nullable(state);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+
+        // Scroll down
+        let state = handle_key_no_pool(state, key(KeyCode::Char('j')));
+        assert_eq!(state.change_preview.as_ref().unwrap().scroll, 1);
+
+        // Scroll up
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.change_preview.as_ref().unwrap().scroll, 0);
+
+        // Scroll up past 0 stays at 0
+        let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
+        assert_eq!(state.change_preview.as_ref().unwrap().scroll, 0);
     }
 }

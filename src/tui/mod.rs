@@ -149,6 +149,7 @@ fn spawn_editor(
 
             state.schema.add_table(new_table);
             state.rebuild_doc();
+            state.recompute_edit_overlay();
             Ok(state)
         }
         Err(e) => Ok(state.with_status(format!(
@@ -356,7 +357,7 @@ fn run_event_loop(
         if state.is_pending_key_expired(Duration::from_secs(1)) {
             state = state
                 .with_pending_key(app::PendingKey::None)
-                .with_status("goto cancelled (timeout)");
+                .with_status("key sequence cancelled (timeout)");
         }
 
         terminal.draw(|frame| draw(frame, &state))?;
@@ -452,6 +453,11 @@ fn draw(frame: &mut Frame, state: &AppState) {
         }
         Mode::Help => {
             help::render_help(frame, layout[1], state.help_source_mode);
+        }
+        Mode::ChangePreview => {
+            if let Some(ref preview) = state.change_preview {
+                render_change_preview(frame, layout[1], preview);
+            }
         }
         _ => {}
     }
@@ -609,6 +615,116 @@ fn render_migration_preview(
     frame.render_widget(content, inner);
 }
 
+/// Render the change preview overlay (Space d).
+fn render_change_preview(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    preview: &app::ChangePreviewState,
+) {
+    use ratatui::widgets::Clear;
+
+    let mut content_lines: Vec<Line> = Vec::new();
+
+    if preview.show_sql {
+        // SQL view
+        if let Some(ref sql) = preview.sql {
+            for sql_line in sql.lines() {
+                content_lines.push(Line::from(Span::styled(
+                    sql_line.to_string(),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        } else {
+            content_lines.push(Line::from(Span::styled(
+                " No SQL generated",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        // Summary view
+        for line in &preview.summary {
+            let (prefix, color) = if line.starts_with('+') {
+                ("+", Color::Green)
+            } else if line.starts_with('-') {
+                ("-", Color::Red)
+            } else if line.starts_with('~') {
+                ("~", Color::Yellow)
+            } else {
+                (" ", Color::White)
+            };
+            let text = line.strip_prefix(prefix).unwrap_or(line);
+            content_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {prefix} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text.to_string(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    let total_lines = content_lines.len();
+
+    frame.render_widget(Clear, area);
+
+    let title = if preview.show_sql {
+        " Change Preview — SQL "
+    } else {
+        " Change Preview — Summary "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible_height = inner.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = preview.scroll.min(max_scroll);
+
+    let mut lines: Vec<Line> = content_lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible_height.saturating_sub(2))
+        .collect();
+
+    // Footer
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " s",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if preview.show_sql {
+                " summary  "
+            } else {
+                " sql  "
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let content = Paragraph::new(lines);
+    frame.render_widget(content, inner);
+}
+
 /// Render the LLM pending overlay (loading indicator).
 fn render_llm_pending(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     use ratatui::widgets::Clear;
@@ -749,6 +865,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         Mode::LlmPreview => Style::default().fg(Color::Black).bg(Color::Magenta),
         Mode::Help => Style::default().fg(Color::Black).bg(Color::Blue),
         Mode::InDocSearch => Style::default().fg(Color::Black).bg(Color::Green),
+        Mode::ChangePreview => Style::default().fg(Color::Black).bg(Color::Yellow),
     };
 
     let mode_label = format!(" {} ", state.mode);
@@ -756,8 +873,17 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
     let mut spans = vec![Span::styled(mode_label, mode_style)];
 
     // Show pending key indicator
-    if state.pending_key != app::PendingKey::None {
-        spans.push(Span::styled(" g...", Style::default().fg(Color::Yellow)));
+    match &state.pending_key {
+        app::PendingKey::None => {}
+        app::PendingKey::G => {
+            spans.push(Span::styled(" g...", Style::default().fg(Color::Yellow)));
+        }
+        app::PendingKey::CloseBracket => {
+            spans.push(Span::styled(" ]...", Style::default().fg(Color::Yellow)));
+        }
+        app::PendingKey::OpenBracket => {
+            spans.push(Span::styled(" [...", Style::default().fg(Color::Yellow)));
+        }
     }
 
     // Show transient status message
