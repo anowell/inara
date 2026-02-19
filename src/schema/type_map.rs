@@ -84,8 +84,25 @@ const RUST_MAPPINGS: &[(PgType, &str)] = &[
 ];
 
 /// Static mapping table for PgType → TypeScript type.
-/// Intentionally minimal — the full table is added by a follow-up bead.
-const TYPESCRIPT_MAPPINGS: &[(PgType, &str)] = &[];
+const TYPESCRIPT_MAPPINGS: &[(PgType, &str)] = &[
+    (PgType::Boolean, "boolean"),
+    (PgType::SmallInt, "number"),
+    (PgType::Integer, "number"),
+    (PgType::BigInt, "bigint"),
+    (PgType::Real, "number"),
+    (PgType::DoublePrecision, "number"),
+    (PgType::Text, "string"),
+    (PgType::Bytea, "Buffer"),
+    (PgType::Uuid, "string"),
+    (PgType::Json, "unknown"),
+    (PgType::Jsonb, "unknown"),
+    (PgType::Timestamp, "Date"),
+    (PgType::Timestamptz, "Date"),
+    (PgType::Date, "string"),
+    (PgType::Time, "string"),
+    (PgType::Timetz, "string"),
+    (PgType::Interval, "string"),
+];
 
 impl Default for TypeMapper {
     fn default() -> Self {
@@ -223,9 +240,8 @@ impl TypeMapper {
 
         // 3. Parameterized type mappings
         match pg_type {
-            PgType::Varchar(_) | PgType::Char(_) | PgType::Numeric(_) => {
-                // Unmapped until TS mapping table is filled in
-            }
+            PgType::Varchar(_) | PgType::Char(_) => return "string".to_string(),
+            PgType::Numeric(_) => return "string".to_string(),
             PgType::Array(inner) => {
                 let inner_type = self.language_type(inner);
                 return format!("{inner_type}[]");
@@ -992,6 +1008,86 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
     // --- TypeScript language ---
 
     #[test]
+    fn typescript_boolean() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Boolean), "boolean");
+    }
+
+    #[test]
+    fn typescript_integer_types() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::SmallInt), "number");
+        assert_eq!(mapper.language_type(&PgType::Integer), "number");
+    }
+
+    #[test]
+    fn typescript_bigint() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::BigInt), "bigint");
+    }
+
+    #[test]
+    fn typescript_float_types() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Real), "number");
+        assert_eq!(mapper.language_type(&PgType::DoublePrecision), "number");
+    }
+
+    #[test]
+    fn typescript_numeric() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Numeric(None)), "string");
+        assert_eq!(
+            mapper.language_type(&PgType::Numeric(Some((10, 2)))),
+            "string"
+        );
+    }
+
+    #[test]
+    fn typescript_text_types() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Text), "string");
+        assert_eq!(mapper.language_type(&PgType::Varchar(None)), "string");
+        assert_eq!(mapper.language_type(&PgType::Varchar(Some(255))), "string");
+        assert_eq!(mapper.language_type(&PgType::Char(Some(1))), "string");
+    }
+
+    #[test]
+    fn typescript_bytea() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Bytea), "Buffer");
+    }
+
+    #[test]
+    fn typescript_uuid() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Uuid), "string");
+    }
+
+    #[test]
+    fn typescript_json_types() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Json), "unknown");
+        assert_eq!(mapper.language_type(&PgType::Jsonb), "unknown");
+    }
+
+    #[test]
+    fn typescript_timestamp_types() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Timestamp), "Date");
+        assert_eq!(mapper.language_type(&PgType::Timestamptz), "Date");
+    }
+
+    #[test]
+    fn typescript_date_time_interval() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language_type(&PgType::Date), "string");
+        assert_eq!(mapper.language_type(&PgType::Time), "string");
+        assert_eq!(mapper.language_type(&PgType::Timetz), "string");
+        assert_eq!(mapper.language_type(&PgType::Interval), "string");
+    }
+
+    #[test]
     fn typescript_custom_type_returns_name() {
         let mapper = TypeMapper::for_language(Language::TypeScript);
         assert_eq!(
@@ -1003,39 +1099,111 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
     #[test]
     fn typescript_array_wrapping() {
         let mapper = TypeMapper::for_language(Language::TypeScript);
-        // With empty TS mapping table, inner falls back to pg type string
-        let result = mapper.language_type(&PgType::Array(Box::new(PgType::Integer)));
-        assert_eq!(result, "integer[]");
+        assert_eq!(
+            mapper.language_type(&PgType::Array(Box::new(PgType::Integer))),
+            "number[]"
+        );
+        assert_eq!(
+            mapper.language_type(&PgType::Array(Box::new(PgType::Text))),
+            "string[]"
+        );
     }
 
     #[test]
     fn typescript_nullable_wrapping() {
         let mapper = TypeMapper::for_language(Language::TypeScript);
-        let result = mapper.type_annotation(&PgType::Text, true);
-        assert_eq!(result, "text | null");
+        assert_eq!(mapper.type_annotation(&PgType::Text, true), "string | null");
+        assert_eq!(
+            mapper.type_annotation(&PgType::Integer, true),
+            "number | null"
+        );
+        assert_eq!(
+            mapper.type_annotation(&PgType::Jsonb, true),
+            "unknown | null"
+        );
     }
 
     #[test]
     fn typescript_non_nullable() {
         let mapper = TypeMapper::for_language(Language::TypeScript);
-        let result = mapper.type_annotation(&PgType::Text, false);
-        assert_eq!(result, "text");
+        assert_eq!(mapper.type_annotation(&PgType::Text, false), "string");
+        assert_eq!(mapper.type_annotation(&PgType::Integer, false), "number");
     }
 
     #[test]
     fn typescript_overrides_work() {
         let mut overrides = BTreeMap::new();
-        overrides.insert("text".to_string(), "string".to_string());
+        overrides.insert("jsonb".to_string(), "Record<string, unknown>".to_string());
         let mapper = TypeMapper::for_language(Language::TypeScript).with_overrides(overrides);
+        assert_eq!(
+            mapper.language_type(&PgType::Jsonb),
+            "Record<string, unknown>"
+        );
+        // Non-overridden types still use defaults
         assert_eq!(mapper.language_type(&PgType::Text), "string");
+    }
+
+    #[test]
+    fn typescript_override_takes_precedence() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("bigint".to_string(), "string".to_string());
+        let mapper = TypeMapper::for_language(Language::TypeScript).with_overrides(overrides);
+        assert_eq!(mapper.language_type(&PgType::BigInt), "string");
     }
 
     #[test]
     fn typescript_nullable_with_override() {
         let mut overrides = BTreeMap::new();
-        overrides.insert("uuid".to_string(), "string".to_string());
+        overrides.insert("jsonb".to_string(), "any".to_string());
         let mapper = TypeMapper::for_language(Language::TypeScript).with_overrides(overrides);
-        assert_eq!(mapper.type_annotation(&PgType::Uuid, true), "string | null");
+        assert_eq!(mapper.type_annotation(&PgType::Jsonb, true), "any | null");
+    }
+
+    #[test]
+    fn typescript_all_common_types_have_mappings() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        // Types where the TS name differs from the PG name
+        let types_with_different_names = vec![
+            PgType::SmallInt,
+            PgType::Integer,
+            PgType::Real,
+            PgType::DoublePrecision,
+            PgType::Numeric(None),
+            PgType::Text,
+            PgType::Varchar(None),
+            PgType::Varchar(Some(255)),
+            PgType::Char(None),
+            PgType::Bytea,
+            PgType::Uuid,
+            PgType::Timestamp,
+            PgType::Timestamptz,
+            PgType::Date,
+            PgType::Time,
+            PgType::Timetz,
+            PgType::Interval,
+            PgType::Json,
+            PgType::Jsonb,
+            PgType::Array(Box::new(PgType::Integer)),
+        ];
+
+        for pg_type in &types_with_different_names {
+            let mapped = mapper.language_type(pg_type);
+            assert!(
+                !mapped.is_empty(),
+                "PgType {} should have a non-empty TS mapping",
+                pg_type
+            );
+            assert_ne!(
+                mapped,
+                pg_type.to_string(),
+                "PgType {} should map to a TS type, not its PG name",
+                pg_type
+            );
+        }
+
+        // boolean and bigint legitimately share names with their PG types
+        assert_eq!(mapper.language_type(&PgType::Boolean), "boolean");
+        assert_eq!(mapper.language_type(&PgType::BigInt), "bigint");
     }
 
     // --- for_language constructor ---
