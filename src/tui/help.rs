@@ -123,6 +123,14 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Previous change",
     },
     Binding {
+        key: "u",
+        desc: "Undo",
+    },
+    Binding {
+        key: "U",
+        desc: "Redo",
+    },
+    Binding {
         key: "Ctrl-z",
         desc: "Revert change at cursor",
     },

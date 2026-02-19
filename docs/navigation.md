@@ -77,6 +77,8 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 |-----|--------|
 | `q` | Open Query HUD for focused element |
 | `e` | Edit focused table in `$EDITOR` |
+| `u` | Undo last schema change |
+| `U` | Redo last undone schema change |
 | `r` | Rename focused element (explicit) |
 | `:` | Enter command mode |
 | `/` | Forward in-document search |
@@ -84,14 +86,16 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | `n` | Next search match (when search active) |
 | `N` | Previous search match |
 
-### Quick Actions (column-focused only)
+### Change Menu (`c` prefix, column-focused)
 
 | Key | Action |
 |-----|--------|
-| `n` | Toggle nullable |
-| `u` | Toggle unique constraint (single-column) |
-| `i` | Toggle index (single-column) |
-| `D` | Set or clear default value (enters DefaultPrompt mode) |
+| `c r` | Rename focused element |
+| `c R` | Rename containing table |
+| `c n` | Toggle nullable |
+| `c u` | Toggle unique constraint (single-column) |
+| `c i` | Toggle index (single-column) |
+| `c d` | Set or clear default value (enters DefaultPrompt mode) |
 
 ## Command Mode
 

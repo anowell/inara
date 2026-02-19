@@ -130,6 +130,7 @@ fn spawn_editor(
     match crate::schema::parse::parse_single_table(&text) {
         Ok(new_table) => {
             let mut state = state.ensure_original_schema();
+            state.push_undo_snapshot();
             let table_name = req.table_name;
 
             // Handle rename

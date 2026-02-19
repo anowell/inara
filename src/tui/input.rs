@@ -223,6 +223,10 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             HandleResult::state_only(state)
         }
 
+        // Undo / Redo (helix-style)
+        KeyCode::Char('u') => HandleResult::state_only(state.undo()),
+        KeyCode::Char('U') => HandleResult::state_only(state.redo()),
+
         // Granular revert
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             HandleResult::state_only(edit::revert_at_cursor(state))
@@ -432,6 +436,7 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
         state.renames.clear();
         state.edited_tables.clear();
         state.edit_overlay = None;
+        state.undo_history.clear();
         state.rebuild_doc();
         return HandleResult::state_only(state.with_status("Schema reset to original"));
     }
@@ -1551,6 +1556,9 @@ mod tests {
             KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.jump_forward()
             }
+            // Undo / Redo (helix-style)
+            KeyCode::Char('u') => state.undo(),
+            KeyCode::Char('U') => state.redo(),
             // Granular revert
             KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 edit::revert_at_cursor(state)
@@ -3600,5 +3608,90 @@ mod tests {
         // Scroll up past 0 stays at 0
         let state = handle_key_no_pool(state, key(KeyCode::Char('k')));
         assert_eq!(state.change_preview.as_ref().unwrap().scroll, 0);
+    }
+
+    // --- Undo / Redo keybinding tests ---
+
+    /// Helper to create a state that has gone through a quick action (so undo history exists).
+    fn undo_test_state() -> AppState {
+        use crate::schema::types::PgType;
+        use crate::schema::Column;
+
+        let mut schema = Schema::new();
+        let mut users = Table::new("users");
+        users.add_column(Column::new("id", PgType::Uuid));
+        users.add_column(Column::new("email", PgType::Text));
+        schema.add_table(users);
+        let state = AppState::new(schema, "test".into(), None)
+            .with_viewport_height(20)
+            .toggle_expand() // expand "users"
+            .cursor_down(2); // focus on "email"
+
+        // Apply toggle_nullable through the change menu keys
+        let state = handle_key_no_pool(state, key(KeyCode::Char('c'))); // enter change menu
+        handle_key_no_pool(state, key(KeyCode::Char('n'))) // toggle nullable
+    }
+
+    #[test]
+    fn u_key_undoes_last_change() {
+        let state = undo_test_state();
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.nullable); // toggle_nullable was applied
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable); // undone
+    }
+
+    #[test]
+    fn shift_u_key_redoes_undone_change() {
+        let state = undo_test_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u'))); // undo
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable);
+
+        let state = handle_key_no_pool(state, key(KeyCode::Char('U'))); // redo
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.nullable); // re-applied
+    }
+
+    #[test]
+    fn u_key_no_edits_shows_status() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('u')));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Already at oldest change")
+        );
+    }
+
+    #[test]
+    fn shift_u_key_no_redo_shows_status() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('U')));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Already at newest change")
+        );
     }
 }

@@ -25,6 +25,7 @@ pub fn toggle_nullable(state: AppState) -> AppState {
     };
 
     let mut state = state.ensure_original_schema();
+    state.push_undo_snapshot();
     if let Some(table) = state.schema.tables.get_mut(&table_name) {
         if let Some(col) = table.columns.iter_mut().find(|c| c.name == col_name) {
             col.nullable = !col.nullable;
@@ -47,6 +48,7 @@ pub fn toggle_column_unique(state: AppState) -> AppState {
     };
 
     let mut state = state.ensure_original_schema();
+    state.push_undo_snapshot();
     if let Some(table) = state.schema.tables.get_mut(&table_name) {
         // Check if a single-column UNIQUE exists for this column
         let existing_idx = table.constraints.iter().position(|c| {
@@ -80,6 +82,7 @@ pub fn toggle_column_index(state: AppState) -> AppState {
     };
 
     let mut state = state.ensure_original_schema();
+    state.push_undo_snapshot();
     if let Some(table) = state.schema.tables.get_mut(&table_name) {
         let existing_idx = table
             .indexes
@@ -173,6 +176,7 @@ fn confirm_default_prompt(mut state: AppState) -> AppState {
     let text = state.default_prompt_buf.trim().to_string();
     state.default_prompt_buf.clear();
 
+    state.push_undo_snapshot();
     if let Some(table) = state.schema.tables.get_mut(&target.table) {
         if let Some(col) = table.columns.iter_mut().find(|c| c.name == target.column) {
             if text.is_empty() {
@@ -321,6 +325,7 @@ fn confirm_rename(mut state: AppState) -> AppState {
             if old_name == new_name {
                 return state.with_mode(Mode::Normal);
             }
+            state.push_undo_snapshot();
             if let Some(mut table) = state.schema.tables.remove(&old_name) {
                 table.name = new_name.clone();
                 state.schema.add_table(table);
@@ -340,6 +345,7 @@ fn confirm_rename(mut state: AppState) -> AppState {
             if old_col_name == new_name {
                 return state.with_mode(Mode::Normal);
             }
+            state.push_undo_snapshot();
             if let Some(table) = state.schema.tables.get_mut(&table_name) {
                 // Rename the column in the table
                 for col in &mut table.columns {
@@ -1216,5 +1222,244 @@ mod tests {
             .column("email")
             .unwrap();
         assert!(!email.nullable); // restored to original NOT NULL
+    }
+
+    // ── Undo / Redo ────────────────────────────────────────────────
+
+    #[test]
+    fn undo_restores_previous_state() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable);
+
+        let state = toggle_nullable(state); // email is now nullable
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.nullable);
+
+        let state = state.undo();
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable); // restored
+    }
+
+    #[test]
+    fn redo_reapplies_undone_change() {
+        let state = state_with_users().cursor_down(2);
+        let state = toggle_nullable(state); // nullable
+        let state = state.undo(); // restored to NOT NULL
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(!col.nullable);
+
+        let state = state.redo(); // back to nullable
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.nullable);
+    }
+
+    #[test]
+    fn undo_multiple_actions() {
+        let state = state_with_users().cursor_down(2); // "email"
+
+        // Action 1: toggle nullable
+        let state = toggle_nullable(state);
+        assert!(
+            state
+                .schema
+                .table("users")
+                .unwrap()
+                .column("email")
+                .unwrap()
+                .nullable
+        );
+
+        // Action 2: toggle index
+        let state = toggle_column_index(state);
+        assert!(!state.schema.table("users").unwrap().indexes.is_empty());
+
+        // Undo action 2 (index)
+        let state = state.undo();
+        assert!(state.schema.table("users").unwrap().indexes.is_empty());
+        // nullable still applied
+        assert!(
+            state
+                .schema
+                .table("users")
+                .unwrap()
+                .column("email")
+                .unwrap()
+                .nullable
+        );
+
+        // Undo action 1 (nullable)
+        let state = state.undo();
+        assert!(
+            !state
+                .schema
+                .table("users")
+                .unwrap()
+                .column("email")
+                .unwrap()
+                .nullable
+        );
+    }
+
+    #[test]
+    fn new_edit_after_undo_clears_redo() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let state = toggle_nullable(state); // action 1
+        let state = state.undo(); // undo action 1 — redo available
+
+        // New edit: toggle unique
+        let state = toggle_column_unique(state);
+        // Redo should be gone
+        let state = state.redo();
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Already at newest change")
+        );
+    }
+
+    #[test]
+    fn undo_with_no_history_shows_status() {
+        let state = state_with_users();
+        let state = state.undo();
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Already at oldest change")
+        );
+    }
+
+    #[test]
+    fn redo_with_no_history_shows_status() {
+        let state = state_with_users();
+        let state = state.redo();
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("Already at newest change")
+        );
+    }
+
+    #[test]
+    fn undo_clears_edit_state_when_fully_reverted() {
+        let state = state_with_users().cursor_down(2);
+        let state = toggle_nullable(state);
+        assert!(state.original_schema.is_some());
+
+        let state = state.undo();
+        // Schema should match original — edit state should be cleared
+        assert!(state.original_schema.is_none());
+        assert!(state.edit_overlay.is_none());
+    }
+
+    #[test]
+    fn redo_after_full_undo_restores_original_schema() {
+        let state = state_with_users().cursor_down(2); // "email"
+        let state = toggle_nullable(state);
+        assert!(state.original_schema.is_some());
+        assert!(state.has_edits());
+
+        // Undo fully — original_schema cleared
+        let state = state.undo();
+        assert!(state.original_schema.is_none());
+        assert!(!state.has_edits());
+
+        // Redo — must restore original_schema so diff engine works
+        let state = state.redo();
+        assert!(state.original_schema.is_some());
+        assert!(state.has_edits());
+        // The edit overlay should also be recomputed
+        assert!(state.edit_overlay.is_some());
+    }
+
+    #[test]
+    fn undo_redo_rename() {
+        let state = state_with_users(); // cursor on "users" table header
+        let state = enter_rename_mode(state);
+
+        // Type "accounts"
+        let state = "accounts"
+            .chars()
+            .fold(state, |s, ch| handle_rename(s, key(KeyCode::Char(ch))));
+        let state = handle_rename(state, key(KeyCode::Enter));
+
+        assert!(state.schema.table("accounts").is_some());
+        assert!(state.schema.table("users").is_none());
+
+        // Undo the rename
+        let state = state.undo();
+        assert!(state.schema.table("users").is_some());
+        assert!(state.schema.table("accounts").is_none());
+        // Rename metadata should also be restored
+        assert!(state.renames.is_empty());
+
+        // Redo the rename
+        let state = state.redo();
+        assert!(state.schema.table("accounts").is_some());
+        assert!(state.schema.table("users").is_none());
+    }
+
+    #[test]
+    fn undo_redo_default_prompt() {
+        let state = state_with_users().cursor_down(2); // "email" (no default)
+        let state = enter_default_prompt(state);
+
+        // Type "now()"
+        let state = handle_default_prompt(state, key(KeyCode::Char('n')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('o')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('w')));
+        let state = handle_default_prompt(state, key(KeyCode::Char('(')));
+        let state = handle_default_prompt(state, key(KeyCode::Char(')')));
+        let state = handle_default_prompt(state, key(KeyCode::Enter));
+
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.default.is_some());
+
+        // Undo — default should be cleared
+        let state = state.undo();
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert!(col.default.is_none());
+
+        // Redo — default should be restored
+        let state = state.redo();
+        let col = state
+            .schema
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert_eq!(col.default, Some(Expression::FunctionCall("now()".into())));
     }
 }

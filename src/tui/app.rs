@@ -148,6 +148,92 @@ pub struct InDocSearchState {
     pub origin_cursor: usize,
 }
 
+/// Maximum number of entries in the undo/redo stacks.
+const UNDO_STACK_MAX: usize = 100;
+
+/// A snapshot of the schema editing state at a point in time.
+#[derive(Debug, Clone)]
+pub struct UndoSnapshot {
+    pub schema: Schema,
+    pub original_schema: Option<Schema>,
+    pub renames: Vec<RenameMetadata>,
+    pub edited_tables: BTreeSet<String>,
+}
+
+/// Classic two-stack undo/redo history for schema editing actions.
+///
+/// On each edit, the pre-edit state is pushed to `undo_stack` and `redo_stack`
+/// is cleared. Undo pops from `undo_stack` and pushes to `redo_stack`. Redo
+/// does the reverse.
+#[derive(Debug, Clone)]
+pub struct UndoHistory {
+    undo_stack: Vec<UndoSnapshot>,
+    redo_stack: Vec<UndoSnapshot>,
+}
+
+impl Default for UndoHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UndoHistory {
+    pub fn new() -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    /// Record the current state before an edit. Clears redo history.
+    pub fn push(&mut self, snapshot: UndoSnapshot) {
+        self.redo_stack.clear();
+        self.undo_stack.push(snapshot);
+        if self.undo_stack.len() > UNDO_STACK_MAX {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Pop the most recent undo snapshot. Caller must push current state
+    /// to `push_redo` separately.
+    pub fn pop_undo(&mut self) -> Option<UndoSnapshot> {
+        self.undo_stack.pop()
+    }
+
+    /// Push current state to the redo stack (called during undo).
+    pub fn push_redo(&mut self, snapshot: UndoSnapshot) {
+        self.redo_stack.push(snapshot);
+    }
+
+    /// Pop the most recent redo snapshot. Caller must push current state
+    /// to undo stack separately.
+    pub fn pop_redo(&mut self) -> Option<UndoSnapshot> {
+        self.redo_stack.pop()
+    }
+
+    /// Push current state to the undo stack (called during redo).
+    pub fn push_undo(&mut self, snapshot: UndoSnapshot) {
+        self.undo_stack.push(snapshot);
+        if self.undo_stack.len() > UNDO_STACK_MAX {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Clear all history (e.g., after writing a migration).
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+}
+
 /// Maximum number of entries in the jump list.
 const JUMP_LIST_MAX: usize = 100;
 
@@ -387,6 +473,8 @@ pub struct AppState {
     pub show_edit_changes: bool,
     /// Resolved migrations directory (None if not found or no .sql files).
     pub migrations_dir: Option<std::path::PathBuf>,
+    /// Undo/redo history for schema editing actions.
+    pub undo_history: UndoHistory,
 }
 
 impl AppState {
@@ -438,6 +526,7 @@ impl AppState {
             edit_overlay: None,
             show_edit_changes: true,
             migrations_dir,
+            undo_history: UndoHistory::new(),
         }
     }
 
@@ -765,7 +854,76 @@ impl AppState {
         self.renames.clear();
         self.edited_tables.clear();
         self.edit_overlay = None;
+        self.undo_history.clear();
         self
+    }
+
+    /// Take a snapshot of the current editing state for undo history.
+    ///
+    /// Call this **before** mutating the schema so the snapshot captures
+    /// the state to restore on undo.
+    pub fn push_undo_snapshot(&mut self) {
+        self.undo_history.push(UndoSnapshot {
+            schema: self.schema.clone(),
+            original_schema: self.original_schema.clone(),
+            renames: self.renames.clone(),
+            edited_tables: self.edited_tables.clone(),
+        });
+    }
+
+    /// Undo the last schema editing action.
+    pub fn undo(mut self) -> Self {
+        let current = UndoSnapshot {
+            schema: self.schema.clone(),
+            original_schema: self.original_schema.clone(),
+            renames: self.renames.clone(),
+            edited_tables: self.edited_tables.clone(),
+        };
+
+        if let Some(snapshot) = self.undo_history.pop_undo() {
+            self.undo_history.push_redo(current);
+
+            self.schema = snapshot.schema;
+            self.original_schema = snapshot.original_schema;
+            self.renames = snapshot.renames;
+            self.edited_tables = snapshot.edited_tables;
+            self.rebuild_doc();
+            self.recompute_edit_overlay();
+
+            // If schema matches original, clear edit state entirely
+            if !self.has_edits() {
+                self.original_schema = None;
+                self.edit_overlay = None;
+            }
+
+            self.with_status("Undo")
+        } else {
+            self.with_status("Already at oldest change")
+        }
+    }
+
+    /// Redo a previously undone schema editing action.
+    pub fn redo(mut self) -> Self {
+        let current = UndoSnapshot {
+            schema: self.schema.clone(),
+            original_schema: self.original_schema.clone(),
+            renames: self.renames.clone(),
+            edited_tables: self.edited_tables.clone(),
+        };
+
+        if let Some(snapshot) = self.undo_history.pop_redo() {
+            self.undo_history.push_undo(current);
+
+            self.schema = snapshot.schema;
+            self.original_schema = snapshot.original_schema;
+            self.renames = snapshot.renames;
+            self.edited_tables = snapshot.edited_tables;
+            self.rebuild_doc();
+            self.recompute_edit_overlay();
+            self.with_status("Redo")
+        } else {
+            self.with_status("Already at newest change")
+        }
     }
 
     /// Recompute the edit overlay from the diff between original and current schema.
@@ -2488,5 +2646,105 @@ mod tests {
         let state = sample_state();
         let state = state.next_change();
         assert_eq!(state.status_message.as_deref(), Some("No edit changes"));
+    }
+
+    // --- UndoHistory unit tests ---
+
+    #[test]
+    fn undo_history_new_is_empty() {
+        let h = UndoHistory::new();
+        assert!(!h.can_undo());
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn undo_history_push_enables_undo() {
+        let mut h = UndoHistory::new();
+        h.push(UndoSnapshot {
+            schema: Schema::new(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        });
+        assert!(h.can_undo());
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn undo_history_pop_undo_returns_snapshot() {
+        let mut h = UndoHistory::new();
+        let mut schema = Schema::new();
+        schema.add_table(crate::schema::Table::new("marker"));
+        h.push(UndoSnapshot {
+            schema: schema.clone(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        });
+        let snapshot = h.pop_undo().unwrap();
+        assert!(snapshot.schema.table("marker").is_some());
+        assert!(!h.can_undo());
+    }
+
+    #[test]
+    fn undo_history_redo_round_trip() {
+        let mut h = UndoHistory::new();
+        let snapshot = UndoSnapshot {
+            schema: Schema::new(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        };
+        h.push(snapshot.clone());
+
+        // Pop undo, push redo
+        let popped = h.pop_undo().unwrap();
+        h.push_redo(UndoSnapshot {
+            schema: Schema::new(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        });
+        assert!(h.can_redo());
+
+        // Pop redo
+        let _redo_snap = h.pop_redo().unwrap();
+        assert!(!h.can_redo());
+        // Push undo should work
+        h.push_undo(popped);
+        assert!(h.can_undo());
+    }
+
+    #[test]
+    fn undo_history_push_clears_redo() {
+        let mut h = UndoHistory::new();
+        let snapshot = UndoSnapshot {
+            schema: Schema::new(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        };
+        h.push(snapshot.clone());
+        let _ = h.pop_undo();
+        h.push_redo(snapshot.clone());
+        assert!(h.can_redo());
+
+        // New edit clears redo
+        h.push(snapshot);
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn undo_history_clear() {
+        let mut h = UndoHistory::new();
+        h.push(UndoSnapshot {
+            schema: Schema::new(),
+            original_schema: None,
+            renames: Vec::new(),
+            edited_tables: BTreeSet::new(),
+        });
+        h.clear();
+        assert!(!h.can_undo());
+        assert!(!h.can_redo());
     }
 }
