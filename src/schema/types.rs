@@ -32,6 +32,17 @@ pub enum PgType {
     Custom(String),
 }
 
+impl PgType {
+    /// Returns `true` for text-family types (text, varchar, char).
+    ///
+    /// Used by the default-prompt auto-quoting logic: unquoted input on a
+    /// text-type column that doesn't look like a SQL keyword or function call
+    /// is automatically wrapped in single quotes.
+    pub fn is_text_type(&self) -> bool {
+        matches!(self, PgType::Text | PgType::Varchar(_) | PgType::Char(_))
+    }
+}
+
 impl std::fmt::Display for PgType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -212,6 +223,20 @@ mod tests {
         let arr = PgType::Array(Box::new(PgType::Jsonb));
         let cloned = arr.clone();
         assert_eq!(arr, cloned);
+    }
+
+    #[test]
+    fn pg_type_is_text_type() {
+        assert!(PgType::Text.is_text_type());
+        assert!(PgType::Varchar(None).is_text_type());
+        assert!(PgType::Varchar(Some(255)).is_text_type());
+        assert!(PgType::Char(None).is_text_type());
+        assert!(PgType::Char(Some(1)).is_text_type());
+        assert!(!PgType::Integer.is_text_type());
+        assert!(!PgType::Boolean.is_text_type());
+        assert!(!PgType::Uuid.is_text_type());
+        assert!(!PgType::Jsonb.is_text_type());
+        assert!(!PgType::Array(Box::new(PgType::Text)).is_text_type());
     }
 
     #[test]

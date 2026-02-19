@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::app::{AppState, DefaultPromptTarget, FocusTarget, Mode, RenameMetadata, RenameTarget};
 use crate::migration::overlay::ChangeMarker;
 use crate::schema::render::render_single_table;
-use crate::schema::types::Expression;
+use crate::schema::types::{Expression, PgType};
 use crate::schema::{Constraint, Index};
 
 /// An editor request produced by the `e` keybinding.
@@ -176,13 +176,21 @@ fn confirm_default_prompt(mut state: AppState) -> AppState {
     let text = state.default_prompt_buf.trim().to_string();
     state.default_prompt_buf.clear();
 
+    // Look up the column's PgType for auto-quoting decisions.
+    let pg_type = state
+        .schema
+        .table(&target.table)
+        .and_then(|t| t.column(&target.column))
+        .map(|c| c.pg_type.clone())
+        .unwrap_or(PgType::Text);
+
     state.push_undo_snapshot();
     if let Some(table) = state.schema.tables.get_mut(&target.table) {
         if let Some(col) = table.columns.iter_mut().find(|c| c.name == target.column) {
             if text.is_empty() {
                 col.default = None;
             } else {
-                col.default = Some(classify_expression(&text));
+                col.default = Some(classify_expression(&text, &pg_type));
             }
         }
     }
@@ -195,20 +203,61 @@ fn confirm_default_prompt(mut state: AppState) -> AppState {
     state
 }
 
+/// SQL keywords that are valid bare DEFAULT expressions.
+const SQL_KEYWORDS: &[&str] = &[
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+];
+
 /// Classify a default expression string into an Expression variant.
 ///
-/// Reuses the same logic as the parser (parse.rs:370-380).
-fn classify_expression(s: &str) -> Expression {
-    if s.contains('(') && s.ends_with(')') {
-        Expression::FunctionCall(s.to_string())
-    } else if s.starts_with('\'')
-        || s.starts_with('-')
-        || s.chars().next().is_some_and(|c| c.is_ascii_digit())
-    {
-        Expression::Literal(s.to_string())
-    } else {
-        Expression::Raw(s.to_string())
+/// Precedence rules:
+/// 1. Already single-quoted (both ends) → Literal, use as-is
+/// 2. Contains `(` → FunctionCall, use as-is
+/// 3. SQL keywords (case-insensitive) → Raw, use as-is
+/// 4. Non-text + starts with `-` or digit → Literal (numeric), use as-is
+/// 5. Text-type column + none of above → auto-wrap in single quotes
+/// 6. Non-text column → Raw expression
+fn classify_expression(s: &str, pg_type: &PgType) -> Expression {
+    // 1. Already single-quoted → literal as-is
+    if s.starts_with('\'') && s.ends_with('\'') {
+        return Expression::Literal(s.to_string());
     }
+
+    // 2. Looks like a function call → use as-is
+    if s.contains('(') && s.ends_with(')') {
+        return Expression::FunctionCall(s.to_string());
+    }
+
+    // 3. SQL keywords → Raw as-is
+    if SQL_KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(s)) {
+        return Expression::Raw(s.to_string());
+    }
+
+    // 4. Numeric literal (non-text columns only; text columns fall through to auto-quoting
+    //    so that `0` on TEXT → '0', matching Postgres round-trip behavior)
+    if !pg_type.is_text_type()
+        && (s.starts_with('-') || s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    {
+        return Expression::Literal(s.to_string());
+    }
+
+    // 5. Text-type column → auto-wrap in single quotes (escape internal quotes)
+    if pg_type.is_text_type() {
+        let escaped = s.replace('\'', "''");
+        return Expression::Literal(format!("'{escaped}'"));
+    }
+
+    // 6. Non-text column → raw expression
+    Expression::Raw(s.to_string())
 }
 
 // ── External editor request ─────────────────────────────────────
@@ -911,33 +960,161 @@ mod tests {
 
     #[test]
     fn classify_function_call() {
+        let int = PgType::Integer;
         assert_eq!(
-            classify_expression("now()"),
+            classify_expression("now()", &int),
             Expression::FunctionCall("now()".into())
         );
         assert_eq!(
-            classify_expression("gen_random_uuid()"),
+            classify_expression("gen_random_uuid()", &int),
             Expression::FunctionCall("gen_random_uuid()".into())
+        );
+        // Function calls pass through even on text columns
+        assert_eq!(
+            classify_expression("now()", &PgType::Text),
+            Expression::FunctionCall("now()".into())
         );
     }
 
     #[test]
     fn classify_literal() {
-        assert_eq!(classify_expression("42"), Expression::Literal("42".into()));
+        let int = PgType::Integer;
         assert_eq!(
-            classify_expression("'hello'"),
+            classify_expression("42", &int),
+            Expression::Literal("42".into())
+        );
+        assert_eq!(
+            classify_expression("'hello'", &int),
             Expression::Literal("'hello'".into())
         );
-        assert_eq!(classify_expression("-1"), Expression::Literal("-1".into()));
+        assert_eq!(
+            classify_expression("-1", &int),
+            Expression::Literal("-1".into())
+        );
     }
 
     #[test]
     fn classify_raw() {
+        let int = PgType::Integer;
         assert_eq!(
-            classify_expression("CURRENT_TIMESTAMP"),
+            classify_expression("CURRENT_TIMESTAMP", &int),
             Expression::Raw("CURRENT_TIMESTAMP".into())
         );
-        assert_eq!(classify_expression("true"), Expression::Raw("true".into()));
+        // SQL keyword TRUE is case-insensitive
+        assert_eq!(
+            classify_expression("true", &int),
+            Expression::Raw("true".into())
+        );
+        assert_eq!(
+            classify_expression("TRUE", &int),
+            Expression::Raw("TRUE".into())
+        );
+    }
+
+    // ── Auto-quoting on text columns ────────────────────────────
+
+    #[test]
+    fn classify_auto_quotes_bare_text_on_text_column() {
+        let text = PgType::Text;
+        // Unquoted string on text column → auto-wrapped in single quotes
+        assert_eq!(
+            classify_expression("hello", &text),
+            Expression::Literal("'hello'".into())
+        );
+        assert_eq!(
+            classify_expression("active", &text),
+            Expression::Literal("'active'".into())
+        );
+    }
+
+    #[test]
+    fn classify_auto_quotes_escapes_internal_quotes() {
+        let text = PgType::Text;
+        // Internal single quotes get escaped: it's → 'it''s'
+        assert_eq!(
+            classify_expression("it's", &text),
+            Expression::Literal("'it''s'".into())
+        );
+    }
+
+    #[test]
+    fn classify_explicit_quotes_pass_through_on_text_column() {
+        let text = PgType::Text;
+        // Already single-quoted → literal as-is (no double-wrapping)
+        assert_eq!(
+            classify_expression("'NULL'", &text),
+            Expression::Literal("'NULL'".into())
+        );
+        assert_eq!(
+            classify_expression("''", &text),
+            Expression::Literal("''".into())
+        );
+        assert_eq!(
+            classify_expression("'it''s'", &text),
+            Expression::Literal("'it''s'".into())
+        );
+    }
+
+    #[test]
+    fn classify_null_keyword_vs_string() {
+        let text = PgType::Text;
+        // Bare NULL → SQL keyword (Raw)
+        assert_eq!(
+            classify_expression("NULL", &text),
+            Expression::Raw("NULL".into())
+        );
+        // Quoted 'NULL' → string literal
+        assert_eq!(
+            classify_expression("'NULL'", &text),
+            Expression::Literal("'NULL'".into())
+        );
+    }
+
+    #[test]
+    fn classify_sql_keywords_not_auto_quoted() {
+        let text = PgType::Text;
+        // SQL keywords pass through as Raw even on text columns
+        assert_eq!(
+            classify_expression("NULL", &text),
+            Expression::Raw("NULL".into())
+        );
+        assert_eq!(
+            classify_expression("CURRENT_TIMESTAMP", &text),
+            Expression::Raw("CURRENT_TIMESTAMP".into())
+        );
+    }
+
+    #[test]
+    fn classify_numeric_on_text_column_is_auto_quoted() {
+        // On text columns, numeric input falls through to auto-quoting
+        // so that Postgres round-trip is stable ('0'::text → '0')
+        assert_eq!(
+            classify_expression("0", &PgType::Text),
+            Expression::Literal("'0'".into())
+        );
+        assert_eq!(
+            classify_expression("-1", &PgType::Text),
+            Expression::Literal("'-1'".into())
+        );
+    }
+
+    #[test]
+    fn classify_no_auto_quote_on_non_text() {
+        let int = PgType::Integer;
+        // Bare word on non-text column → Raw (no auto-quoting)
+        assert_eq!(
+            classify_expression("active", &int),
+            Expression::Raw("active".into())
+        );
+    }
+
+    #[test]
+    fn classify_varchar_is_text_type() {
+        let varchar = PgType::Varchar(Some(255));
+        assert_eq!(
+            classify_expression("hello", &varchar),
+            Expression::Literal("'hello'".into())
+        );
     }
 
     // ── Editor request ──────────────────────────────────────────

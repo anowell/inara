@@ -987,7 +987,7 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
     // Show default prompt
     if state.mode == Mode::DefaultPrompt {
         spans.push(Span::styled(
-            " Set default: ",
+            " DEFAULT expr: ",
             Style::default().fg(Color::Yellow),
         ));
         spans.push(Span::styled(

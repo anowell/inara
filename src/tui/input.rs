@@ -3622,7 +3622,7 @@ mod tests {
         users.add_column(Column::new("id", PgType::Uuid));
         users.add_column(Column::new("email", PgType::Text));
         schema.add_table(users);
-        let state = AppState::new(schema, "test".into(), None)
+        let state = AppState::new(schema, "test".into(), Some("migrations".into()))
             .with_viewport_height(20)
             .toggle_expand() // expand "users"
             .cursor_down(2); // focus on "email"
