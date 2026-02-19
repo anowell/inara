@@ -23,6 +23,7 @@ pub enum Mode {
     Command,
     SpaceMenu,
     GotoMenu,
+    ChangeMenu,
     MigrationPreview,
     LlmPending,
     LlmPreview,
@@ -1642,6 +1643,7 @@ mod tests {
         assert_eq!(Mode::Command.to_string(), "Command");
         assert_eq!(Mode::SpaceMenu.to_string(), "SpaceMenu");
         assert_eq!(Mode::GotoMenu.to_string(), "GotoMenu");
+        assert_eq!(Mode::ChangeMenu.to_string(), "ChangeMenu");
         assert_eq!(Mode::MigrationPreview.to_string(), "MigrationPreview");
         assert_eq!(Mode::LlmPending.to_string(), "LlmPending");
         assert_eq!(Mode::LlmPreview.to_string(), "LlmPreview");

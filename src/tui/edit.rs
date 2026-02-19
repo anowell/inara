@@ -239,7 +239,7 @@ pub fn prepare_editor_request(state: AppState) -> (AppState, Option<EditorReques
     (state, Some(request))
 }
 
-// ── Rename mode (unchanged from original) ───────────────────────
+// ── Rename mode ─────────────────────────────────────────────────
 
 /// Enter rename mode for the focused element.
 pub fn enter_rename_mode(state: AppState) -> AppState {
@@ -249,6 +249,24 @@ pub fn enter_rename_mode(state: AppState) -> AppState {
         _ => return state, // Can only rename tables and columns
     };
 
+    enter_rename_with_target(state, target)
+}
+
+/// Enter rename mode targeting the containing node (table) regardless
+/// of which line within the table is focused.
+pub fn enter_rename_node_mode(state: AppState) -> AppState {
+    let table_name = match state.focus() {
+        Some(target) => target.table_name().map(|s| s.to_string()),
+        None => return state,
+    };
+    let Some(table_name) = table_name else {
+        return state;
+    };
+
+    enter_rename_with_target(state, RenameTarget::Table(table_name))
+}
+
+fn enter_rename_with_target(state: AppState, target: RenameTarget) -> AppState {
     let mut state = state.ensure_original_schema();
     state.rename_target = Some(target);
     state.rename_buf = String::new();

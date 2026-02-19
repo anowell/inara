@@ -104,6 +104,7 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
         Mode::Command => handle_command(state, key, pool),
         Mode::SpaceMenu => handle_space_menu(state, key, pool),
         Mode::GotoMenu => HandleResult::state_only(handle_goto_menu(state, key)),
+        Mode::ChangeMenu => HandleResult::state_only(handle_change_menu(state, key)),
         Mode::Search => HandleResult::state_only(handle_search(state, key)),
         Mode::DefaultPrompt => HandleResult::state_only(edit::handle_default_prompt(state, key)),
         Mode::Rename => HandleResult::state_only(edit::handle_rename(state, key)),
@@ -191,7 +192,7 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             HandleResult::state_only(state.toggle_rust_types())
         }
-        KeyCode::Char('r') => HandleResult::state_only(edit::enter_rename_mode(state)),
+        KeyCode::Char('c') => HandleResult::state_only(state.with_mode(Mode::ChangeMenu)),
         KeyCode::Char('q') => {
             let (state, handle) = open_hud(state, pool);
             HandleResult::with_hud(state, handle)
@@ -205,20 +206,9 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             state.enter_in_doc_search(super::app::SearchDirection::Backward),
         ),
 
-        // Quick actions (column-context only)
-        // `n` is context-aware: navigates search matches when a search is active,
-        // otherwise toggles nullable.
-        KeyCode::Char('n') => {
-            if state.in_doc_search.is_some() {
-                HandleResult::state_only(state.next_search_match())
-            } else {
-                HandleResult::state_only(edit::toggle_nullable(state))
-            }
-        }
+        // Search match navigation
+        KeyCode::Char('n') => HandleResult::state_only(state.next_search_match()),
         KeyCode::Char('N') => HandleResult::state_only(state.prev_search_match()),
-        KeyCode::Char('u') => HandleResult::state_only(edit::toggle_column_unique(state)),
-        KeyCode::Char('i') => HandleResult::state_only(edit::toggle_column_index(state)),
-        KeyCode::Char('D') => HandleResult::state_only(edit::enter_default_prompt(state)),
 
         // Clear in-document search highlighting
         KeyCode::Esc => {
@@ -285,6 +275,29 @@ fn handle_goto_menu(state: AppState, key: KeyEvent) -> AppState {
             }
         }
         _ => state, // non-char keys dismiss
+    }
+}
+
+/// Handle key events in ChangeMenu mode.
+///
+/// The change menu shows available change actions for the current context.
+/// Pressing a valid key executes the change. Esc or any unrecognized
+/// key dismisses the menu.
+fn handle_change_menu(state: AppState, key: KeyEvent) -> AppState {
+    let state = state.with_mode(Mode::Normal);
+    match key.code {
+        // Rename current element (column on column, table on table header)
+        KeyCode::Char('r') => edit::enter_rename_mode(state),
+        // Rename containing node (table) regardless of focus
+        KeyCode::Char('R') => edit::enter_rename_node_mode(state),
+        // Column-level quick actions
+        KeyCode::Char('n') => edit::toggle_nullable(state),
+        KeyCode::Char('u') => edit::toggle_column_unique(state),
+        KeyCode::Char('i') => edit::toggle_column_index(state),
+        KeyCode::Char('d') => edit::enter_default_prompt(state),
+        // Dismiss
+        KeyCode::Esc => state,
+        _ => state,
     }
 }
 
@@ -1424,6 +1437,7 @@ mod tests {
             Mode::Command => handle_command(state, key, &no_pool()).state,
             Mode::SpaceMenu => handle_space_menu(state, key, &no_pool()).state,
             Mode::GotoMenu => handle_goto_menu(state, key),
+            Mode::ChangeMenu => handle_change_menu(state, key),
             Mode::Search => handle_search(state, key),
             Mode::DefaultPrompt => edit::handle_default_prompt(state, key),
             Mode::Rename => edit::handle_rename(state, key),
@@ -1506,7 +1520,7 @@ mod tests {
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.toggle_rust_types()
             }
-            KeyCode::Char('r') => edit::enter_rename_mode(state),
+            KeyCode::Char('c') => state.with_mode(Mode::ChangeMenu),
             // In-document search
             KeyCode::Char('/') => {
                 state.enter_in_doc_search(crate::tui::app::SearchDirection::Forward)
@@ -1514,18 +1528,9 @@ mod tests {
             KeyCode::Char('?') => {
                 state.enter_in_doc_search(crate::tui::app::SearchDirection::Backward)
             }
-            // Quick actions (column-context only)
-            KeyCode::Char('n') => {
-                if state.in_doc_search.is_some() {
-                    state.next_search_match()
-                } else {
-                    edit::toggle_nullable(state)
-                }
-            }
+            // Search match navigation
+            KeyCode::Char('n') => state.next_search_match(),
             KeyCode::Char('N') => state.prev_search_match(),
-            KeyCode::Char('u') => edit::toggle_column_unique(state),
-            KeyCode::Char('i') => edit::toggle_column_index(state),
-            KeyCode::Char('D') => edit::enter_default_prompt(state),
             // 'e' produces an editor request — in tests we just prepare the request and ignore it
             KeyCode::Char('e') => edit::prepare_editor_request(state).0,
             // Change navigation (bracket sequences)

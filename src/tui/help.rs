@@ -83,24 +83,8 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Edit in $EDITOR",
     },
     Binding {
-        key: "r",
-        desc: "Rename element",
-    },
-    Binding {
-        key: "n",
-        desc: "Toggle nullable",
-    },
-    Binding {
-        key: "u",
-        desc: "Toggle unique",
-    },
-    Binding {
-        key: "i",
-        desc: "Toggle index",
-    },
-    Binding {
-        key: "D",
-        desc: "Set/clear default",
+        key: "c",
+        desc: "Change...",
     },
     Binding {
         key: "q",
@@ -301,6 +285,37 @@ const LLM_PREVIEW_BINDINGS: &[Binding] = &[
     },
 ];
 
+const CHANGE_MENU_BINDINGS: &[Binding] = &[
+    Binding {
+        key: "r",
+        desc: "Rename element",
+    },
+    Binding {
+        key: "R",
+        desc: "Rename table (node)",
+    },
+    Binding {
+        key: "n",
+        desc: "Toggle nullable",
+    },
+    Binding {
+        key: "u",
+        desc: "Toggle unique",
+    },
+    Binding {
+        key: "i",
+        desc: "Toggle index",
+    },
+    Binding {
+        key: "d",
+        desc: "Set/clear default",
+    },
+    Binding {
+        key: "Esc",
+        desc: "Cancel",
+    },
+];
+
 const GOTO_MENU_BINDINGS: &[Binding] = &[
     Binding {
         key: "g",
@@ -390,6 +405,7 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
         Mode::MigrationPreview => MIGRATION_PREVIEW_BINDINGS,
         Mode::SpaceMenu => SPACE_MENU_BINDINGS,
         Mode::GotoMenu => GOTO_MENU_BINDINGS,
+        Mode::ChangeMenu => CHANGE_MENU_BINDINGS,
         Mode::LlmPending => LLM_PENDING_BINDINGS,
         Mode::LlmPreview => LLM_PREVIEW_BINDINGS,
         Mode::InDocSearch => IN_DOC_SEARCH_BINDINGS,
@@ -490,6 +506,7 @@ mod tests {
             Mode::Command,
             Mode::SpaceMenu,
             Mode::GotoMenu,
+            Mode::ChangeMenu,
             Mode::MigrationPreview,
             Mode::LlmPending,
             Mode::LlmPreview,
@@ -513,6 +530,20 @@ mod tests {
         assert!(
             bindings.iter().any(|b| b.key == "?"),
             "Space menu should include the ? key"
+        );
+    }
+
+    #[test]
+    fn normal_mode_shows_change_as_prefix() {
+        let bindings = bindings_for_mode(Mode::Normal);
+        let change = bindings.iter().find(|b| b.key == "c");
+        assert!(
+            change.is_some(),
+            "Normal mode should show c as a change key"
+        );
+        assert!(
+            change.unwrap().desc.contains("Change"),
+            "c should be described as Change"
         );
     }
 

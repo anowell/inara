@@ -426,6 +426,77 @@ pub fn render_goto_menu(frame: &mut Frame, area: Rect, state: &crate::tui::app::
     frame.render_widget(paragraph, menu_area);
 }
 
+/// Change menu items for table context (table header, separator, constraint, index, close brace).
+const CHANGE_TABLE_ITEMS: &[(&str, &str)] = &[("r", "Rename table")];
+
+/// Change menu items for column context.
+const CHANGE_COLUMN_ITEMS: &[(&str, &str)] = &[
+    ("r", "Rename column"),
+    ("R", "Rename table"),
+    ("n", "Toggle nullable"),
+    ("u", "Toggle unique"),
+    ("i", "Toggle index"),
+    ("d", "Set/clear default"),
+];
+
+/// Render the change menu overlay, showing context-aware change actions.
+pub fn render_change_menu(frame: &mut Frame, area: Rect, state: &crate::tui::app::AppState) {
+    use crate::tui::app::FocusTarget;
+
+    let items: &[(&str, &str)] = match state.focus() {
+        Some(FocusTarget::Table(_))
+        | Some(FocusTarget::Separator(_))
+        | Some(FocusTarget::Constraint(_, _))
+        | Some(FocusTarget::Index(_, _))
+        | Some(FocusTarget::TableClose(_)) => CHANGE_TABLE_ITEMS,
+        Some(FocusTarget::Column(_, _)) => CHANGE_COLUMN_ITEMS,
+        _ => &[],
+    };
+
+    if items.is_empty() {
+        return;
+    }
+
+    let menu_width: u16 = 26;
+    let menu_height: u16 = items.len() as u16 + 2; // borders
+
+    // Center horizontally, place near top
+    let x = area.x + area.width.saturating_sub(menu_width) / 2;
+    let y = area.y + 2;
+    let menu_area = Rect::new(
+        x,
+        y,
+        menu_width.min(area.width),
+        menu_height.min(area.height.saturating_sub(2)),
+    );
+
+    // Clear the area behind the menu
+    frame.render_widget(Clear, menu_area);
+
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .map(|(key, label)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {key}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Change ");
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, menu_area);
+}
+
 /// Render the search overlay.
 pub fn render_search_overlay(frame: &mut Frame, area: Rect, search: &SearchState) {
     let overlay_width: u16 = 50.min(area.width.saturating_sub(4));
@@ -779,5 +850,22 @@ mod tests {
     fn goto_basic_items_only_has_g() {
         assert_eq!(GOTO_BASIC_ITEMS.len(), 1);
         assert_eq!(GOTO_BASIC_ITEMS[0].0, "g");
+    }
+
+    #[test]
+    fn change_table_items_has_rename() {
+        let keys: Vec<&str> = CHANGE_TABLE_ITEMS.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"r"));
+    }
+
+    #[test]
+    fn change_column_items_has_expected_keys() {
+        let keys: Vec<&str> = CHANGE_COLUMN_ITEMS.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"r"));
+        assert!(keys.contains(&"R"));
+        assert!(keys.contains(&"n"));
+        assert!(keys.contains(&"u"));
+        assert!(keys.contains(&"i"));
+        assert!(keys.contains(&"d"));
     }
 }
