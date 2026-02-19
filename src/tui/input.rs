@@ -176,6 +176,9 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
         }
 
         // Expand/collapse
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            HandleResult::state_only(state.toggle_expand_all())
+        }
         KeyCode::Enter => HandleResult::state_only(state.toggle_expand()),
 
         // Table jumping

@@ -51,6 +51,10 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Toggle expand/collapse",
     },
     Binding {
+        key: "Shift-Enter",
+        desc: "Expand/collapse all",
+    },
+    Binding {
         key: "Tab",
         desc: "Next table",
     },

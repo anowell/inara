@@ -1042,6 +1042,27 @@ impl AppState {
         self
     }
 
+    /// Toggle expand/collapse for all nodes (tables, enums, types).
+    ///
+    /// If any node is collapsed, expand all. If all are already expanded, collapse all.
+    pub fn toggle_expand_all(mut self) -> Self {
+        let all_names: BTreeSet<String> = self
+            .schema
+            .enums
+            .keys()
+            .chain(self.schema.types.keys())
+            .chain(self.schema.tables.keys())
+            .cloned()
+            .collect();
+        if all_names.iter().all(|n| self.expanded.contains(n)) {
+            self.expanded.clear();
+        } else {
+            self.expanded = all_names;
+        }
+        self.rebuild_doc();
+        self
+    }
+
     /// Jump cursor to the next line with an edit change marker.
     pub fn next_change(mut self) -> Self {
         if self.edit_overlay.is_none() {
@@ -1818,6 +1839,47 @@ mod tests {
         // Toggle collapse
         let state = state.toggle_expand();
         assert!(!state.expanded.contains("alpha"));
+    }
+
+    #[test]
+    fn toggle_expand_all_expands_when_none_expanded() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+
+        let state = state.toggle_expand_all();
+        assert_eq!(state.expanded.len(), 5);
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(state.expanded.contains(name));
+        }
+    }
+
+    #[test]
+    fn toggle_expand_all_collapses_when_all_expanded() {
+        let state = sample_state();
+
+        // Expand all, then toggle again should collapse all
+        let state = state.toggle_expand_all();
+        assert_eq!(state.expanded.len(), 5);
+
+        let state = state.toggle_expand_all();
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
+    fn toggle_expand_all_expands_when_partially_expanded() {
+        let state = sample_state();
+
+        // Expand just one table
+        let state = state.toggle_expand();
+        assert_eq!(state.expanded.len(), 1);
+        assert!(state.expanded.contains("alpha"));
+
+        // Toggle all should expand the rest
+        let state = state.toggle_expand_all();
+        assert_eq!(state.expanded.len(), 5);
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(state.expanded.contains(name));
+        }
     }
 
     #[test]
