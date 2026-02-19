@@ -173,14 +173,25 @@ fn render_line(state: &AppState, target: &FocusTarget, is_focused: bool) -> Line
 fn render_enum_header(state: &AppState, name: &str) -> Vec<Span<'static>> {
     let enum_type = state.schema.enums.get(name);
     let is_empty = enum_type.map(|e| e.variants.is_empty()).unwrap_or(true);
+    let is_expanded = state.expanded.contains(name);
 
     let mut spans = vec![
         Span::styled("enum ", KEYWORD_STYLE),
         Span::styled(name.to_string(), NAME_STYLE),
         Span::styled(" {", NORMAL_STYLE),
     ];
-    if is_empty {
+    if is_expanded && is_empty {
         spans.push(Span::styled(" }", NORMAL_STYLE));
+    } else if !is_expanded {
+        if is_empty {
+            spans.push(Span::styled(" }", NORMAL_STYLE));
+        } else {
+            let variant_count = enum_type.map(|e| e.variants.len()).unwrap_or(0);
+            spans.push(Span::styled(
+                format!(" ... {variant_count} variants ... }}"),
+                DIM_STYLE,
+            ));
+        }
     }
     spans
 }
@@ -220,13 +231,24 @@ fn render_type_header(state: &AppState, name: &str) -> Vec<Span<'static>> {
             spans
         }
         CustomTypeKind::Composite { fields } => {
+            let is_expanded = state.expanded.contains(name);
             let mut spans = vec![
                 Span::styled("composite ", KEYWORD_STYLE),
                 Span::styled(name.to_string(), NAME_STYLE),
                 Span::styled(" {", NORMAL_STYLE),
             ];
-            if fields.is_empty() {
+            if is_expanded && fields.is_empty() {
                 spans.push(Span::styled(" }", NORMAL_STYLE));
+            } else if !is_expanded {
+                if fields.is_empty() {
+                    spans.push(Span::styled(" }", NORMAL_STYLE));
+                } else {
+                    let field_count = fields.len();
+                    spans.push(Span::styled(
+                        format!(" ... {field_count} fields ... }}"),
+                        DIM_STYLE,
+                    ));
+                }
             }
             spans
         }
@@ -634,7 +656,9 @@ mod tests {
             name: "mood".into(),
             variants: vec!["happy".into(), "sad".into()],
         });
-        let state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let state = AppState::new(schema, String::new())
+            .with_viewport_height(20)
+            .toggle_expand(); // expand the enum
         let lines = render_document(&state);
         // header + 2 variants + close = 4
         assert_eq!(lines.len(), 4);
@@ -730,7 +754,9 @@ mod tests {
                 ],
             },
         });
-        let state = AppState::new(schema, String::new()).with_viewport_height(10);
+        let state = AppState::new(schema, String::new())
+            .with_viewport_height(10)
+            .toggle_expand(); // expand the composite type
         let lines = render_document(&state);
         // header + 2 fields + close = 4
         assert_eq!(lines.len(), 4);
@@ -750,7 +776,7 @@ mod tests {
         for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
             schema.add_table(Table::new(name));
         }
-        // 5 tables + 4 blanks = 9 lines, viewport only shows 3
+        // 5 collapsed tables = 5 lines, viewport only shows 3
         let state = AppState::new(schema, String::new()).with_viewport_height(3);
         let lines = render_document(&state);
         assert_eq!(lines.len(), 3);
@@ -871,6 +897,7 @@ mod tests {
         });
         let state = AppState::new(schema, String::new())
             .with_viewport_height(20)
+            .toggle_expand() // expand the composite type
             .toggle_rust_types();
         let lines = render_document(&state);
 

@@ -257,6 +257,25 @@ impl FocusTarget {
             _ => None,
         }
     }
+
+    /// Returns the parent node name for any expandable target (table, enum, or type).
+    pub fn node_name(&self) -> Option<&str> {
+        match self {
+            FocusTarget::Table(n)
+            | FocusTarget::Column(n, _)
+            | FocusTarget::Separator(n)
+            | FocusTarget::Constraint(n, _)
+            | FocusTarget::Index(n, _)
+            | FocusTarget::TableClose(n)
+            | FocusTarget::Enum(n)
+            | FocusTarget::EnumVariant(n, _)
+            | FocusTarget::EnumClose(n)
+            | FocusTarget::Type(n)
+            | FocusTarget::TypeField(n, _)
+            | FocusTarget::TypeClose(n) => Some(n),
+            FocusTarget::Blank => None,
+        }
+    }
 }
 
 /// A single line in the document with its focus target.
@@ -527,6 +546,10 @@ impl AppState {
                 }
             }
             GotoFocus::Enum(name) => {
+                if !self.expanded.contains(name) {
+                    self.expanded.insert(name.clone());
+                    self.rebuild_doc();
+                }
                 if let Some(pos) = self
                     .doc
                     .iter()
@@ -536,6 +559,10 @@ impl AppState {
                 }
             }
             GotoFocus::Type(name) => {
+                if !self.expanded.contains(name) {
+                    self.expanded.insert(name.clone());
+                    self.rebuild_doc();
+                }
                 if let Some(pos) = self
                     .doc
                     .iter()
@@ -622,6 +649,10 @@ impl AppState {
                 }
             }
             SymbolKind::Enum => {
+                if !self.expanded.contains(&symbol.display) {
+                    self.expanded.insert(symbol.display.clone());
+                    self.rebuild_doc();
+                }
                 if let Some(pos) = self
                     .doc
                     .iter()
@@ -631,6 +662,10 @@ impl AppState {
                 }
             }
             SymbolKind::Type => {
+                if !self.expanded.contains(&symbol.display) {
+                    self.expanded.insert(symbol.display.clone());
+                    self.rebuild_doc();
+                }
                 if let Some(pos) = self
                     .doc
                     .iter()
@@ -940,13 +975,13 @@ impl AppState {
         self.scroll_to_cursor()
     }
 
-    /// Toggle expand/collapse for the table under the cursor.
+    /// Toggle expand/collapse for the node (table, enum, or type) under the cursor.
     pub fn toggle_expand(mut self) -> Self {
-        let table_name = match self.focus() {
-            Some(target) => target.table_name().map(|s| s.to_string()),
+        let node_name = match self.focus() {
+            Some(target) => target.node_name().map(|s| s.to_string()),
             None => None,
         };
-        if let Some(name) = table_name {
+        if let Some(name) = node_name {
             if self.expanded.contains(&name) {
                 self.expanded.remove(&name);
             } else {
@@ -997,13 +1032,19 @@ impl AppState {
                 return;
             }
 
-            // Fall back: for sub-table targets (e.g. after collapse), jump to the table header
+            // Fall back: for sub-node targets (e.g. after collapse), jump to the parent header
             let fallback = match target {
                 FocusTarget::Column(t, _)
                 | FocusTarget::Separator(t)
                 | FocusTarget::Constraint(t, _)
                 | FocusTarget::Index(t, _)
                 | FocusTarget::TableClose(t) => Some(FocusTarget::Table(t.clone())),
+                FocusTarget::EnumVariant(n, _) | FocusTarget::EnumClose(n) => {
+                    Some(FocusTarget::Enum(n.clone()))
+                }
+                FocusTarget::TypeField(n, _) | FocusTarget::TypeClose(n) => {
+                    Some(FocusTarget::Type(n.clone()))
+                }
                 _ => None,
             };
 
@@ -1141,22 +1182,22 @@ impl AppState {
 
 /// Build the flat document model from a schema and expanded set.
 ///
-/// The document is a list of lines, one per visible element. Collapsed tables
-/// show a single summary line. Expanded tables show all internal lines.
-/// Enums and custom types are always expanded (they're typically short).
+/// The document is a list of lines, one per visible element. Collapsed nodes
+/// show a single summary line. Expanded nodes show all internal lines.
+/// All node types (enums, types, tables) support collapse/expand.
 pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLine> {
     let mut lines = Vec::new();
     // Track whether the previous block spanned multiple lines.
-    // A blank separator is inserted only when either the previous or current
-    // block is multi-line, so consecutive collapsed (single-line) items pack
-    // tightly together.
+    // A blank separator is inserted only when the previous block was
+    // multi-line, so expanding a node doesn't shift its header down.
     let mut prev_multiline: Option<bool> = None;
 
     // Enums
     for enum_type in schema.enums.values() {
-        let is_multiline = !enum_type.variants.is_empty();
+        let is_expanded = expanded.contains(&enum_type.name);
+        let is_multiline = is_expanded && !enum_type.variants.is_empty();
         if let Some(prev) = prev_multiline {
-            if prev || is_multiline {
+            if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
                 });
@@ -1166,28 +1207,32 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
         lines.push(DocLine {
             target: FocusTarget::Enum(enum_type.name.clone()),
         });
-        if enum_type.variants.is_empty() {
-            // Single-line enum: `enum name { }` — no close brace line
-        } else {
-            for (i, _variant) in enum_type.variants.iter().enumerate() {
+        if is_expanded {
+            if enum_type.variants.is_empty() {
+                // Single-line enum: `enum name { }` — no close brace line
+            } else {
+                for (i, _variant) in enum_type.variants.iter().enumerate() {
+                    lines.push(DocLine {
+                        target: FocusTarget::EnumVariant(enum_type.name.clone(), i),
+                    });
+                }
                 lines.push(DocLine {
-                    target: FocusTarget::EnumVariant(enum_type.name.clone(), i),
+                    target: FocusTarget::EnumClose(enum_type.name.clone()),
                 });
             }
-            lines.push(DocLine {
-                target: FocusTarget::EnumClose(enum_type.name.clone()),
-            });
         }
     }
 
     // Custom types
     for custom_type in schema.types.values() {
-        let is_multiline = matches!(
-            &custom_type.kind,
-            crate::schema::CustomTypeKind::Composite { fields } if !fields.is_empty()
-        );
+        let is_expanded = expanded.contains(&custom_type.name);
+        let is_multiline = is_expanded
+            && matches!(
+                &custom_type.kind,
+                crate::schema::CustomTypeKind::Composite { fields } if !fields.is_empty()
+            );
         if let Some(prev) = prev_multiline {
-            if prev || is_multiline {
+            if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
                 });
@@ -1199,16 +1244,18 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
             target: FocusTarget::Type(custom_type.name.clone()),
         });
 
-        if let crate::schema::CustomTypeKind::Composite { fields } = &custom_type.kind {
-            if !fields.is_empty() {
-                for (i, _) in fields.iter().enumerate() {
+        if is_expanded {
+            if let crate::schema::CustomTypeKind::Composite { fields } = &custom_type.kind {
+                if !fields.is_empty() {
+                    for (i, _) in fields.iter().enumerate() {
+                        lines.push(DocLine {
+                            target: FocusTarget::TypeField(custom_type.name.clone(), i),
+                        });
+                    }
                     lines.push(DocLine {
-                        target: FocusTarget::TypeField(custom_type.name.clone(), i),
+                        target: FocusTarget::TypeClose(custom_type.name.clone()),
                     });
                 }
-                lines.push(DocLine {
-                    target: FocusTarget::TypeClose(custom_type.name.clone()),
-                });
             }
         }
     }
@@ -1220,7 +1267,7 @@ pub fn build_document(schema: &Schema, expanded: &BTreeSet<String>) -> Vec<DocLi
             table.columns.is_empty() && table.constraints.is_empty() && table.indexes.is_empty();
         let is_multiline = is_expanded && !is_empty;
         if let Some(prev) = prev_multiline {
-            if prev || is_multiline {
+            if prev {
                 lines.push(DocLine {
                     target: FocusTarget::Blank,
                 });
@@ -1528,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_table_gets_blank_separators() {
+    fn expanded_table_gets_blank_after_not_before() {
         use crate::schema::types::PgType;
         use crate::schema::{Column, Table};
 
@@ -1543,17 +1590,17 @@ mod tests {
         // All collapsed: aaa(0) bbb(1) ccc(2) — no blanks
         assert_eq!(state.line_count(), 3);
 
-        // Expand bbb: aaa(0) blank(1) bbb(2) id(3) close(4) blank(5) ccc(6)
+        // Expand bbb: no blank before bbb (prev was single-line), blank after
+        // aaa(0) bbb(1) id(2) close(3) blank(4) ccc(5)
         state.expanded.insert("bbb".into());
         state.rebuild_doc();
-        assert_eq!(state.line_count(), 7);
+        assert_eq!(state.line_count(), 6);
         assert_eq!(state.doc[0].target, FocusTarget::Table("aaa".into()));
-        assert_eq!(state.doc[1].target, FocusTarget::Blank);
-        assert_eq!(state.doc[2].target, FocusTarget::Table("bbb".into()));
-        assert!(matches!(state.doc[3].target, FocusTarget::Column(_, _)));
-        assert_eq!(state.doc[4].target, FocusTarget::TableClose("bbb".into()));
-        assert_eq!(state.doc[5].target, FocusTarget::Blank);
-        assert_eq!(state.doc[6].target, FocusTarget::Table("ccc".into()));
+        assert_eq!(state.doc[1].target, FocusTarget::Table("bbb".into()));
+        assert!(matches!(state.doc[2].target, FocusTarget::Column(_, _)));
+        assert_eq!(state.doc[3].target, FocusTarget::TableClose("bbb".into()));
+        assert_eq!(state.doc[4].target, FocusTarget::Blank);
+        assert_eq!(state.doc[5].target, FocusTarget::Table("ccc".into()));
     }
 
     #[test]
@@ -1645,9 +1692,13 @@ mod tests {
         schema.add_table(Table::new("users"));
 
         let state = AppState::new(schema, String::new());
-        // enum header + 2 variants + close + blank + table header = 6
-        assert_eq!(state.line_count(), 6);
+        // Both collapsed: mood(0) users(1)
+        assert_eq!(state.line_count(), 2);
         assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
+
+        // Expand enum: mood(0) happy(1) sad(2) close(3) blank(4) users(5)
+        let state = state.toggle_expand();
+        assert_eq!(state.line_count(), 6);
     }
 
     #[test]
