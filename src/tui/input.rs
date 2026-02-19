@@ -190,7 +190,7 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
         KeyCode::Char(':') => HandleResult::state_only(state.with_mode(Mode::Command)),
         KeyCode::Char(' ') => HandleResult::state_only(state.with_mode(Mode::SpaceMenu)),
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            HandleResult::state_only(state.toggle_rust_types())
+            HandleResult::state_only(state.toggle_language_types())
         }
         KeyCode::Char('c') => {
             if state.migrations_dir.is_none() {
@@ -1569,7 +1569,7 @@ mod tests {
             KeyCode::Char(':') => state.with_mode(Mode::Command),
             KeyCode::Char(' ') => state.with_mode(Mode::SpaceMenu),
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.toggle_rust_types()
+                state.toggle_language_types()
             }
             KeyCode::Char('c') => {
                 if state.migrations_dir.is_none() {
@@ -1844,24 +1844,24 @@ mod tests {
         assert_eq!(state.cursor, 2); // unchanged
     }
 
-    // --- Rust type toggle ---
+    // --- Language type toggle ---
 
     #[test]
-    fn ctrl_t_toggles_rust_types() {
+    fn ctrl_t_toggles_language_types() {
         let state = sample_state();
-        assert!(!state.show_rust_types);
+        assert!(!state.show_language_types);
 
         let state = handle_key_no_pool(
             state,
             key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
-        assert!(state.show_rust_types);
+        assert!(state.show_language_types);
 
         let state = handle_key_no_pool(
             state,
             key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
-        assert!(!state.show_rust_types);
+        assert!(!state.show_language_types);
     }
 
     // --- Space menu ---

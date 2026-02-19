@@ -41,10 +41,22 @@ async fn main() -> Result<()> {
         .map(|l| l.config.types.overrides.clone())
         .unwrap_or_default();
 
+    // Collect language from config
+    let config_language = loaded
+        .as_ref()
+        .and_then(|l| l.config.types.language.clone());
+
     match database_url {
         Some(ref url) => {
             let display_url = mask_password(url);
-            inara::tui::run(url, display_url, migrations_dir, config_overrides).await?;
+            inara::tui::run(
+                url,
+                display_url,
+                migrations_dir,
+                config_overrides,
+                config_language,
+            )
+            .await?;
         }
         None => {
             eprintln!(

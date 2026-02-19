@@ -112,7 +112,7 @@ const NORMAL_BINDINGS: &[Binding] = &[
     },
     Binding {
         key: "Ctrl-t",
-        desc: "Toggle Rust types",
+        desc: "Toggle language types",
     },
     Binding {
         key: "]g",

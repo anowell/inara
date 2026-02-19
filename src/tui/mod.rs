@@ -200,6 +200,7 @@ pub async fn run(
     connection_info: String,
     migrations_dir: Option<std::path::PathBuf>,
     config_overrides: std::collections::BTreeMap<String, String>,
+    config_language: Option<String>,
 ) -> Result<()> {
     // Initialize file-based tracing before entering TUI mode
     init_file_tracing();
@@ -238,26 +239,51 @@ pub async fn run(
 
     let mut terminal = init_terminal()?;
 
-    // Load PG→Rust type mapper from target project's Cargo.toml
+    // Determine target language from config (default: Rust)
+    let language = match config_language.as_deref() {
+        Some(s) => match crate::schema::type_map::Language::from_config(s) {
+            Some(lang) => lang,
+            None => {
+                tracing::warn!("Unrecognized language '{s}' in config, falling back to rust");
+                crate::schema::type_map::Language::Rust
+            }
+        },
+        None => crate::schema::type_map::Language::Rust,
+    };
+    tracing::info!("Type mapper language: {language}");
+
+    // Build type mapper based on language
     let cargo_toml_path = std::path::Path::new("Cargo.toml");
     let type_mapper = {
-        let mut mapper = crate::schema::type_map::TypeMapper::from_cargo_toml(cargo_toml_path);
+        let mut mapper = match language {
+            crate::schema::type_map::Language::Rust => {
+                // Rust: detect features from Cargo.toml
+                crate::schema::type_map::TypeMapper::from_cargo_toml(cargo_toml_path)
+            }
+            _ => crate::schema::type_map::TypeMapper::for_language(language),
+        };
 
-        // Merge overrides: Cargo.toml metadata / .inara.toml (legacy), then config file overrides
-        let mut overrides = crate::schema::type_map::load_overrides(cargo_toml_path);
-        // Config file overrides take precedence
+        // Merge overrides: Cargo.toml metadata / .inara.toml (legacy) for Rust only
+        let mut overrides = if language == crate::schema::type_map::Language::Rust {
+            crate::schema::type_map::load_overrides(cargo_toml_path)
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        // Config file overrides ([types.overrides]) apply for all languages
         overrides.extend(config_overrides);
         if !overrides.is_empty() {
             tracing::info!("Loaded {} type override(s)", overrides.len());
             mapper = mapper.with_overrides(overrides);
         }
-        let features = mapper.features();
-        tracing::info!(
-            "Type mapper: chrono={}, time={}, jiff={}",
-            features.chrono,
-            features.time,
-            features.jiff
-        );
+        if language == crate::schema::type_map::Language::Rust {
+            let features = mapper.features();
+            tracing::info!(
+                "Rust features: chrono={}, time={}, jiff={}",
+                features.chrono,
+                features.time,
+                features.jiff
+            );
+        }
         mapper
     };
 

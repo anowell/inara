@@ -446,10 +446,10 @@ pub struct AppState {
     pub status_message: Option<String>,
     /// When the pending key was set (for timeout).
     pub pending_key_time: Option<Instant>,
-    /// PG→Rust type mapper (feature-aware, with user overrides).
+    /// PG→language type mapper (language-aware, with user overrides).
     pub type_mapper: TypeMapper,
-    /// Whether to show Rust type annotations alongside PG types.
-    pub show_rust_types: bool,
+    /// Whether to show language-specific type annotations alongside PG types.
+    pub show_language_types: bool,
     /// Pending migrations overlay state (present when overlay is active).
     pub pending_overlay: Option<PendingOverlay>,
     /// Whether the pending overlay is currently visible.
@@ -514,7 +514,7 @@ impl AppState {
             status_message: None,
             pending_key_time: None,
             type_mapper: TypeMapper::new(),
-            show_rust_types: false,
+            show_language_types: false,
             pending_overlay: None,
             show_pending_overlay: false,
             llm_preview: None,
@@ -955,9 +955,9 @@ impl AppState {
         self
     }
 
-    /// Toggle Rust type annotation display on/off.
-    pub fn toggle_rust_types(mut self) -> Self {
-        self.show_rust_types = !self.show_rust_types;
+    /// Toggle language-specific type annotation display on/off.
+    pub fn toggle_language_types(mut self) -> Self {
+        self.show_language_types = !self.show_language_types;
         self
     }
 

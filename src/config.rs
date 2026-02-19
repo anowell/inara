@@ -19,9 +19,9 @@ pub struct InaraConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TypesConfig {
-    /// Target language (currently only "rust" is supported).
+    /// Target language for type mapping (e.g., "rust", "typescript"). Defaults to "rust".
     pub language: Option<String>,
-    /// PG type name → Rust type string overrides.
+    /// PG type name → language type string overrides.
     pub overrides: BTreeMap<String, String>,
 }
 

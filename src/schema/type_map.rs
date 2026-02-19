@@ -3,6 +3,37 @@ use std::path::Path;
 
 use super::types::PgType;
 
+/// Target language for type mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    /// Rust — feature-aware (chrono/time/jiff), Cargo.toml scanning.
+    Rust,
+    /// TypeScript — static mapping table.
+    TypeScript,
+}
+
+impl Language {
+    /// Parse a language name from a config string.
+    ///
+    /// Returns `None` for unrecognized values.
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "rust" => Some(Language::Rust),
+            "typescript" | "ts" => Some(Language::TypeScript),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Language::Rust => write!(f, "rust"),
+            Language::TypeScript => write!(f, "typescript"),
+        }
+    }
+}
+
 /// Detected sqlx feature flags that affect type mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedFeatures {
@@ -22,21 +53,22 @@ impl DetectedFeatures {
     }
 }
 
-/// Maps Postgres types to Rust type strings.
+/// Maps Postgres types to language-specific type strings.
 ///
-/// Holds detected sqlx feature flags and user overrides.
-/// Feature detection reads the target project's Cargo.toml to find
-/// which datetime crate is in use (chrono, time, or jiff-sqlx).
+/// Dispatches on the target language. Holds detected sqlx feature flags
+/// (Rust-only) and user overrides. Feature detection reads the target
+/// project's Cargo.toml to find which datetime crate is in use.
 /// User overrides take precedence over all defaults.
 #[derive(Debug, Clone)]
 pub struct TypeMapper {
+    language: Language,
     features: DetectedFeatures,
     overrides: BTreeMap<String, String>,
 }
 
 /// Static mapping table for PgType → default Rust type (no feature flags).
 /// These match sqlx::postgres::types defaults.
-const DEFAULT_MAPPINGS: &[(PgType, &str)] = &[
+const RUST_MAPPINGS: &[(PgType, &str)] = &[
     (PgType::Boolean, "bool"),
     (PgType::SmallInt, "i16"),
     (PgType::Integer, "i32"),
@@ -51,6 +83,10 @@ const DEFAULT_MAPPINGS: &[(PgType, &str)] = &[
     (PgType::Interval, "sqlx::postgres::types::PgInterval"),
 ];
 
+/// Static mapping table for PgType → TypeScript type.
+/// Intentionally minimal — the full table is added by a follow-up bead.
+const TYPESCRIPT_MAPPINGS: &[(PgType, &str)] = &[];
+
 impl Default for TypeMapper {
     fn default() -> Self {
         Self::new()
@@ -58,73 +94,103 @@ impl Default for TypeMapper {
 }
 
 impl TypeMapper {
-    /// Create a new TypeMapper with default mappings only (no features, no overrides).
+    /// Create a new TypeMapper for Rust with default mappings (no features, no overrides).
     pub fn new() -> Self {
         Self {
+            language: Language::Rust,
             features: DetectedFeatures::none(),
             overrides: BTreeMap::new(),
         }
     }
 
-    /// Create a TypeMapper by detecting features from a Cargo.toml file.
+    /// Create a TypeMapper for the given language with no overrides.
+    pub fn for_language(language: Language) -> Self {
+        Self {
+            language,
+            features: DetectedFeatures::none(),
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    /// Create a Rust TypeMapper by detecting features from a Cargo.toml file.
     ///
     /// Returns a mapper with defaults if the file can't be read or parsed.
     pub fn from_cargo_toml(path: &Path) -> Self {
         let features = detect_features(path).unwrap_or_else(|_| DetectedFeatures::none());
         Self {
+            language: Language::Rust,
             features,
             overrides: BTreeMap::new(),
         }
     }
 
-    /// Create a TypeMapper with explicit features (useful for testing).
+    /// Create a Rust TypeMapper with explicit features (useful for testing).
     pub fn with_features(features: DetectedFeatures) -> Self {
         Self {
+            language: Language::Rust,
             features,
             overrides: BTreeMap::new(),
         }
     }
 
-    /// Add user overrides from a map of pg_type_name → rust_type_string.
+    /// Add user overrides from a map of pg_type_name → type_string.
     pub fn with_overrides(mut self, overrides: BTreeMap<String, String>) -> Self {
         self.overrides = overrides;
         self
     }
 
-    /// Get the detected features.
+    /// Get the target language.
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    /// Get the detected features (Rust-only; always `DetectedFeatures::none()` for other languages).
     pub fn features(&self) -> &DetectedFeatures {
         &self.features
     }
 
-    /// Look up the Rust type string for a given PgType, wrapping in `Option<T>` if nullable.
+    /// Look up the language-specific type string for a given PgType,
+    /// wrapping for nullability if needed.
     ///
-    /// Returns `"Option<T>"` when `nullable` is true, `"T"` otherwise.
-    pub fn rust_type_annotation(&self, pg_type: &PgType, nullable: bool) -> String {
-        let base = self.rust_type(pg_type);
+    /// Rust: `Option<T>` / `T`
+    /// TypeScript: `T | null` / `T`
+    pub fn type_annotation(&self, pg_type: &PgType, nullable: bool) -> String {
+        let base = self.language_type(pg_type);
         if nullable {
-            format!("Option<{base}>")
+            match self.language {
+                Language::Rust => format!("Option<{base}>"),
+                Language::TypeScript => format!("{base} | null"),
+            }
         } else {
             base
         }
     }
 
-    /// Look up the Rust type string for a given PgType.
+    /// Look up the language-specific type string for a given PgType.
     ///
-    /// Priority: user overrides → feature-aware mapping → static defaults → fallback.
-    pub fn rust_type(&self, pg_type: &PgType) -> String {
+    /// Priority: user overrides → language-specific mapping → fallback.
+    pub fn language_type(&self, pg_type: &PgType) -> String {
         // 1. Check user overrides (keyed by the PgType display string)
         let pg_type_str = pg_type.to_string();
         if let Some(override_type) = self.overrides.get(&pg_type_str) {
             return override_type.clone();
         }
 
+        match self.language {
+            Language::Rust => self.rust_type_inner(pg_type, &pg_type_str),
+            Language::TypeScript => self.typescript_type_inner(pg_type, &pg_type_str),
+        }
+    }
+
+    /// Rust type resolution (after overrides checked).
+    fn rust_type_inner(&self, pg_type: &PgType, pg_type_str: &str) -> String {
         // 2. Feature-aware mappings (datetime types)
         if let Some(mapped) = self.feature_aware_mapping(pg_type) {
             return mapped.to_string();
         }
 
         // 3. Static default mappings
-        for (pg, rust) in DEFAULT_MAPPINGS {
+        for (pg, rust) in RUST_MAPPINGS {
             if pg == pg_type {
                 return rust.to_string();
             }
@@ -135,7 +201,7 @@ impl TypeMapper {
             PgType::Varchar(_) | PgType::Char(_) => return "String".to_string(),
             PgType::Numeric(_) => return "rust_decimal::Decimal".to_string(),
             PgType::Array(inner) => {
-                let inner_type = self.rust_type(inner);
+                let inner_type = self.language_type(inner);
                 return format!("Vec<{inner_type}>");
             }
             PgType::Custom(name) => return name.clone(),
@@ -143,10 +209,36 @@ impl TypeMapper {
         }
 
         // 5. Fallback for anything unmapped
-        pg_type_str
+        pg_type_str.to_string()
     }
 
-    /// Feature-aware mapping for datetime types.
+    /// TypeScript type resolution (after overrides checked).
+    fn typescript_type_inner(&self, pg_type: &PgType, pg_type_str: &str) -> String {
+        // 2. Static mappings
+        for (pg, ts) in TYPESCRIPT_MAPPINGS {
+            if pg == pg_type {
+                return ts.to_string();
+            }
+        }
+
+        // 3. Parameterized type mappings
+        match pg_type {
+            PgType::Varchar(_) | PgType::Char(_) | PgType::Numeric(_) => {
+                // Unmapped until TS mapping table is filled in
+            }
+            PgType::Array(inner) => {
+                let inner_type = self.language_type(inner);
+                return format!("{inner_type}[]");
+            }
+            PgType::Custom(name) => return name.clone(),
+            _ => {}
+        }
+
+        // 4. Fallback for anything unmapped
+        pg_type_str.to_string()
+    }
+
+    /// Feature-aware mapping for datetime types (Rust only).
     fn feature_aware_mapping(&self, pg_type: &PgType) -> Option<&'static str> {
         match pg_type {
             PgType::Timestamp => {
@@ -299,66 +391,101 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    // --- Default type mappings ---
+    // --- Language enum ---
+
+    #[test]
+    fn language_from_config_rust() {
+        assert_eq!(Language::from_config("rust"), Some(Language::Rust));
+        assert_eq!(Language::from_config("Rust"), Some(Language::Rust));
+        assert_eq!(Language::from_config("RUST"), Some(Language::Rust));
+    }
+
+    #[test]
+    fn language_from_config_typescript() {
+        assert_eq!(
+            Language::from_config("typescript"),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            Language::from_config("TypeScript"),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(Language::from_config("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_config("TS"), Some(Language::TypeScript));
+    }
+
+    #[test]
+    fn language_from_config_unknown() {
+        assert_eq!(Language::from_config("python"), None);
+        assert_eq!(Language::from_config(""), None);
+    }
+
+    #[test]
+    fn language_display() {
+        assert_eq!(Language::Rust.to_string(), "rust");
+        assert_eq!(Language::TypeScript.to_string(), "typescript");
+    }
+
+    // --- Default (Rust) type mappings ---
 
     #[test]
     fn default_boolean() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Boolean), "bool");
+        assert_eq!(mapper.language_type(&PgType::Boolean), "bool");
     }
 
     #[test]
     fn default_integer_types() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::SmallInt), "i16");
-        assert_eq!(mapper.rust_type(&PgType::Integer), "i32");
-        assert_eq!(mapper.rust_type(&PgType::BigInt), "i64");
+        assert_eq!(mapper.language_type(&PgType::SmallInt), "i16");
+        assert_eq!(mapper.language_type(&PgType::Integer), "i32");
+        assert_eq!(mapper.language_type(&PgType::BigInt), "i64");
     }
 
     #[test]
     fn default_float_types() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Real), "f32");
-        assert_eq!(mapper.rust_type(&PgType::DoublePrecision), "f64");
+        assert_eq!(mapper.language_type(&PgType::Real), "f32");
+        assert_eq!(mapper.language_type(&PgType::DoublePrecision), "f64");
     }
 
     #[test]
     fn default_text_types() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Text), "String");
-        assert_eq!(mapper.rust_type(&PgType::Varchar(None)), "String");
-        assert_eq!(mapper.rust_type(&PgType::Varchar(Some(255))), "String");
-        assert_eq!(mapper.rust_type(&PgType::Char(Some(1))), "String");
+        assert_eq!(mapper.language_type(&PgType::Text), "String");
+        assert_eq!(mapper.language_type(&PgType::Varchar(None)), "String");
+        assert_eq!(mapper.language_type(&PgType::Varchar(Some(255))), "String");
+        assert_eq!(mapper.language_type(&PgType::Char(Some(1))), "String");
     }
 
     #[test]
     fn default_uuid() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Uuid), "uuid::Uuid");
+        assert_eq!(mapper.language_type(&PgType::Uuid), "uuid::Uuid");
     }
 
     #[test]
     fn default_bytea() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Bytea), "Vec<u8>");
+        assert_eq!(mapper.language_type(&PgType::Bytea), "Vec<u8>");
     }
 
     #[test]
     fn default_json_types() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type(&PgType::Json), "serde_json::Value");
-        assert_eq!(mapper.rust_type(&PgType::Jsonb), "serde_json::Value");
+        assert_eq!(mapper.language_type(&PgType::Json), "serde_json::Value");
+        assert_eq!(mapper.language_type(&PgType::Jsonb), "serde_json::Value");
     }
 
     #[test]
     fn default_numeric() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Numeric(None)),
+            mapper.language_type(&PgType::Numeric(None)),
             "rust_decimal::Decimal"
         );
         assert_eq!(
-            mapper.rust_type(&PgType::Numeric(Some((10, 2)))),
+            mapper.language_type(&PgType::Numeric(Some((10, 2)))),
             "rust_decimal::Decimal"
         );
     }
@@ -367,7 +494,7 @@ mod tests {
     fn default_interval() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Interval),
+            mapper.language_type(&PgType::Interval),
             "sqlx::postgres::types::PgInterval"
         );
     }
@@ -376,11 +503,11 @@ mod tests {
     fn default_array() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Array(Box::new(PgType::Integer))),
+            mapper.language_type(&PgType::Array(Box::new(PgType::Integer))),
             "Vec<i32>"
         );
         assert_eq!(
-            mapper.rust_type(&PgType::Array(Box::new(PgType::Text))),
+            mapper.language_type(&PgType::Array(Box::new(PgType::Text))),
             "Vec<String>"
         );
     }
@@ -389,7 +516,7 @@ mod tests {
     fn default_custom_type_returns_name() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Custom("user_role".into())),
+            mapper.language_type(&PgType::Custom("user_role".into())),
             "user_role"
         );
     }
@@ -400,7 +527,7 @@ mod tests {
     fn default_timestamp_no_features() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamp),
+            mapper.language_type(&PgType::Timestamp),
             "sqlx::types::chrono::NaiveDateTime"
         );
     }
@@ -409,7 +536,7 @@ mod tests {
     fn default_timestamptz_no_features() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamptz),
+            mapper.language_type(&PgType::Timestamptz),
             "sqlx::types::chrono::DateTime<Utc>"
         );
     }
@@ -418,7 +545,7 @@ mod tests {
     fn default_date_no_features() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Date),
+            mapper.language_type(&PgType::Date),
             "sqlx::types::chrono::NaiveDate"
         );
     }
@@ -427,7 +554,7 @@ mod tests {
     fn default_time_no_features() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type(&PgType::Time),
+            mapper.language_type(&PgType::Time),
             "sqlx::types::chrono::NaiveTime"
         );
     }
@@ -442,15 +569,15 @@ mod tests {
             jiff: false,
         });
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamp),
+            mapper.language_type(&PgType::Timestamp),
             "chrono::NaiveDateTime"
         );
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamptz),
+            mapper.language_type(&PgType::Timestamptz),
             "chrono::DateTime<Utc>"
         );
-        assert_eq!(mapper.rust_type(&PgType::Date), "chrono::NaiveDate");
-        assert_eq!(mapper.rust_type(&PgType::Time), "chrono::NaiveTime");
+        assert_eq!(mapper.language_type(&PgType::Date), "chrono::NaiveDate");
+        assert_eq!(mapper.language_type(&PgType::Time), "chrono::NaiveTime");
     }
 
     // --- Feature detection: time ---
@@ -463,16 +590,19 @@ mod tests {
             jiff: false,
         });
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamp),
+            mapper.language_type(&PgType::Timestamp),
             "time::PrimitiveDateTime"
         );
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamptz),
+            mapper.language_type(&PgType::Timestamptz),
             "time::OffsetDateTime"
         );
-        assert_eq!(mapper.rust_type(&PgType::Date), "time::Date");
-        assert_eq!(mapper.rust_type(&PgType::Time), "time::Time");
-        assert_eq!(mapper.rust_type(&PgType::Timetz), "time::OffsetDateTime");
+        assert_eq!(mapper.language_type(&PgType::Date), "time::Date");
+        assert_eq!(mapper.language_type(&PgType::Time), "time::Time");
+        assert_eq!(
+            mapper.language_type(&PgType::Timetz),
+            "time::OffsetDateTime"
+        );
     }
 
     // --- Feature detection: jiff ---
@@ -485,12 +615,15 @@ mod tests {
             jiff: true,
         });
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamp),
+            mapper.language_type(&PgType::Timestamp),
             "jiff::civil::DateTime"
         );
-        assert_eq!(mapper.rust_type(&PgType::Timestamptz), "jiff::Timestamp");
-        assert_eq!(mapper.rust_type(&PgType::Date), "jiff::civil::Date");
-        assert_eq!(mapper.rust_type(&PgType::Time), "jiff::civil::Time");
+        assert_eq!(
+            mapper.language_type(&PgType::Timestamptz),
+            "jiff::Timestamp"
+        );
+        assert_eq!(mapper.language_type(&PgType::Date), "jiff::civil::Date");
+        assert_eq!(mapper.language_type(&PgType::Time), "jiff::civil::Time");
     }
 
     // --- Chrono takes precedence when both chrono and time are present ---
@@ -503,7 +636,7 @@ mod tests {
             jiff: false,
         });
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamptz),
+            mapper.language_type(&PgType::Timestamptz),
             "chrono::DateTime<Utc>"
         );
     }
@@ -517,10 +650,10 @@ mod tests {
         overrides.insert("text".to_string(), "&str".to_string());
 
         let mapper = TypeMapper::new().with_overrides(overrides);
-        assert_eq!(mapper.rust_type(&PgType::Uuid), "MyUuid");
-        assert_eq!(mapper.rust_type(&PgType::Text), "&str");
+        assert_eq!(mapper.language_type(&PgType::Uuid), "MyUuid");
+        assert_eq!(mapper.language_type(&PgType::Text), "&str");
         // Non-overridden types still work
-        assert_eq!(mapper.rust_type(&PgType::Integer), "i32");
+        assert_eq!(mapper.language_type(&PgType::Integer), "i32");
     }
 
     #[test]
@@ -535,7 +668,7 @@ mod tests {
         })
         .with_overrides(overrides);
 
-        assert_eq!(mapper.rust_type(&PgType::Timestamptz), "MyDateTime");
+        assert_eq!(mapper.language_type(&PgType::Timestamptz), "MyDateTime");
     }
 
     // --- Cargo.toml feature detection ---
@@ -751,17 +884,17 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 
         let mapper = TypeMapper::from_cargo_toml(&cargo_toml);
         assert_eq!(
-            mapper.rust_type(&PgType::Timestamptz),
+            mapper.language_type(&PgType::Timestamptz),
             "chrono::DateTime<Utc>"
         );
-        assert_eq!(mapper.rust_type(&PgType::Integer), "i32");
+        assert_eq!(mapper.language_type(&PgType::Integer), "i32");
     }
 
     #[test]
     fn from_cargo_toml_missing_file_uses_defaults() {
         let mapper = TypeMapper::from_cargo_toml(Path::new("/nonexistent/Cargo.toml"));
         // Should still work with defaults
-        assert_eq!(mapper.rust_type(&PgType::Integer), "i32");
+        assert_eq!(mapper.language_type(&PgType::Integer), "i32");
     }
 
     // --- Nullable-aware annotation ---
@@ -769,26 +902,23 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
     #[test]
     fn annotation_non_nullable() {
         let mapper = TypeMapper::new();
-        assert_eq!(mapper.rust_type_annotation(&PgType::Text, false), "String");
-        assert_eq!(
-            mapper.rust_type_annotation(&PgType::Uuid, false),
-            "uuid::Uuid"
-        );
+        assert_eq!(mapper.type_annotation(&PgType::Text, false), "String");
+        assert_eq!(mapper.type_annotation(&PgType::Uuid, false), "uuid::Uuid");
     }
 
     #[test]
     fn annotation_nullable_wraps_option() {
         let mapper = TypeMapper::new();
         assert_eq!(
-            mapper.rust_type_annotation(&PgType::Text, true),
+            mapper.type_annotation(&PgType::Text, true),
             "Option<String>"
         );
         assert_eq!(
-            mapper.rust_type_annotation(&PgType::Uuid, true),
+            mapper.type_annotation(&PgType::Uuid, true),
             "Option<uuid::Uuid>"
         );
         assert_eq!(
-            mapper.rust_type_annotation(&PgType::Jsonb, true),
+            mapper.type_annotation(&PgType::Jsonb, true),
             "Option<serde_json::Value>"
         );
     }
@@ -801,11 +931,11 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
             jiff: false,
         });
         assert_eq!(
-            mapper.rust_type_annotation(&PgType::Timestamptz, true),
+            mapper.type_annotation(&PgType::Timestamptz, true),
             "Option<chrono::DateTime<Utc>>"
         );
         assert_eq!(
-            mapper.rust_type_annotation(&PgType::Timestamptz, false),
+            mapper.type_annotation(&PgType::Timestamptz, false),
             "chrono::DateTime<Utc>"
         );
     }
@@ -841,22 +971,91 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
         ];
 
         for pg_type in types {
-            let rust_type = mapper.rust_type(&pg_type);
+            let mapped = mapper.language_type(&pg_type);
             assert!(
-                !rust_type.is_empty(),
+                !mapped.is_empty(),
                 "PgType {} should have a non-empty mapping",
                 pg_type
             );
             // Ensure it's not just the raw PG type string (except for custom types)
             if !matches!(pg_type, PgType::Custom(_)) {
                 assert_ne!(
-                    rust_type,
+                    mapped,
                     pg_type.to_string(),
-                    "PgType {} should map to a Rust type, not itself",
+                    "PgType {} should map to a language type, not itself",
                     pg_type
                 );
             }
         }
+    }
+
+    // --- TypeScript language ---
+
+    #[test]
+    fn typescript_custom_type_returns_name() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(
+            mapper.language_type(&PgType::Custom("user_role".into())),
+            "user_role"
+        );
+    }
+
+    #[test]
+    fn typescript_array_wrapping() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        // With empty TS mapping table, inner falls back to pg type string
+        let result = mapper.language_type(&PgType::Array(Box::new(PgType::Integer)));
+        assert_eq!(result, "integer[]");
+    }
+
+    #[test]
+    fn typescript_nullable_wrapping() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        let result = mapper.type_annotation(&PgType::Text, true);
+        assert_eq!(result, "text | null");
+    }
+
+    #[test]
+    fn typescript_non_nullable() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        let result = mapper.type_annotation(&PgType::Text, false);
+        assert_eq!(result, "text");
+    }
+
+    #[test]
+    fn typescript_overrides_work() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("text".to_string(), "string".to_string());
+        let mapper = TypeMapper::for_language(Language::TypeScript).with_overrides(overrides);
+        assert_eq!(mapper.language_type(&PgType::Text), "string");
+    }
+
+    #[test]
+    fn typescript_nullable_with_override() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("uuid".to_string(), "string".to_string());
+        let mapper = TypeMapper::for_language(Language::TypeScript).with_overrides(overrides);
+        assert_eq!(mapper.type_annotation(&PgType::Uuid, true), "string | null");
+    }
+
+    // --- for_language constructor ---
+
+    #[test]
+    fn for_language_rust_same_as_new() {
+        let new_mapper = TypeMapper::new();
+        let lang_mapper = TypeMapper::for_language(Language::Rust);
+        assert_eq!(
+            new_mapper.language_type(&PgType::Integer),
+            lang_mapper.language_type(&PgType::Integer)
+        );
+        assert_eq!(new_mapper.language(), Language::Rust);
+        assert_eq!(lang_mapper.language(), Language::Rust);
+    }
+
+    #[test]
+    fn for_language_typescript() {
+        let mapper = TypeMapper::for_language(Language::TypeScript);
+        assert_eq!(mapper.language(), Language::TypeScript);
     }
 
     // --- Test helpers ---

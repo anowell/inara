@@ -338,13 +338,13 @@ fn render_type_field(state: &AppState, name: &str, idx: usize) -> Vec<Span<'stat
     if let CustomTypeKind::Composite { fields } = &custom_type.kind {
         if let Some((field_name, pg_type)) = fields.get(idx) {
             let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-            let spans = if state.show_rust_types {
-                let rust_type = state.type_mapper.rust_type(pg_type);
+            let spans = if state.show_language_types {
+                let lang_type = state.type_mapper.language_type(pg_type);
                 let name_part = format!("{field_name}: ");
                 let name_width = max_name_len + 2; // +2 for ": "
                 vec![
                     Span::styled(format!("    {name_part:<name_width$}"), NAME_STYLE),
-                    Span::styled(rust_type, TYPE_STYLE),
+                    Span::styled(lang_type, TYPE_STYLE),
                 ]
             } else {
                 vec![
@@ -425,27 +425,27 @@ fn render_column_line(state: &AppState, table_name: &str, col_name: &str) -> Vec
         || single_pk_cols.contains(&col.name)
         || single_unique_cols.contains(&col.name);
 
-    let mut spans = if state.show_rust_types {
-        // Struct field syntax: "    name: RustType"
-        let rust_type = state
+    let mut spans = if state.show_language_types {
+        // Struct field syntax: "    name: LanguageType"
+        let lang_type = state
             .type_mapper
-            .rust_type_annotation(&col.pg_type, col.nullable);
+            .type_annotation(&col.pg_type, col.nullable);
         let max_type_len = table
             .columns
             .iter()
             .map(|c| {
                 state
                     .type_mapper
-                    .rust_type_annotation(&c.pg_type, c.nullable)
+                    .type_annotation(&c.pg_type, c.nullable)
                     .len()
             })
             .max()
             .unwrap_or(0);
 
         let padded_type = if has_suffix {
-            format!("{rust_type:<max_type_len$}")
+            format!("{lang_type:<max_type_len$}")
         } else {
-            rust_type
+            lang_type
         };
 
         // Pad "name: " so types align vertically (colon stays adjacent to name)
@@ -896,15 +896,15 @@ mod tests {
         assert!(text.contains("{ }"));
     }
 
-    // --- Rust type annotation tests ---
+    // --- Language type annotation tests ---
 
     #[test]
-    fn column_shows_rust_type_when_enabled() {
+    fn column_shows_language_type_when_enabled() {
         let state = simple_state()
             .with_viewport_height(20)
             .toggle_expand()
-            .toggle_rust_types();
-        assert!(state.show_rust_types);
+            .toggle_language_types();
+        assert!(state.show_language_types);
         let lines = render_document(&state);
 
         let id_text = spans_to_string(&lines[1]);
@@ -925,35 +925,35 @@ mod tests {
     }
 
     #[test]
-    fn column_hides_rust_type_when_disabled() {
+    fn column_hides_language_type_when_disabled() {
         let state = simple_state().with_viewport_height(20).toggle_expand();
-        assert!(!state.show_rust_types);
+        assert!(!state.show_language_types);
         let lines = render_document(&state);
 
         let id_text = spans_to_string(&lines[1]);
         assert!(
             !id_text.contains("//"),
-            "should NOT show Rust type annotation"
+            "should NOT show language type annotation"
         );
     }
 
     #[test]
-    fn rust_type_toggle_on_off() {
+    fn language_type_toggle_on_off() {
         let state = simple_state()
             .with_viewport_height(20)
             .toggle_expand()
-            .toggle_rust_types();
-        assert!(state.show_rust_types);
+            .toggle_language_types();
+        assert!(state.show_language_types);
 
-        let state = state.toggle_rust_types();
-        assert!(!state.show_rust_types);
+        let state = state.toggle_language_types();
+        assert!(!state.show_language_types);
         let lines = render_document(&state);
         let id_text = spans_to_string(&lines[1]);
         assert!(!id_text.contains("//"), "after toggle off, no annotation");
     }
 
     #[test]
-    fn rust_type_with_chrono_feature() {
+    fn language_type_with_chrono_feature() {
         use crate::schema::type_map::{DetectedFeatures, TypeMapper};
 
         let mut schema = Schema::new();
@@ -971,7 +971,7 @@ mod tests {
             .with_type_mapper(mapper)
             .with_viewport_height(20)
             .toggle_expand()
-            .toggle_rust_types();
+            .toggle_language_types();
 
         let lines = render_document(&state);
         let text = spans_to_string(&lines[1]);
@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_type_shows_rust_type() {
+    fn composite_type_shows_language_type() {
         let mut schema = Schema::new();
         schema.add_type(CustomType {
             name: "address".into(),
@@ -996,7 +996,7 @@ mod tests {
         let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand() // expand the composite type
-            .toggle_rust_types();
+            .toggle_language_types();
         let lines = render_document(&state);
 
         let street_text = spans_to_string(&lines[1]);
@@ -1029,7 +1029,7 @@ mod tests {
         let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand()
-            .toggle_rust_types();
+            .toggle_language_types();
 
         let lines = render_document(&state);
 
