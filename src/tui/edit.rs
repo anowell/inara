@@ -615,7 +615,7 @@ mod tests {
     fn state_with_users() -> AppState {
         let mut schema = Schema::new();
         schema.add_table(users_table());
-        AppState::new(schema, String::new())
+        AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand() // expand "users" table
     }
@@ -725,7 +725,7 @@ mod tests {
         });
         schema.add_table(table);
 
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1); // "product_id" column (BTreeMap order)
@@ -967,7 +967,7 @@ mod tests {
         table_a.add_column(Column::new("id", PgType::Uuid));
         schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(20);
         // Expand "a" so it becomes multi-line, producing a blank before "b"
         state.expanded.insert("a".into());
         state.rebuild_doc();
@@ -1096,7 +1096,7 @@ mod tests {
         table_a.add_column(Column::new("id", PgType::Uuid));
         schema.add_table(table_a);
         schema.add_table(Table::new("b"));
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(20);
         // Expand "a" so it becomes multi-line, producing a blank before "b"
         state.expanded.insert("a".into());
         state.rebuild_doc();

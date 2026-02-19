@@ -385,11 +385,17 @@ pub struct AppState {
     pub edit_overlay: Option<EditOverlay>,
     /// Whether to show edit change markers in the gutter (default: true).
     pub show_edit_changes: bool,
+    /// Resolved migrations directory (None if not found or no .sql files).
+    pub migrations_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
     /// Create a new application state from a loaded schema.
-    pub fn new(schema: Schema, connection_info: String) -> Self {
+    pub fn new(
+        schema: Schema,
+        connection_info: String,
+        migrations_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         let expanded = BTreeSet::new();
         let doc = build_document(&schema, &expanded);
         let relation_map = RelationMap::build(&schema);
@@ -431,6 +437,7 @@ impl AppState {
             change_preview: None,
             edit_overlay: None,
             show_edit_changes: true,
+            migrations_dir,
         }
     }
 
@@ -1619,7 +1626,7 @@ mod tests {
         for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
             schema.add_table(crate::schema::Table::new(name));
         }
-        AppState::new(schema, "postgres://user:***@localhost/testdb".into())
+        AppState::new(schema, "postgres://user:***@localhost/testdb".into(), None)
     }
 
     #[test]
@@ -1753,7 +1760,7 @@ mod tests {
 
     #[test]
     fn empty_schema_line_count() {
-        let state = AppState::new(Schema::new(), String::new());
+        let state = AppState::new(Schema::new(), String::new(), None);
         assert_eq!(state.line_count(), 0);
         // cursor_down on empty should stay at 0
         let state = state.cursor_down(1);
@@ -1812,7 +1819,7 @@ mod tests {
         schema.add_table(mid);
         schema.add_table(Table::new("ccc"));
 
-        let mut state = AppState::new(schema, String::new());
+        let mut state = AppState::new(schema, String::new(), None);
         // All collapsed: aaa(0) bbb(1) ccc(2) — no blanks
         assert_eq!(state.line_count(), 3);
 
@@ -1899,7 +1906,7 @@ mod tests {
         });
         schema.add_table(table);
 
-        let state = AppState::new(schema, String::new());
+        let state = AppState::new(schema, String::new(), None);
         assert_eq!(state.line_count(), 1); // Just the table header
 
         // Expand
@@ -1958,7 +1965,7 @@ mod tests {
         });
         schema.add_table(Table::new("users"));
 
-        let state = AppState::new(schema, String::new());
+        let state = AppState::new(schema, String::new(), None);
         // Both collapsed: mood(0) users(1)
         assert_eq!(state.line_count(), 2);
         assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
@@ -1979,7 +1986,7 @@ mod tests {
         table.add_column(Column::new("name", PgType::Text));
         schema.add_table(table);
 
-        let state = AppState::new(schema, String::new());
+        let state = AppState::new(schema, String::new(), None);
         // Expand and navigate to a column
         let state = state.toggle_expand();
         let state = state.cursor_down(1); // now on "id" column
@@ -2014,7 +2021,7 @@ mod tests {
         schema.add_table(table);
         schema.add_table(Table::new("zzz_posts"));
 
-        let mut state = AppState::new(schema, String::new());
+        let mut state = AppState::new(schema, String::new(), None);
         state.expanded.insert("aaa_users".into());
         state.rebuild_doc();
         // Doc: aaa_users(0) id(1) name(2) close(3) blank(4) zzz_posts(5)
@@ -2046,7 +2053,7 @@ mod tests {
             schema.add_table(Table::new(format!("t{i:02}")));
         }
 
-        let mut state = AppState::new(schema, String::new());
+        let mut state = AppState::new(schema, String::new(), None);
         state.expanded.insert("users".into());
         state.rebuild_doc();
         let state = state.with_viewport_height(20);
@@ -2081,7 +2088,7 @@ mod tests {
         }
         schema.add_table(table);
 
-        let mut state = AppState::new(schema, String::new());
+        let mut state = AppState::new(schema, String::new(), None);
         state.expanded.insert("target".into());
         state.rebuild_doc();
         let state = state.with_viewport_height(12);
@@ -2124,7 +2131,7 @@ mod tests {
         }
         schema.add_table(table);
 
-        let mut state = AppState::new(schema, String::new());
+        let mut state = AppState::new(schema, String::new(), None);
         state.expanded.insert("big".into());
         state.rebuild_doc();
         let state = state.with_viewport_height(10);
@@ -2393,7 +2400,7 @@ mod tests {
         users.add_column(Column::new("email", PgType::Text));
         schema.add_table(users);
 
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(20);
         state.expanded.insert("users".into());
         state.edit_overlay = Some(EditOverlay {
             changes: vec![Change::AlterColumn {
@@ -2429,7 +2436,7 @@ mod tests {
         users.add_column(Column::new("bio", PgType::Text));
         schema.add_table(users);
 
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(20);
         state.expanded.insert("users".into());
         state.edit_overlay = Some(EditOverlay {
             changes: vec![Change::AddColumn {
@@ -2461,7 +2468,7 @@ mod tests {
         users.add_column(Column::new("bio", PgType::Text));
         schema.add_table(users);
 
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(20);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(20);
         state.expanded.insert("users".into());
         state.edit_overlay = Some(EditOverlay {
             changes: vec![Change::AddColumn {

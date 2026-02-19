@@ -6,7 +6,7 @@ use color_eyre::eyre::Result;
 #[command(name = "inara", version, about)]
 struct Cli {
     /// PostgreSQL connection URL (e.g. postgres://user:pass@localhost/dbname).
-    /// Falls back to the DATABASE_URL environment variable.
+    /// Falls back to the DATABASE_URL environment variable, then inara.toml.
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
 }
@@ -18,15 +18,39 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match &cli.database_url {
-        Some(url) => {
+    // Discover and load inara.toml config
+    let loaded = inara::config::find_and_load();
+
+    // Resolve database URL: CLI/env > config file
+    let database_url = cli.database_url.or_else(|| {
+        loaded
+            .as_ref()
+            .and_then(|l| inara::config::resolve_database_url(&l.config))
+            .map(String::from)
+    });
+
+    // Resolve migrations directory
+    let migrations_dir = inara::config::resolve_migrations_dir(
+        loaded.as_ref().map(|l| &l.config),
+        loaded.as_ref().map(|l| l.config_dir.as_path()),
+    );
+
+    // Collect type overrides from config
+    let config_overrides = loaded
+        .as_ref()
+        .map(|l| l.config.types.overrides.clone())
+        .unwrap_or_default();
+
+    match database_url {
+        Some(ref url) => {
             let display_url = mask_password(url);
-            inara::tui::run(url, display_url).await?;
+            inara::tui::run(url, display_url, migrations_dir, config_overrides).await?;
         }
         None => {
             eprintln!(
                 "No database URL provided.\n\n\
-                 Use --database-url <URL> or set the DATABASE_URL environment variable.\n\n\
+                 Use --database-url <URL>, set the DATABASE_URL environment variable,\n\
+                 or add database_url to inara.toml.\n\n\
                  Example:\n  \
                  inara --database-url postgres://user:pass@localhost/mydb\n  \
                  DATABASE_URL=postgres://... inara"

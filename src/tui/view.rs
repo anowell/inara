@@ -683,12 +683,12 @@ mod tests {
             columns: vec!["email".into()],
         });
         schema.add_table(table);
-        AppState::new(schema, String::new())
+        AppState::new(schema, String::new(), None)
     }
 
     #[test]
     fn empty_schema_shows_placeholder() {
-        let state = AppState::new(Schema::new(), String::new()).with_viewport_height(10);
+        let state = AppState::new(Schema::new(), String::new(), None).with_viewport_height(10);
         let lines = render_document(&state);
         assert_eq!(lines.len(), 1);
         assert_eq!(spans_to_string(&lines[0]), "No schema elements found.");
@@ -754,7 +754,7 @@ mod tests {
             name: "mood".into(),
             variants: vec!["happy".into(), "sad".into()],
         });
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand(); // expand the enum
         let lines = render_document(&state);
@@ -797,7 +797,7 @@ mod tests {
         });
         schema.add_table(posts);
 
-        let mut state = AppState::new(schema, String::new()).with_viewport_height(30);
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(30);
         state = state.toggle_expand();
         let lines = render_document(&state);
 
@@ -831,7 +831,7 @@ mod tests {
                 constraints: vec!["CHECK (VALUE ~ '^.+@.+$')".into()],
             },
         });
-        let state = AppState::new(schema, String::new()).with_viewport_height(10);
+        let state = AppState::new(schema, String::new(), None).with_viewport_height(10);
         let lines = render_document(&state);
         assert_eq!(lines.len(), 1);
         let text = spans_to_string(&lines[0]);
@@ -852,7 +852,7 @@ mod tests {
                 ],
             },
         });
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(10)
             .toggle_expand(); // expand the composite type
         let lines = render_document(&state);
@@ -875,7 +875,7 @@ mod tests {
             schema.add_table(Table::new(name));
         }
         // 5 collapsed tables = 5 lines, viewport only shows 3
-        let state = AppState::new(schema, String::new()).with_viewport_height(3);
+        let state = AppState::new(schema, String::new(), None).with_viewport_height(3);
         let lines = render_document(&state);
         assert_eq!(lines.len(), 3);
     }
@@ -884,7 +884,7 @@ mod tests {
     fn empty_table_expanded_renders_single_line() {
         let mut schema = Schema::new();
         schema.add_table(Table::new("empty"));
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(10)
             .toggle_expand();
         let lines = render_document(&state);
@@ -967,7 +967,7 @@ mod tests {
             jiff: false,
         });
 
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_type_mapper(mapper)
             .with_viewport_height(20)
             .toggle_expand()
@@ -993,7 +993,7 @@ mod tests {
                 ],
             },
         });
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand() // expand the composite type
             .toggle_rust_types();
@@ -1026,7 +1026,7 @@ mod tests {
         });
         schema.add_table(table);
 
-        let state = AppState::new(schema, String::new())
+        let state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand()
             .toggle_rust_types();
@@ -1095,7 +1095,7 @@ mod tests {
             unparseable: Vec::new(),
         };
 
-        AppState::new(schema, String::new())
+        AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .with_pending_overlay(Some(overlay))
             .toggle_pending_overlay()
@@ -1211,7 +1211,7 @@ mod tests {
             name: "mood".into(),
             variants: vec!["happy".into(), "sad".into()],
         });
-        let state = AppState::new(schema, String::new()).with_viewport_height(10);
+        let state = AppState::new(schema, String::new(), None).with_viewport_height(10);
         let text = line_plain_text(&state, &FocusTarget::Enum("mood".into()));
         assert!(text.contains("enum"), "should contain 'enum' keyword");
         assert!(text.contains("mood"), "should contain enum name");

@@ -3,6 +3,9 @@
 // These tests exercise the full workflow without requiring a database:
 // mutate a table in-memory → trigger :w → verify generated SQL file content.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 use inara::migration::overlay::PendingOverlay;
@@ -12,6 +15,18 @@ use inara::schema::{Column, Constraint, Schema, Table};
 use inara::tui::app::{AppState, FocusTarget, Mode};
 use inara::tui::edit;
 use inara::tui::view;
+
+static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn test_migrations_dir() -> PathBuf {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir()
+        .join(format!("inara-workflow-test-{}-{}", std::process::id(), id))
+        .join("migrations");
+    std::fs::create_dir_all(&dir).expect("create test migrations dir");
+    std::fs::write(dir.join("000_init.up.sql"), "-- init").expect("write dummy sql");
+    dir
+}
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -122,7 +137,9 @@ fn add_column_to_table(state: AppState, col: Column) -> AppState {
 
 #[test]
 fn edit_table_add_column_then_write_migration() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state =
+        AppState::new(test_schema(), "test".into(), Some(mig_dir.clone())).with_viewport_height(40);
     let state = navigate_to_users(state);
     assert_on_table(&state, "users");
 
@@ -161,15 +178,17 @@ fn edit_table_add_column_then_write_migration() {
     assert!(msg.starts_with("Migration written:"));
     assert!(msg.contains("add_bio_to_users"));
 
-    // Cleanup migration file
-    let _ = std::fs::remove_dir_all("migrations");
+    // Cleanup
+    let _ = std::fs::remove_dir_all(mig_dir.parent().unwrap());
 }
 
 // ── Test: rename column → :w → verify ALTER RENAME (not drop+add) ──
 
 #[test]
 fn rename_column_then_write_migration() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state =
+        AppState::new(test_schema(), "test".into(), Some(mig_dir.clone())).with_viewport_height(40);
     let state = navigate_to_users(state);
     assert_on_table(&state, "users");
 
@@ -224,14 +243,16 @@ fn rename_column_then_write_migration() {
     assert!(state.renames.is_empty());
 
     // Cleanup
-    let _ = std::fs::remove_dir_all("migrations");
+    let _ = std::fs::remove_dir_all(mig_dir.parent().unwrap());
 }
 
 // ── Test: multiple table edits → single migration ──────────────────
 
 #[test]
 fn multiple_table_edits_single_migration() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state =
+        AppState::new(test_schema(), "test".into(), Some(mig_dir.clone())).with_viewport_height(40);
 
     // Edit posts (first in BTreeMap order): add "author_id" column
     assert_on_table(&state, "posts");
@@ -269,14 +290,15 @@ fn multiple_table_edits_single_migration() {
     assert!(msg.starts_with("Migration written:"));
 
     // Cleanup
-    let _ = std::fs::remove_dir_all("migrations");
+    let _ = std::fs::remove_dir_all(mig_dir.parent().unwrap());
 }
 
 // ── Test: :w with no edits shows message ───────────────────────────
 
 #[test]
 fn write_with_no_edits_shows_message() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state = AppState::new(test_schema(), "test".into(), Some(mig_dir)).with_viewport_height(40);
 
     let state = dispatch(state, key(KeyCode::Char(':')));
     let state = type_string(state, "w");
@@ -293,7 +315,8 @@ fn write_with_no_edits_shows_message() {
 
 #[test]
 fn cancel_preview_preserves_edit_state() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state = AppState::new(test_schema(), "test".into(), Some(mig_dir)).with_viewport_height(40);
     let state = navigate_to_users(state);
 
     // Make an edit
@@ -325,7 +348,8 @@ fn cancel_preview_preserves_edit_state() {
 
 #[test]
 fn auto_generated_description_for_write() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state = AppState::new(test_schema(), "test".into(), Some(mig_dir)).with_viewport_height(40);
     let state = navigate_to_users(state);
 
     let state = add_column_to_table(state, Column::new("avatar", PgType::Text));
@@ -352,7 +376,9 @@ fn auto_generated_description_for_write() {
 
 #[test]
 fn second_write_after_confirm_shows_no_changes() {
-    let state = AppState::new(test_schema(), "test".into()).with_viewport_height(40);
+    let mig_dir = test_migrations_dir();
+    let state =
+        AppState::new(test_schema(), "test".into(), Some(mig_dir.clone())).with_viewport_height(40);
     let state = navigate_to_users(state);
 
     let state = add_column_to_table(state, Column::new("tmp", PgType::Text));
@@ -377,7 +403,7 @@ fn second_write_after_confirm_shows_no_changes() {
     );
 
     // Cleanup
-    let _ = std::fs::remove_dir_all("migrations");
+    let _ = std::fs::remove_dir_all(mig_dir.parent().unwrap());
 }
 
 // ── Pending overlay integration tests ─────────────────────────────
@@ -404,7 +430,7 @@ fn overlay_shows_added_table_marker() {
         unparseable: Vec::new(),
     };
 
-    let state = AppState::new(schema, "test".into())
+    let state = AppState::new(schema, "test".into(), None)
         .with_viewport_height(20)
         .with_pending_overlay(Some(overlay))
         .toggle_pending_overlay();
@@ -437,7 +463,7 @@ fn overlay_shows_modified_table_marker_with_columns() {
         unparseable: Vec::new(),
     };
 
-    let state = AppState::new(schema, "test".into())
+    let state = AppState::new(schema, "test".into(), None)
         .with_viewport_height(20)
         .toggle_expand() // expand users
         .with_pending_overlay(Some(overlay))
@@ -462,7 +488,7 @@ fn overlay_empty_shows_no_markers() {
         unparseable: Vec::new(),
     };
 
-    let state = AppState::new(schema, "test".into())
+    let state = AppState::new(schema, "test".into(), None)
         .with_viewport_height(20)
         .with_pending_overlay(Some(overlay))
         .toggle_pending_overlay();
@@ -486,7 +512,7 @@ fn overlay_toggle_on_off() {
         unparseable: Vec::new(),
     };
 
-    let state = AppState::new(schema, "test".into())
+    let state = AppState::new(schema, "test".into(), None)
         .with_viewport_height(20)
         .with_pending_overlay(Some(overlay))
         .toggle_pending_overlay();

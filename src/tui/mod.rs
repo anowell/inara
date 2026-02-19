@@ -194,7 +194,12 @@ fn init_file_tracing() {
 ///
 /// This is the main entry point called from `main()`. It connects to the
 /// database, loads the schema, and runs the interactive event loop.
-pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
+pub async fn run(
+    database_url: &str,
+    connection_info: String,
+    migrations_dir: Option<std::path::PathBuf>,
+    config_overrides: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     // Initialize file-based tracing before entering TUI mode
     init_file_tracing();
 
@@ -236,7 +241,11 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
     let cargo_toml_path = std::path::Path::new("Cargo.toml");
     let type_mapper = {
         let mut mapper = crate::schema::type_map::TypeMapper::from_cargo_toml(cargo_toml_path);
-        let overrides = crate::schema::type_map::load_overrides(cargo_toml_path);
+
+        // Merge overrides: Cargo.toml metadata / .inara.toml (legacy), then config file overrides
+        let mut overrides = crate::schema::type_map::load_overrides(cargo_toml_path);
+        // Config file overrides take precedence
+        overrides.extend(config_overrides);
         if !overrides.is_empty() {
             tracing::info!("Loaded {} type override(s)", overrides.len());
             mapper = mapper.with_overrides(overrides);
@@ -251,7 +260,8 @@ pub async fn run(database_url: &str, connection_info: String) -> Result<()> {
         mapper
     };
 
-    let state = AppState::new(schema, connection_info).with_type_mapper(type_mapper);
+    let state =
+        AppState::new(schema, connection_info, migrations_dir).with_type_mapper(type_mapper);
 
     let result = run_event_loop(&mut terminal, state, pool);
 

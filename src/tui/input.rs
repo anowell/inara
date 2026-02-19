@@ -192,7 +192,13 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             HandleResult::state_only(state.toggle_rust_types())
         }
-        KeyCode::Char('c') => HandleResult::state_only(state.with_mode(Mode::ChangeMenu)),
+        KeyCode::Char('c') => {
+            if state.migrations_dir.is_none() {
+                HandleResult::state_only(state.with_status("No migrations directory found"))
+            } else {
+                HandleResult::state_only(state.with_mode(Mode::ChangeMenu))
+            }
+        }
         KeyCode::Char('q') => {
             let (state, handle) = open_hud(state, pool);
             HandleResult::with_hud(state, handle)
@@ -371,6 +377,11 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
 
     // :w or :w <description>
     if cmd == "w" || cmd.starts_with("w ") {
+        if state.migrations_dir.is_none() {
+            return HandleResult::state_only(
+                state.with_status("No migrations directory — cannot write migration"),
+            );
+        }
         let description = if cmd.len() > 2 {
             cmd[2..].trim().to_string()
         } else {
@@ -393,6 +404,9 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
 
     // :generate-down
     if cmd == "generate-down" {
+        if state.migrations_dir.is_none() {
+            return HandleResult::state_only(state.with_status("No migrations directory found"));
+        }
         return execute_generate_down(state);
     }
 
@@ -628,13 +642,17 @@ fn execute_generate_down(state: AppState) -> HandleResult {
     }
 
     // Find the most recent .up.sql migration file
-    let migrations_dir = std::path::Path::new("migrations");
+    let migrations_dir = match &state.migrations_dir {
+        Some(dir) => dir.as_path(),
+        None => {
+            return HandleResult::state_only(state.with_status("No migrations directory found"));
+        }
+    };
     let (up_sql, description) = match find_latest_up_migration(migrations_dir) {
         Some(result) => result,
         None => {
-            return HandleResult::state_only(
-                state.with_status("No up migration found in migrations/"),
-            );
+            let msg = format!("No up migration found in {}", migrations_dir.display());
+            return HandleResult::state_only(state.with_status(msg));
         }
     };
 
@@ -895,7 +913,14 @@ fn confirm_llm_preview(state: AppState) -> AppState {
             let header = "-- AI-generated down migration. Review carefully.\n\n";
             let full_sql = format!("{header}{sql}");
 
-            let migrations_dir = std::path::Path::new("migrations");
+            let migrations_dir = match &state.migrations_dir {
+                Some(dir) => dir.as_path(),
+                None => {
+                    return state
+                        .with_mode(Mode::Normal)
+                        .with_status("No migrations directory found");
+                }
+            };
             if let Err(e) = std::fs::create_dir_all(migrations_dir) {
                 return state
                     .with_mode(Mode::Normal)
@@ -991,9 +1016,17 @@ fn toggle_pending_overlay(state: AppState, pool: &PgPool) -> HandleResult {
         return HandleResult::state_only(state.toggle_pending_overlay());
     }
 
+    // Need a migrations directory for overlay computation
+    let migrations_dir = match &state.migrations_dir {
+        Some(dir) => dir.clone(),
+        None => {
+            return HandleResult::state_only(state.with_status("No migrations directory found"));
+        }
+    };
+
     // Turn on the overlay — spawn async computation
     let handle = new_overlay_handle();
-    spawn_overlay_computation(pool.clone(), handle.clone());
+    spawn_overlay_computation(pool.clone(), migrations_dir, handle.clone());
 
     let state = state
         .toggle_pending_overlay()
@@ -1010,13 +1043,16 @@ fn toggle_pending_overlay(state: AppState, pool: &PgPool) -> HandleResult {
 }
 
 /// Spawn async overlay computation in a background task.
-fn spawn_overlay_computation(pool: PgPool, handle: OverlayResultHandle) {
+fn spawn_overlay_computation(
+    pool: PgPool,
+    migrations_dir: std::path::PathBuf,
+    handle: OverlayResultHandle,
+) {
     let handle_clone = handle.clone();
     let result = tokio::runtime::Handle::try_current().map(|rt| {
         rt.spawn(async move {
-            let migrations_dir = std::path::Path::new("migrations");
             let result =
-                crate::migration::overlay::compute_overlay(&pool, migrations_dir, "public").await;
+                crate::migration::overlay::compute_overlay(&pool, &migrations_dir, "public").await;
             let result = result.map_err(|e| e.to_string());
             if let Ok(mut guard) = handle_clone.lock() {
                 *guard = Some(result);
@@ -1295,7 +1331,14 @@ fn confirm_migration(state: AppState) -> AppState {
     // Convert to rough datetime components (no chrono dependency)
     let timestamp = format_timestamp(secs);
 
-    let migrations_dir = std::path::Path::new("migrations");
+    let migrations_dir = match &state.migrations_dir {
+        Some(dir) => dir.as_path(),
+        None => {
+            return state
+                .with_mode(Mode::Normal)
+                .with_status_message("No migrations directory — cannot write migration".into());
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(migrations_dir) {
         return state
             .with_mode(Mode::Normal)
@@ -1410,7 +1453,7 @@ mod tests {
         for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
             schema.add_table(Table::new(name));
         }
-        AppState::new(schema, "test".into()).with_viewport_height(10)
+        AppState::new(schema, "test".into(), None).with_viewport_height(10)
     }
 
     /// Helper to call handle_key without a pool (for tests that don't trigger HUD).
@@ -1520,7 +1563,13 @@ mod tests {
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.toggle_rust_types()
             }
-            KeyCode::Char('c') => state.with_mode(Mode::ChangeMenu),
+            KeyCode::Char('c') => {
+                if state.migrations_dir.is_none() {
+                    state.with_status("No migrations directory found")
+                } else {
+                    state.with_mode(Mode::ChangeMenu)
+                }
+            }
             // In-document search
             KeyCode::Char('/') => {
                 state.enter_in_doc_search(crate::tui::app::SearchDirection::Forward)
@@ -1860,7 +1909,9 @@ mod tests {
 
     #[test]
     fn space_menu_p_toggles_pending_overlay() {
-        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        let state = state.with_mode(Mode::SpaceMenu);
         let state = handle_key_no_pool(state, key(KeyCode::Char('p')));
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.show_pending_overlay);
@@ -1900,7 +1951,7 @@ mod tests {
         posts.add_column(Column::new("title", PgType::Text));
         schema.add_table(posts);
 
-        AppState::new(schema, "test".into())
+        AppState::new(schema, "test".into(), None)
             .with_viewport_height(20)
             .enter_search(SearchFilter::All)
     }
@@ -2083,7 +2134,7 @@ mod tests {
             variants: vec!["admin".into(), "member".into()],
         });
 
-        AppState::new(schema, "test".into()).with_viewport_height(30)
+        AppState::new(schema, "test".into(), None).with_viewport_height(30)
     }
 
     #[test]
@@ -2358,6 +2409,20 @@ mod tests {
 
     // --- Migration workflow (:w command) ---
 
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn test_migrations_dir() -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("inara-input-test-{}-{}", std::process::id(), id))
+            .join("migrations");
+        std::fs::create_dir_all(&dir).expect("create test migrations dir");
+        // Write a dummy .sql file so validation passes
+        std::fs::write(dir.join("000_init.up.sql"), "-- init").expect("write dummy sql");
+        dir
+    }
+
     fn edited_state() -> AppState {
         use crate::schema::types::PgType;
         use crate::schema::Column;
@@ -2367,7 +2432,9 @@ mod tests {
         users.add_column(Column::new("id", PgType::Uuid));
         users.add_column(Column::new("email", PgType::Text));
         schema.add_table(users);
-        let state = AppState::new(schema, "test".into()).with_viewport_height(20);
+        let migrations_dir = test_migrations_dir();
+        let state =
+            AppState::new(schema, "test".into(), Some(migrations_dir)).with_viewport_height(20);
 
         // Directly mutate the schema to add a column (simulating an edit)
         let mut state = state.ensure_original_schema();
@@ -2381,7 +2448,9 @@ mod tests {
 
     #[test]
     fn command_w_without_edits_shows_no_changes() {
-        let state = sample_state().with_mode(Mode::Command);
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        let state = state.with_mode(Mode::Command);
         let state = handle_key_no_pool(state, key(KeyCode::Char('w')));
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
@@ -2460,6 +2529,7 @@ mod tests {
     #[test]
     fn migration_preview_confirm_writes_file_and_clears_edit_state() {
         let state = edited_state();
+        let migrations_dir = state.migrations_dir.clone().unwrap();
         assert!(state.original_schema.is_some());
         assert!(!state.renames.is_empty() || !state.edited_tables.is_empty());
 
@@ -2481,8 +2551,42 @@ mod tests {
         assert!(msg.starts_with("Migration written:"), "got: {msg}");
         assert!(msg.contains("test_migration"));
 
-        // Cleanup: remove the migration file
-        let _ = std::fs::remove_dir_all("migrations");
+        // Cleanup: remove the temp migrations directory
+        let _ = std::fs::remove_dir_all(migrations_dir.parent().unwrap());
+    }
+
+    // --- Guards: no migrations_dir ---
+
+    #[test]
+    fn c_key_blocked_without_migrations_dir() {
+        let state = sample_state(); // migrations_dir = None
+        let state = handle_key_no_pool(state, key(KeyCode::Char('c')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn c_key_opens_change_menu_with_migrations_dir() {
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('c')));
+        assert_eq!(state.mode, Mode::ChangeMenu);
+    }
+
+    #[test]
+    fn command_w_blocked_without_migrations_dir() {
+        let mut state = sample_state().with_mode(Mode::Command);
+        state.command_buf = "w test".to_string();
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("No migrations directory"));
     }
 
     #[test]
@@ -2584,7 +2688,9 @@ mod tests {
     #[test]
     fn command_generate_down_without_api_key_shows_not_configured() {
         std::env::remove_var("OPENAI_API_KEY");
-        let mut state = sample_state().with_mode(Mode::Command);
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        state.mode = Mode::Command;
         state.command_buf = "generate-down".to_string();
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
@@ -2600,17 +2706,14 @@ mod tests {
     }
 
     #[test]
-    fn command_generate_down_without_migrations_shows_error() {
+    fn command_generate_down_without_migrations_dir_shows_error() {
         let mut state = sample_state().with_mode(Mode::Command);
+        // migrations_dir is None
         state.command_buf = "generate-down".to_string();
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
         let msg = state.status_message.as_deref().unwrap_or("");
-        // Should show either "not configured" or "No up migration" depending on env
-        assert!(
-            msg.contains("not configured") || msg.contains("No up migration"),
-            "got: {msg:?}"
-        );
+        assert!(msg.contains("No migrations directory"), "got: {msg:?}");
     }
 
     #[test]
@@ -2690,10 +2793,10 @@ mod tests {
 
     #[test]
     fn llm_preview_confirm_generate_down_writes_file() {
-        let dir = std::env::temp_dir().join("inara_test_llm_down");
-        let _ = std::fs::create_dir_all(&dir);
+        let migrations_dir = test_migrations_dir();
 
         let mut state = sample_state().with_mode(Mode::LlmPreview);
+        state.migrations_dir = Some(migrations_dir.clone());
         state.llm_preview = Some(crate::tui::app::LlmPreviewState {
             sql: "ALTER TABLE users DROP COLUMN bio;".into(),
             kind: crate::tui::app::LlmPreviewKind::GenerateDown {
@@ -2706,11 +2809,13 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
         let msg = state.status_message.as_deref().unwrap_or("");
-        // Should succeed or fail depending on migrations/ dir
         assert!(
             msg.contains("Down migration written") || msg.contains("Failed"),
             "got: {msg}"
         );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(migrations_dir.parent().unwrap());
     }
 
     #[test]
@@ -2781,7 +2886,7 @@ mod tests {
         posts.add_column(Column::new("title", PgType::Text));
         schema.add_table(posts);
 
-        AppState::new(schema, "test".into()).with_viewport_height(20)
+        AppState::new(schema, "test".into(), None).with_viewport_height(20)
     }
 
     #[test]
@@ -3206,7 +3311,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1); // email column
@@ -3232,7 +3337,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1); // email column
@@ -3298,7 +3403,7 @@ mod tests {
         users.add_column(Column::new("bio", PgType::Text));
         schema.add_table(users);
 
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand(); // expand users
 
@@ -3344,7 +3449,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1); // email column
@@ -3382,7 +3487,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3421,7 +3526,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3450,7 +3555,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3475,7 +3580,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new())
+        let mut state = AppState::new(schema, String::new(), None)
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
