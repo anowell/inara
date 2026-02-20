@@ -28,7 +28,8 @@ Inara's navigation is inspired by helix editor. This document defines the keybin
 | `Ctrl-u` | Half-page up |
 | `Ctrl-f` | Full-page down |
 | `Ctrl-b` | Full-page up |
-| `Enter` | Toggle expand/collapse on focused table |
+| `Enter` / `z` | Toggle expand/collapse on focused node |
+| `Z` | Toggle expand/collapse ALL nodes |
 | `Tab` | Next table |
 | `Shift-Tab` | Previous table |
 
@@ -106,6 +107,8 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | `:w!` | Write migration without confirmation |
 | `:w <desc>` | Write migration with description (safety checks) |
 | `:w! <desc>` | Write migration with description (no confirmation) |
+| `:expand-all` | Expand all nodes |
+| `:collapse-all` | Collapse all nodes |
 | `:ai` | LLM edit prompt (optional) |
 | `:generate-down` | Generate down migration via LLM (optional) |
 

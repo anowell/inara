@@ -1208,23 +1208,41 @@ impl AppState {
         self
     }
 
-    /// Toggle expand/collapse for all nodes (tables, enums, types).
-    ///
-    /// If any node is collapsed, expand all. If all are already expanded, collapse all.
-    pub fn toggle_expand_all(mut self) -> Self {
-        let all_names: BTreeSet<String> = self
-            .schema
+    /// Names of all expandable nodes (tables, enums, types).
+    fn all_node_names(&self) -> BTreeSet<String> {
+        self.schema
             .enums
             .keys()
             .chain(self.schema.types.keys())
             .chain(self.schema.tables.keys())
             .cloned()
-            .collect();
+            .collect()
+    }
+
+    /// Toggle expand/collapse for all nodes (tables, enums, types).
+    ///
+    /// If any node is collapsed, expand all. If all are already expanded, collapse all.
+    pub fn toggle_expand_all(mut self) -> Self {
+        let all_names = self.all_node_names();
         if all_names.iter().all(|n| self.expanded.contains(n)) {
             self.expanded.clear();
         } else {
             self.expanded = all_names;
         }
+        self.rebuild_doc();
+        self
+    }
+
+    /// Expand all nodes (tables, enums, types).
+    pub fn expand_all(mut self) -> Self {
+        self.expanded = self.all_node_names();
+        self.rebuild_doc();
+        self
+    }
+
+    /// Collapse all nodes (tables, enums, types).
+    pub fn collapse_all(mut self) -> Self {
+        self.expanded.clear();
         self.rebuild_doc();
         self
     }
@@ -2047,6 +2065,25 @@ mod tests {
         for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
             assert!(state.expanded.contains(name));
         }
+    }
+
+    #[test]
+    fn expand_all_expands_every_node() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+        let state = state.expand_all();
+        assert_eq!(state.expanded.len(), 5);
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(state.expanded.contains(name));
+        }
+    }
+
+    #[test]
+    fn collapse_all_clears_expanded() {
+        let state = sample_state().expand_all();
+        assert_eq!(state.expanded.len(), 5);
+        let state = state.collapse_all();
+        assert!(state.expanded.is_empty());
     }
 
     #[test]

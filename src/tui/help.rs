@@ -47,11 +47,11 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Full-page up",
     },
     Binding {
-        key: "Enter",
+        key: "Enter / z",
         desc: "Toggle expand/collapse",
     },
     Binding {
-        key: "Shift-Enter",
+        key: "Z",
         desc: "Expand/collapse all",
     },
     Binding {

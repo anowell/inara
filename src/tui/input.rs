@@ -176,11 +176,14 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
             HandleResult::state_only(state.jump_forward())
         }
 
-        // Expand/collapse
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            HandleResult::state_only(state.toggle_expand_all())
+        // Granular revert (must precede 'z' expand/collapse)
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            HandleResult::state_only(edit::revert_at_cursor(state))
         }
-        KeyCode::Enter => HandleResult::state_only(state.toggle_expand()),
+
+        // Expand/collapse
+        KeyCode::Enter | KeyCode::Char('z') => HandleResult::state_only(state.toggle_expand()),
+        KeyCode::Char('Z') => HandleResult::state_only(state.toggle_expand_all()),
 
         // Table jumping
         KeyCode::Tab => HandleResult::state_only(state.record_jump().next_table()),
@@ -226,11 +229,6 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
         // Undo / Redo (helix-style)
         KeyCode::Char('u') => HandleResult::state_only(state.undo()),
         KeyCode::Char('U') => HandleResult::state_only(state.redo()),
-
-        // Granular revert
-        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            HandleResult::state_only(edit::revert_at_cursor(state))
-        }
 
         // Change navigation (bracket sequences)
         KeyCode::Char(']') => {
@@ -439,6 +437,14 @@ fn execute_command(state: AppState, pool: &PgPool) -> HandleResult {
         state.undo_history.clear();
         state.rebuild_doc();
         return HandleResult::state_only(state.with_status("Schema reset to original"));
+    }
+
+    // :expand-all / :collapse-all
+    if cmd == "expand-all" {
+        return HandleResult::state_only(state.expand_all());
+    }
+    if cmd == "collapse-all" {
+        return HandleResult::state_only(state.collapse_all());
     }
 
     HandleResult::state_only(state) // Unknown command, ignore
@@ -1563,7 +1569,8 @@ mod tests {
             KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 edit::revert_at_cursor(state)
             }
-            KeyCode::Enter => state.toggle_expand(),
+            KeyCode::Enter | KeyCode::Char('z') => state.toggle_expand(),
+            KeyCode::Char('Z') => state.toggle_expand_all(),
             KeyCode::Tab => state.record_jump().next_table(),
             KeyCode::BackTab => state.record_jump().prev_table(),
             KeyCode::Char(':') => state.with_mode(Mode::Command),
@@ -3693,5 +3700,83 @@ mod tests {
             state.status_message.as_deref(),
             Some("Already at newest change")
         );
+    }
+
+    // --- z / Z expand/collapse keybindings ---
+
+    #[test]
+    fn z_toggles_expand_single() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('z')));
+        assert!(
+            state.expanded.contains("alpha"),
+            "z should toggle expand on the focused node"
+        );
+    }
+
+    #[test]
+    fn shift_z_expands_all_when_none_expanded() {
+        let state = sample_state();
+        assert!(state.expanded.is_empty());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('Z')));
+        assert_eq!(state.expanded.len(), 5);
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(state.expanded.contains(name));
+        }
+    }
+
+    #[test]
+    fn shift_z_collapses_all_when_all_expanded() {
+        let state = sample_state();
+        let state = handle_key_no_pool(state, key(KeyCode::Char('Z')));
+        assert_eq!(state.expanded.len(), 5);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('Z')));
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
+    fn shift_z_expands_all_when_partially_expanded() {
+        let state = sample_state();
+        // Expand just one via z
+        let state = handle_key_no_pool(state, key(KeyCode::Char('z')));
+        assert_eq!(state.expanded.len(), 1);
+        // Z should expand the rest
+        let state = handle_key_no_pool(state, key(KeyCode::Char('Z')));
+        assert_eq!(state.expanded.len(), 5);
+    }
+
+    // --- :expand-all / :collapse-all commands ---
+
+    #[test]
+    fn command_expand_all() {
+        let state = sample_state().with_mode(Mode::Command);
+        // Type "expand-all"
+        let state = "expand-all"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(state.expanded.len(), 5);
+    }
+
+    #[test]
+    fn command_collapse_all() {
+        let state = sample_state().with_mode(Mode::Command);
+        // First expand all via command
+        let state = "expand-all"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.expanded.len(), 5);
+
+        // Now collapse all
+        let state = state.with_mode(Mode::Command);
+        let state = "collapse-all"
+            .chars()
+            .fold(state, |s, ch| handle_key_no_pool(s, key(KeyCode::Char(ch))));
+        let state = handle_key_no_pool(state, key(KeyCode::Enter));
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.expanded.is_empty());
     }
 }
