@@ -938,43 +938,46 @@ fn confirm_llm_preview(state: AppState) -> AppState {
                     .with_status(format!("Failed to create migrations directory: {e}"));
             }
 
-            // Generate timestamp
+            // Use the detected pattern for down-migration naming
+            let pattern = &state.migration_pattern;
             let now = std::time::SystemTime::now();
             let duration = now
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            let timestamp = format_timestamp(duration.as_secs());
+            let secs = duration.as_secs();
 
-            let slug = slugify(&description);
-            let filename = format!("{timestamp}_{slug}.down.sql");
-            let path = migrations_dir.join(&filename);
+            let existing_names: Vec<String> = state
+                .migration_index
+                .migrations
+                .iter()
+                .map(|m| m.timestamp.clone())
+                .collect();
+            let existing_refs: Vec<&str> = existing_names.iter().map(|s| s.as_str()).collect();
+            let prefix_value = pattern.next_prefix(&existing_refs, secs);
+
+            let path = pattern.generate_down_path(migrations_dir, &description, &prefix_value);
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return state
+                        .with_mode(Mode::Normal)
+                        .with_status(format!("Failed to create migrations directory: {e}"));
+                }
+            }
+            let display = path
+                .strip_prefix(migrations_dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
             match std::fs::write(&path, &full_sql) {
                 Ok(()) => state
                     .with_mode(Mode::Normal)
-                    .with_status(format!("Down migration written: {filename}")),
+                    .with_status(format!("Down migration written: {display}")),
                 Err(e) => state
                     .with_mode(Mode::Normal)
                     .with_status(format!("Failed to write down migration: {e}")),
             }
         }
     }
-}
-
-/// Convert a description to a filename-safe slug (same logic as migration::slugify).
-fn slugify(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
 }
 
 /// Handle key events in SpaceMenu mode.
@@ -1333,15 +1336,6 @@ fn confirm_migration(state: AppState) -> AppState {
     let sql = preview.sql.clone();
     let description = preview.description.clone();
 
-    // Generate timestamp: YYYYMMDDHHMMSS
-    let now = std::time::SystemTime::now();
-    let duration = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    // Convert to rough datetime components (no chrono dependency)
-    let timestamp = format_timestamp(secs);
-
     let migrations_dir = match &state.migrations_dir {
         Some(dir) => dir.as_path(),
         None => {
@@ -1356,51 +1350,40 @@ fn confirm_migration(state: AppState) -> AppState {
             .with_status_message(format!("Failed to create migrations directory: {e}"));
     }
 
-    match crate::migration::write_migration(migrations_dir, &description, &sql, &timestamp) {
+    // Use the detected pattern for prefix generation and file writing
+    let pattern = &state.migration_pattern;
+    let now = std::time::SystemTime::now();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+
+    // Collect existing prefixes for sequential/versioned patterns
+    let existing_names: Vec<String> = state
+        .migration_index
+        .migrations
+        .iter()
+        .map(|m| m.timestamp.clone())
+        .collect();
+    let existing_refs: Vec<&str> = existing_names.iter().map(|s| s.as_str()).collect();
+    let prefix_value = pattern.next_prefix(&existing_refs, secs);
+
+    match pattern.write_migration(migrations_dir, &description, &sql, &prefix_value) {
         Ok(path) => {
-            let filename = path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let display = path
+                .strip_prefix(migrations_dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
             state
                 .clear_edit_state()
                 .with_mode(Mode::Normal)
-                .with_status_message(format!("Migration written: {filename}"))
+                .with_status_message(format!("Migration written: {display}"))
         }
         Err(e) => state
             .with_mode(Mode::Normal)
             .with_status_message(format!("Failed to write migration: {e}")),
     }
-}
-
-/// Format a unix timestamp as YYYYMMDDHHMMSS.
-fn format_timestamp(secs: u64) -> String {
-    // Days since epoch
-    let days = secs / 86400;
-    let day_secs = secs % 86400;
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    // Convert days to y/m/d using a civil calendar algorithm
-    let (year, month, day) = days_to_civil(days as i64);
-    format!("{year:04}{month:02}{day:02}{hours:02}{minutes:02}{seconds:02}")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-/// Algorithm from Howard Hinnant's chrono-compatible date algorithms.
-fn days_to_civil(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 /// Handle 'y' key in HUD mode to confirm a safety warning and run the query.
@@ -2605,17 +2588,6 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_format() {
-        // Test known epoch values
-        assert_eq!(format_timestamp(0), "19700101000000");
-        // 2026-02-14 12:00:00 UTC
-        let ts = 1771070400;
-        let result = format_timestamp(ts);
-        assert!(result.starts_with("2026"), "got: {result}");
-        assert_eq!(result.len(), 14);
-    }
-
-    #[test]
     fn auto_describe_single_change() {
         let changes = vec![diff::Change::AddColumn {
             table: "users".into(),
@@ -2831,13 +2803,6 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(migrations_dir.parent().unwrap());
-    }
-
-    #[test]
-    fn slugify_works() {
-        assert_eq!(slugify("add bio to users"), "add_bio_to_users");
-        assert_eq!(slugify("Add FK: posts→users"), "add_fk_posts_users");
-        assert_eq!(slugify("  multiple   spaces  "), "multiple_spaces");
     }
 
     #[test]

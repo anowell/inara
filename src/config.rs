@@ -221,19 +221,14 @@ fn find_migrations_in_tree(root: &Path) -> Option<PathBuf> {
 }
 
 /// Validate that a directory exists and contains at least one `.sql` file.
+///
+/// Checks both direct children and one level of subdirectories to support
+/// frameworks that use subdirectory layouts (Diesel, Prisma, Hasura).
 fn validate_migrations_dir(path: &Path) -> Option<PathBuf> {
     if !path.is_dir() {
         return None;
     }
-    let has_sql = std::fs::read_dir(path)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "sql")
-                .unwrap_or(false)
-        });
+    let has_sql = !crate::migration::pattern::discover_sql_files(path).is_empty();
     if has_sql {
         Some(path.to_path_buf())
     } else {

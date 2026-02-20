@@ -2,6 +2,7 @@
 
 pub mod loader;
 pub mod overlay;
+pub mod pattern;
 pub mod warnings;
 
 use std::fmt::Write;
@@ -40,6 +41,9 @@ pub fn generate_sql(changes: &[Change]) -> String {
 ///
 /// Returns the path to the created file. The `timestamp` parameter allows
 /// tests to inject a fixed value for determinism.
+///
+/// This uses the default sqlx naming convention. For pattern-aware writing,
+/// use [`pattern::MigrationPattern::write_migration`].
 pub fn write_migration(
     dir: &Path,
     description: &str,

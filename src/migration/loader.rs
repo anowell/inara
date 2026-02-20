@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::pattern::{self, MigrationPattern};
+
 /// A reference to a single migration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationRef {
@@ -107,6 +109,140 @@ pub fn scan_migrations(dir: &Path) -> Result<Vec<MigrationFile>, std::io::Error>
     }
 
     // Sort by timestamp ascending
+    migrations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(migrations)
+}
+
+/// Scan a directory for migration files using a detected pattern.
+///
+/// Handles all layout types: flat files, flat up/down files, subdirectory
+/// layouts with up.sql/down.sql or named SQL files.
+/// Returns migration files sorted by prefix (ascending).
+pub fn scan_migrations_with_pattern(
+    dir: &Path,
+    pat: &MigrationPattern,
+) -> Result<Vec<MigrationFile>, std::io::Error> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut migrations = Vec::new();
+
+    match &pat.layout {
+        pattern::Layout::Flat | pattern::Layout::FlatUpDown => {
+            // Flat layouts: files directly in the migrations directory
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+
+                let filename = match path.file_name().and_then(|f| f.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
+
+                // Determine the name stem by stripping the extension
+                let stem = match &pat.layout {
+                    pattern::Layout::FlatUpDown => {
+                        if !filename.ends_with(".up.sql") {
+                            continue;
+                        }
+                        filename.strip_suffix(".up.sql").unwrap_or(&filename)
+                    }
+                    pattern::Layout::Flat => {
+                        if !filename.ends_with(".sql") || filename.ends_with(".down.sql") {
+                            continue;
+                        }
+                        filename.strip_suffix(".sql").unwrap_or(&filename)
+                    }
+                    _ => unreachable!(),
+                };
+
+                let (timestamp, description) = match pat.parse_name(stem) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+
+                let sql = std::fs::read_to_string(&path)?;
+                migrations.push(MigrationFile {
+                    timestamp,
+                    description,
+                    path,
+                    sql,
+                });
+            }
+        }
+        pattern::Layout::SubdirUpDown => {
+            // Subdirectory layout: each migration is a directory containing up.sql
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let dir_name = match path.file_name().and_then(|f| f.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
+
+                let up_path = path.join("up.sql");
+                if !up_path.is_file() {
+                    continue;
+                }
+
+                let (timestamp, description) = match pat.parse_name(&dir_name) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+
+                let sql = std::fs::read_to_string(&up_path)?;
+                migrations.push(MigrationFile {
+                    timestamp,
+                    description,
+                    path: up_path,
+                    sql,
+                });
+            }
+        }
+        pattern::Layout::SubdirSingleFile(sql_filename) => {
+            // Subdirectory layout: each migration is a directory containing a named SQL file
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let dir_name = match path.file_name().and_then(|f| f.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
+
+                let sql_path = path.join(sql_filename);
+                if !sql_path.is_file() {
+                    continue;
+                }
+
+                let (timestamp, description) = match pat.parse_name(&dir_name) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+
+                let sql = std::fs::read_to_string(&sql_path)?;
+                migrations.push(MigrationFile {
+                    timestamp,
+                    description,
+                    path: sql_path,
+                    sql,
+                });
+            }
+        }
+    }
+
+    // Sort by timestamp/prefix ascending
     migrations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(migrations)
 }
@@ -380,6 +516,15 @@ pub fn build_index(migrations: &[MigrationFile]) -> MigrationIndex {
 /// This is the main entry point — combines scanning and indexing.
 pub fn load_and_index(dir: &Path) -> Result<MigrationIndex, std::io::Error> {
     let migrations = scan_migrations(dir)?;
+    Ok(build_index(&migrations))
+}
+
+/// Load migrations using a detected pattern and build the index.
+pub fn load_and_index_with_pattern(
+    dir: &Path,
+    pat: &MigrationPattern,
+) -> Result<MigrationIndex, std::io::Error> {
+    let migrations = scan_migrations_with_pattern(dir, pat)?;
     Ok(build_index(&migrations))
 }
 

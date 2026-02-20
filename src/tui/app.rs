@@ -8,6 +8,7 @@ use super::goto::{GotoFocus, GotoTarget};
 use super::hud::{HudState, HudStatus};
 use crate::migration::loader::MigrationIndex;
 use crate::migration::overlay::{EditOverlay, PendingOverlay};
+use crate::migration::pattern::MigrationPattern;
 use crate::schema::relations::RelationMap;
 use crate::schema::type_map::TypeMapper;
 use crate::schema::Schema;
@@ -473,6 +474,8 @@ pub struct AppState {
     pub show_edit_changes: bool,
     /// Resolved migrations directory (None if not found or no .sql files).
     pub migrations_dir: Option<std::path::PathBuf>,
+    /// Detected migration naming pattern for conforming filename generation.
+    pub migration_pattern: MigrationPattern,
     /// Undo/redo history for schema editing actions.
     pub undo_history: UndoHistory,
 }
@@ -487,6 +490,10 @@ impl AppState {
         let expanded = BTreeSet::new();
         let doc = build_document(&schema, &expanded);
         let relation_map = RelationMap::build(&schema);
+        let migration_pattern = migrations_dir
+            .as_deref()
+            .map(crate::migration::pattern::detect_pattern)
+            .unwrap_or_default();
         Self {
             schema,
             original_schema: None,
@@ -526,6 +533,7 @@ impl AppState {
             edit_overlay: None,
             show_edit_changes: true,
             migrations_dir,
+            migration_pattern,
             undo_history: UndoHistory::new(),
         }
     }
