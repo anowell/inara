@@ -483,7 +483,9 @@ fn draw(frame: &mut Frame, state: &AppState) {
 
     // Render overlays on top of the content area
     match state.mode {
-        Mode::SpaceMenu => fuzzy::render_space_menu(frame, layout[1]),
+        Mode::SpaceMenu => {
+            fuzzy::render_space_menu(frame, layout[1], state.migrations_dir.is_none())
+        }
         Mode::GotoMenu => fuzzy::render_goto_menu(frame, layout[1], state),
         Mode::ChangeMenu => fuzzy::render_change_menu(frame, layout[1], state),
         Mode::Search => {
@@ -505,7 +507,12 @@ fn draw(frame: &mut Frame, state: &AppState) {
             }
         }
         Mode::Help => {
-            help::render_help(frame, layout[1], state.help_source_mode);
+            help::render_help(
+                frame,
+                layout[1],
+                state.help_source_mode,
+                state.migrations_dir.is_none(),
+            );
         }
         Mode::ChangePreview => {
             if let Some(ref preview) = state.change_preview {
@@ -1037,12 +1044,24 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
         }
     }
 
-    // Right-aligned table count
+    // Right-aligned indicators
     let table_count = state.schema.tables.len();
     let right_info = format!("{table_count} tables ");
+    let read_only_label = if state.migrations_dir.is_none() {
+        "[read-only] "
+    } else {
+        ""
+    };
     let left_width: usize = spans.iter().map(|s| s.width()).sum();
-    let padding = (area.width as usize).saturating_sub(left_width + right_info.len());
+    let padding =
+        (area.width as usize).saturating_sub(left_width + read_only_label.len() + right_info.len());
     spans.push(Span::raw(" ".repeat(padding)));
+    if state.migrations_dir.is_none() {
+        spans.push(Span::styled(
+            read_only_label,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     spans.push(Span::styled(
         right_info,
         Style::default().fg(Color::DarkGray),

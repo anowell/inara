@@ -302,12 +302,20 @@ pub const SPACE_MENU_ITEMS: &[(&str, &str)] = &[
     ("c", "Find column"),
     ("m", "Find migration"),
     ("p", "Pending migrations"),
+    ("g", "Toggle edit markers"),
+    ("d", "Change preview"),
     ("?", "Help"),
 ];
 
+/// Keys that require a migrations directory to function.
+const MIGRATION_DEPENDENT_KEYS: &[&str] = &["m", "p", "g", "d"];
+
 /// Render the space menu overlay.
-pub fn render_space_menu(frame: &mut Frame, area: Rect) {
-    let menu_width: u16 = 26;
+///
+/// When `read_only` is true (no migrations directory), migration-dependent
+/// items are shown dimmed with an "(unavailable)" suffix.
+pub fn render_space_menu(frame: &mut Frame, area: Rect, read_only: bool) {
+    let menu_width: u16 = if read_only { 40 } else { 26 };
     let menu_height: u16 = SPACE_MENU_ITEMS.len() as u16 + 2; // borders
 
     // Center horizontally, place near top
@@ -326,15 +334,26 @@ pub fn render_space_menu(frame: &mut Frame, area: Rect) {
     let lines: Vec<Line<'static>> = SPACE_MENU_ITEMS
         .iter()
         .map(|(key, label)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("  {key}"),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
-            ])
+            let unavailable = read_only && MIGRATION_DEPENDENT_KEYS.contains(key);
+            if unavailable {
+                Line::from(vec![
+                    Span::styled(format!("  {key}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {label} (unavailable)"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {key}"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
+                ])
+            }
         })
         .collect();
 
@@ -867,5 +886,39 @@ mod tests {
         assert!(keys.contains(&"u"));
         assert!(keys.contains(&"i"));
         assert!(keys.contains(&"d"));
+    }
+
+    #[test]
+    fn migration_dependent_keys_are_in_space_menu() {
+        let menu_keys: Vec<&str> = SPACE_MENU_ITEMS.iter().map(|(k, _)| *k).collect();
+        for dep_key in MIGRATION_DEPENDENT_KEYS {
+            assert!(
+                menu_keys.contains(dep_key),
+                "Migration-dependent key '{dep_key}' should exist in SPACE_MENU_ITEMS"
+            );
+        }
+    }
+
+    #[test]
+    fn render_space_menu_no_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Normal mode (read_only = false)
+        terminal
+            .draw(|frame| {
+                render_space_menu(frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // Read-only mode (read_only = true)
+        terminal
+            .draw(|frame| {
+                render_space_menu(frame, frame.area(), true);
+            })
+            .unwrap();
     }
 }

@@ -436,8 +436,9 @@ fn bindings_for_mode(mode: Mode) -> &'static [Binding] {
 /// Render the help overlay centered in the given area.
 ///
 /// Shows keybindings for `source_mode` — the mode the user was in before
-/// pressing `?`.
-pub fn render_help(frame: &mut Frame, area: Rect, source_mode: Mode) {
+/// pressing `?`. When `read_only` is true, adds a footer explaining that
+/// migration hotkeys are disabled.
+pub fn render_help(frame: &mut Frame, area: Rect, source_mode: Mode, read_only: bool) {
     let bindings = bindings_for_mode(source_mode);
 
     let title = format!(" Help — {} ", source_mode);
@@ -457,6 +458,15 @@ pub fn render_help(frame: &mut Frame, area: Rect, source_mode: Mode) {
             ])
         })
         .collect();
+
+    // Read-only footer
+    if read_only {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Migration hotkeys disabled — no migrations directory discovered",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     // Footer
     lines.push(Line::from(""));
@@ -576,5 +586,30 @@ mod tests {
             goto.unwrap().desc.contains("Goto"),
             "g should be described as Goto"
         );
+    }
+
+    #[test]
+    fn render_help_accepts_read_only_flag() {
+        // Verify that render_help compiles and runs with both read_only values.
+        // We can't easily inspect rendered output, but we can verify no panic.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_help(frame, area, Mode::Normal, false);
+            })
+            .unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_help(frame, area, Mode::Normal, true);
+            })
+            .unwrap();
     }
 }

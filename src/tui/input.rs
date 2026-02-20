@@ -244,10 +244,14 @@ fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult 
 
         // External editor
         KeyCode::Char('e') => {
-            let (state, request) = edit::prepare_editor_request(state);
-            match request {
-                Some(req) => HandleResult::with_editor(state, req),
-                None => HandleResult::state_only(state),
+            if state.migrations_dir.is_none() {
+                HandleResult::state_only(state.with_status("No migrations directory found"))
+            } else {
+                let (state, request) = edit::prepare_editor_request(state);
+                match request {
+                    Some(req) => HandleResult::with_editor(state, req),
+                    None => HandleResult::state_only(state),
+                }
             }
         }
 
@@ -995,21 +999,47 @@ fn handle_space_menu(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleRes
         KeyCode::Char('t') => HandleResult::state_only(state.enter_search(SearchFilter::Tables)),
         KeyCode::Char('c') => HandleResult::state_only(state.enter_search(SearchFilter::Columns)),
         KeyCode::Char('m') => {
-            HandleResult::state_only(state.enter_search(SearchFilter::Migrations))
+            if state.migrations_dir.is_none() {
+                HandleResult::state_only(
+                    state
+                        .with_mode(Mode::Normal)
+                        .with_status("No migrations directory found"),
+                )
+            } else {
+                HandleResult::state_only(state.enter_search(SearchFilter::Migrations))
+            }
         }
         KeyCode::Char('p') => toggle_pending_overlay(state, pool),
         KeyCode::Char('g') => {
-            let mut state = state.with_mode(Mode::Normal);
-            state.show_edit_changes = !state.show_edit_changes;
-            state.rebuild_doc();
-            let label = if state.show_edit_changes {
-                "Edit markers shown"
+            if state.migrations_dir.is_none() {
+                HandleResult::state_only(
+                    state
+                        .with_mode(Mode::Normal)
+                        .with_status("No migrations directory found"),
+                )
             } else {
-                "Edit markers hidden"
-            };
-            HandleResult::state_only(state.with_status(label))
+                let mut state = state.with_mode(Mode::Normal);
+                state.show_edit_changes = !state.show_edit_changes;
+                state.rebuild_doc();
+                let label = if state.show_edit_changes {
+                    "Edit markers shown"
+                } else {
+                    "Edit markers hidden"
+                };
+                HandleResult::state_only(state.with_status(label))
+            }
         }
-        KeyCode::Char('d') => open_change_preview(state),
+        KeyCode::Char('d') => {
+            if state.migrations_dir.is_none() {
+                HandleResult::state_only(
+                    state
+                        .with_mode(Mode::Normal)
+                        .with_status("No migrations directory found"),
+                )
+            } else {
+                open_change_preview(state)
+            }
+        }
         KeyCode::Char('?') => {
             let mut state = state;
             state.help_source_mode = Mode::Normal;
@@ -1586,8 +1616,14 @@ mod tests {
             // Search match navigation
             KeyCode::Char('n') => state.next_search_match(),
             KeyCode::Char('N') => state.prev_search_match(),
-            // 'e' produces an editor request — in tests we just prepare the request and ignore it
-            KeyCode::Char('e') => edit::prepare_editor_request(state).0,
+            // 'e' produces an editor request — guarded on migrations_dir
+            KeyCode::Char('e') => {
+                if state.migrations_dir.is_none() {
+                    state.with_status("No migrations directory found")
+                } else {
+                    edit::prepare_editor_request(state).0
+                }
+            }
             // Change navigation (bracket sequences)
             KeyCode::Char(']') => state.with_pending_key(PendingKey::CloseBracket),
             KeyCode::Char('[') => state.with_pending_key(PendingKey::OpenBracket),
@@ -1904,7 +1940,9 @@ mod tests {
 
     #[test]
     fn space_menu_m_enters_search_migrations() {
-        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        let state = state.with_mode(Mode::SpaceMenu);
         let state = handle_key_no_pool(state, key(KeyCode::Char('m')));
         assert_eq!(state.mode, Mode::Search);
         assert_eq!(
@@ -3359,7 +3397,8 @@ mod tests {
 
     #[test]
     fn space_g_toggles_edit_changes() {
-        let state = sample_state();
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
         assert!(state.show_edit_changes);
 
         // Space → g
@@ -3616,7 +3655,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new(), None)
+        let mut state = AppState::new(schema, String::new(), Some(test_migrations_dir()))
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3635,7 +3674,8 @@ mod tests {
 
     #[test]
     fn space_d_no_changes_shows_status() {
-        let state = sample_state();
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
         let state = handle_key_no_pool(state, key(KeyCode::Char(' ')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
         assert_eq!(state.mode, Mode::Normal);
@@ -3655,7 +3695,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new(), None)
+        let mut state = AppState::new(schema, String::new(), Some(test_migrations_dir()))
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3684,7 +3724,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new(), None)
+        let mut state = AppState::new(schema, String::new(), Some(test_migrations_dir()))
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3709,7 +3749,7 @@ mod tests {
         let mut t = Table::new("users");
         t.add_column(Column::new("email", PgType::Text));
         schema.add_table(t);
-        let mut state = AppState::new(schema, String::new(), None)
+        let mut state = AppState::new(schema, String::new(), Some(test_migrations_dir()))
             .with_viewport_height(20)
             .toggle_expand();
         state = state.cursor_down(1);
@@ -3892,5 +3932,87 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Enter));
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.expanded.is_empty());
+    }
+
+    // --- Read-only mode guards ---
+
+    #[test]
+    fn e_key_blocked_without_migrations_dir() {
+        // sample_state() has migrations_dir = None
+        let state = sample_state();
+        assert!(state.migrations_dir.is_none());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_m_blocked_without_migrations_dir() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('m')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_g_blocked_without_migrations_dir() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_d_blocked_without_migrations_dir() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('d')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_p_blocked_without_migrations_dir() {
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        assert!(state.migrations_dir.is_none());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('p')));
+        assert_eq!(state.mode, Mode::Normal);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_g_allowed_with_migrations_dir() {
+        let mut state = sample_state();
+        state.migrations_dir = Some(test_migrations_dir());
+        let state = state.with_mode(Mode::SpaceMenu);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
+        assert_eq!(state.mode, Mode::Normal);
+        // Should toggle edit markers, not show error
+        assert_ne!(
+            state.status_message.as_deref(),
+            Some("No migrations directory found")
+        );
+    }
+
+    #[test]
+    fn space_f_allowed_without_migrations_dir() {
+        // Non-migration-dependent items should still work in read-only mode
+        let state = sample_state().with_mode(Mode::SpaceMenu);
+        assert!(state.migrations_dir.is_none());
+        let state = handle_key_no_pool(state, key(KeyCode::Char('f')));
+        assert_eq!(state.mode, Mode::Search);
     }
 }
