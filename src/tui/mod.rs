@@ -175,12 +175,27 @@ fn install_panic_hook() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the directory for log files.
+///
+/// Uses `$XDG_STATE_HOME/inara/` (typically `~/.local/state/inara/`),
+/// creating it if needed. Falls back to the current directory if the
+/// XDG path is unavailable or directory creation fails.
+fn log_dir() -> std::path::PathBuf {
+    if let Some(mut dir) = dirs::state_dir() {
+        dir.push("inara");
+        if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    std::path::PathBuf::from(".")
+}
+
 /// Initialize tracing to log to a file instead of stdout/stderr.
 ///
 /// TUI applications cannot log to stdout because it would corrupt the
-/// terminal display. Logs go to `inara.log` in the current directory.
+/// terminal display. Logs go to `inara.log` in the XDG state directory.
 fn init_file_tracing() {
-    let file_appender = tracing_appender::rolling::never(".", "inara.log");
+    let file_appender = tracing_appender::rolling::never(log_dir(), "inara.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1035,4 +1050,29 @@ fn draw_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppSt
 
     let status_bar = Line::from(spans);
     frame.render_widget(Paragraph::new(status_bar), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_dir_returns_valid_path() {
+        let dir = log_dir();
+        // Should always return a path (XDG state dir or fallback ".")
+        assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn log_dir_prefers_xdg_state() {
+        let dir = log_dir();
+        // On systems with a home directory, should resolve to XDG state path
+        if dirs::state_dir().is_some() {
+            assert!(dir.ends_with("inara"));
+            assert!(dir.exists(), "log_dir should create the directory");
+        } else {
+            // Fallback to current directory
+            assert_eq!(dir, std::path::PathBuf::from("."));
+        }
+    }
 }
