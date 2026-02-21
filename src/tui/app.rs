@@ -1348,6 +1348,104 @@ impl AppState {
         self
     }
 
+    /// Jump cursor to the next type definition (table or enum header).
+    pub fn next_type_def(mut self) -> Self {
+        for i in (self.cursor + 1)..self.doc.len() {
+            if matches!(
+                self.doc[i].target,
+                FocusTarget::Table(_) | FocusTarget::Enum(_)
+            ) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        // Wrap to beginning
+        for i in 0..self.cursor {
+            if matches!(
+                self.doc[i].target,
+                FocusTarget::Table(_) | FocusTarget::Enum(_)
+            ) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self
+    }
+
+    /// Jump cursor to the previous type definition (table or enum header).
+    pub fn prev_type_def(mut self) -> Self {
+        if self.cursor > 0 {
+            for i in (0..self.cursor).rev() {
+                if matches!(
+                    self.doc[i].target,
+                    FocusTarget::Table(_) | FocusTarget::Enum(_)
+                ) {
+                    self.cursor = i;
+                    return self.scroll_to_focus();
+                }
+            }
+        }
+        // Wrap to end
+        for i in (self.cursor + 1..self.doc.len()).rev() {
+            if matches!(
+                self.doc[i].target,
+                FocusTarget::Table(_) | FocusTarget::Enum(_)
+            ) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self
+    }
+
+    /// Jump cursor to the next expanded item (table or enum that is currently expanded).
+    pub fn next_expanded(mut self) -> Self {
+        for i in (self.cursor + 1)..self.doc.len() {
+            if self.is_expanded_header(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        // Wrap to beginning
+        for i in 0..self.cursor {
+            if self.is_expanded_header(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self.with_status("No other expanded items")
+    }
+
+    /// Jump cursor to the previous expanded item (table or enum that is currently expanded).
+    pub fn prev_expanded(mut self) -> Self {
+        if self.cursor > 0 {
+            for i in (0..self.cursor).rev() {
+                if self.is_expanded_header(i) {
+                    self.cursor = i;
+                    return self.scroll_to_focus();
+                }
+            }
+        }
+        // Wrap to end
+        for i in (self.cursor + 1..self.doc.len()).rev() {
+            if self.is_expanded_header(i) {
+                self.cursor = i;
+                return self.scroll_to_focus();
+            }
+        }
+        self.with_status("No other expanded items")
+    }
+
+    /// Check if a document line is a header for an expanded node.
+    fn is_expanded_header(&self, index: usize) -> bool {
+        match &self.doc.get(index).map(|l| &l.target) {
+            Some(FocusTarget::Table(name) | FocusTarget::Enum(name)) => {
+                self.expanded.contains(name)
+            }
+            _ => false,
+        }
+    }
+
     /// Rebuild the document after expand/collapse or schema changes, preserving cursor context.
     pub fn rebuild_doc(&mut self) {
         let old_target = self.focus().cloned();
@@ -2691,6 +2789,121 @@ mod tests {
         let state = sample_state();
         let state = state.next_change();
         assert_eq!(state.status_message.as_deref(), Some("No edit changes"));
+    }
+
+    // --- next/prev type_def ---
+
+    #[test]
+    fn next_type_def_visits_tables_and_enums() {
+        use crate::schema::EnumType;
+
+        let mut schema = Schema::new();
+        schema.add_enum(EnumType {
+            name: "mood".into(),
+            variants: vec!["happy".into(), "sad".into()],
+        });
+        schema.add_table(crate::schema::Table::new("users"));
+        schema.add_table(crate::schema::Table::new("posts"));
+
+        let state = AppState::new(schema, String::new(), None).with_viewport_height(20);
+        // Document order (collapsed): mood(0) posts(1) users(2)
+        assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
+
+        let state = state.next_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
+
+        let state = state.next_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        // Wrap to beginning
+        let state = state.next_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
+    }
+
+    #[test]
+    fn prev_type_def_visits_tables_and_enums() {
+        use crate::schema::EnumType;
+
+        let mut schema = Schema::new();
+        schema.add_enum(EnumType {
+            name: "mood".into(),
+            variants: vec!["happy".into(), "sad".into()],
+        });
+        schema.add_table(crate::schema::Table::new("users"));
+        schema.add_table(crate::schema::Table::new("posts"));
+
+        let state = AppState::new(schema, String::new(), None).with_viewport_height(20);
+        // Start at mood(0), prev should wrap to users(last type def)
+        let state = state.prev_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
+
+        let state = state.prev_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("posts".into())));
+
+        let state = state.prev_type_def();
+        assert_eq!(state.focus(), Some(&FocusTarget::Enum("mood".into())));
+    }
+
+    // --- next/prev expanded ---
+
+    #[test]
+    fn next_expanded_jumps_between_expanded_headers() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo", "charlie"] {
+            schema.add_table(crate::schema::Table::new(name));
+        }
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(30);
+        state.expanded.insert("alpha".into());
+        state.expanded.insert("charlie".into());
+        state.rebuild_doc();
+
+        // Cursor at alpha (expanded), next should go to charlie
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+        let state = state.next_expanded();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+
+        // Next wraps back to alpha
+        let state = state.next_expanded();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn prev_expanded_jumps_backward() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo", "charlie"] {
+            schema.add_table(crate::schema::Table::new(name));
+        }
+        let mut state = AppState::new(schema, String::new(), None).with_viewport_height(30);
+        state.expanded.insert("alpha".into());
+        state.expanded.insert("charlie".into());
+        state.rebuild_doc();
+
+        // Start at alpha, prev should wrap to charlie
+        let state = state.prev_expanded();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("charlie".into())));
+
+        let state = state.prev_expanded();
+        assert_eq!(state.focus(), Some(&FocusTarget::Table("alpha".into())));
+    }
+
+    #[test]
+    fn next_expanded_no_expanded_shows_status() {
+        let state = sample_state();
+        let state = state.next_expanded();
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No other expanded items")
+        );
+    }
+
+    #[test]
+    fn prev_expanded_no_expanded_shows_status() {
+        let state = sample_state();
+        let state = state.prev_expanded();
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No other expanded items")
+        );
     }
 
     // --- UndoHistory unit tests ---

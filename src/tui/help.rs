@@ -115,12 +115,24 @@ const NORMAL_BINDINGS: &[Binding] = &[
         desc: "Toggle language types",
     },
     Binding {
-        key: "]g",
-        desc: "Next change",
+        key: "]",
+        desc: "Next... (prefix)",
     },
     Binding {
-        key: "[g",
-        desc: "Previous change",
+        key: "[",
+        desc: "Previous... (prefix)",
+    },
+    Binding {
+        key: "]g / [g",
+        desc: "Next/prev change",
+    },
+    Binding {
+        key: "]t / [t",
+        desc: "Next/prev type (table/enum)",
+    },
+    Binding {
+        key: "]e / [e",
+        desc: "Next/prev expanded item",
     },
     Binding {
         key: "u",

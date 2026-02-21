@@ -72,6 +72,14 @@ Context-sensitive: behavior depends on whether a table or column is focused.
 | `g i` | Indexes containing this column |
 | `g y` | Jump to enum/custom type definition |
 
+### Next/Previous (`]` / `[` prefix)
+
+| Key | Action |
+|-----|--------|
+| `]g` / `[g` | Next/prev change (requires edit overlay) |
+| `]t` / `[t` | Next/prev type definition (table or enum) |
+| `]e` / `[e` | Next/prev expanded item |
+
 ### Actions
 
 | Key | Action |

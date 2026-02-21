@@ -123,21 +123,25 @@ pub fn handle_key(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult
 
 /// Handle key events in Normal mode.
 fn handle_normal(state: AppState, key: KeyEvent, pool: &PgPool) -> HandleResult {
-    // Handle pending bracket keys for ]g / [g change navigation
+    // Handle pending bracket keys for ] / [ prefix navigation
     match state.pending_key {
         PendingKey::CloseBracket => {
             let state = state.with_pending_key(PendingKey::None);
-            return match key.code {
-                KeyCode::Char('g') => HandleResult::state_only(state.next_change()),
-                _ => HandleResult::state_only(state),
-            };
+            return HandleResult::state_only(match key.code {
+                KeyCode::Char('g') => state.next_change(),
+                KeyCode::Char('t') => state.record_jump().next_type_def(),
+                KeyCode::Char('e') => state.record_jump().next_expanded(),
+                _ => state,
+            });
         }
         PendingKey::OpenBracket => {
             let state = state.with_pending_key(PendingKey::None);
-            return match key.code {
-                KeyCode::Char('g') => HandleResult::state_only(state.prev_change()),
-                _ => HandleResult::state_only(state),
-            };
+            return HandleResult::state_only(match key.code {
+                KeyCode::Char('g') => state.prev_change(),
+                KeyCode::Char('t') => state.record_jump().prev_type_def(),
+                KeyCode::Char('e') => state.record_jump().prev_expanded(),
+                _ => state,
+            });
         }
         _ => {}
     }
@@ -1496,12 +1500,14 @@ mod tests {
 
     /// Normal mode handler for tests (no pool, no HUD opening, no editor spawn).
     fn handle_normal_no_pool(state: AppState, key: KeyEvent) -> AppState {
-        // Handle pending bracket keys for ]g / [g change navigation
+        // Handle pending bracket keys for ] / [ prefix navigation
         match state.pending_key {
             PendingKey::CloseBracket => {
                 let state = state.with_pending_key(PendingKey::None);
                 return match key.code {
                     KeyCode::Char('g') => state.next_change(),
+                    KeyCode::Char('t') => state.record_jump().next_type_def(),
+                    KeyCode::Char('e') => state.record_jump().next_expanded(),
                     _ => state,
                 };
             }
@@ -1509,6 +1515,8 @@ mod tests {
                 let state = state.with_pending_key(PendingKey::None);
                 return match key.code {
                     KeyCode::Char('g') => state.prev_change(),
+                    KeyCode::Char('t') => state.record_jump().prev_type_def(),
+                    KeyCode::Char('e') => state.record_jump().prev_expanded(),
                     _ => state,
                 };
             }
@@ -3416,6 +3424,147 @@ mod tests {
         let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
         let state = handle_key_no_pool(state, key(KeyCode::Char('g')));
         assert_eq!(state.status_message.as_deref(), Some("No edit changes"));
+    }
+
+    // --- ]t / [t type definition navigation ---
+
+    #[test]
+    fn bracket_t_navigates_type_definitions() {
+        use crate::schema::EnumType;
+
+        let mut schema = Schema::new();
+        schema.add_enum(EnumType {
+            name: "mood".into(),
+            variants: vec!["happy".into(), "sad".into()],
+        });
+        for name in ["alpha", "bravo"] {
+            schema.add_table(Table::new(name));
+        }
+        let state = AppState::new(schema, "test".into(), None).with_viewport_height(20);
+        assert_eq!(state.cursor, 0);
+
+        // First item should be an enum or table (BTreeMap order: alpha, bravo, mood)
+        // Enums come first in document, then tables — but BTreeMap ordering determines it.
+        // ]t should jump to next type definition
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        assert_eq!(state.pending_key, PendingKey::CloseBracket);
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        assert_eq!(state.pending_key, PendingKey::None);
+        // Should have moved forward to a type definition
+        assert!(state.cursor > 0);
+        let target = state.focus().unwrap();
+        assert!(
+            matches!(target, FocusTarget::Table(_) | FocusTarget::Enum(_)),
+            "Expected table or enum header, got {:?}",
+            target
+        );
+    }
+
+    #[test]
+    fn bracket_t_wraps_around() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo"] {
+            schema.add_table(Table::new(name));
+        }
+        let mut state = AppState::new(schema, "test".into(), None).with_viewport_height(20);
+
+        // Move to last table
+        let last = state.line_count().saturating_sub(1);
+        state = state.cursor_to(last);
+
+        // ]t should wrap to first type definition
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        assert_eq!(state.cursor, 0);
+        assert!(matches!(state.focus(), Some(FocusTarget::Table(_))));
+    }
+
+    #[test]
+    fn bracket_t_prev_navigates_backward() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo", "charlie"] {
+            schema.add_table(Table::new(name));
+        }
+        let state = AppState::new(schema, "test".into(), None).with_viewport_height(20);
+
+        // Move to last type def
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        let pos_after_two_next = state.cursor;
+
+        // [t should go back
+        let state = handle_key_no_pool(state, key(KeyCode::Char('[')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('t')));
+        assert!(state.cursor < pos_after_two_next);
+        assert!(matches!(state.focus(), Some(FocusTarget::Table(_))));
+    }
+
+    // --- ]e / [e expanded item navigation ---
+
+    #[test]
+    fn bracket_e_navigates_expanded_items() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo", "charlie"] {
+            schema.add_table(Table::new(name));
+        }
+        let mut state = AppState::new(schema, "test".into(), None).with_viewport_height(30);
+
+        // Expand alpha and charlie (not bravo)
+        state.expanded.insert("alpha".into());
+        state.expanded.insert("charlie".into());
+        state.rebuild_doc();
+
+        // ]e should jump to next expanded item
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        // Should land on an expanded header (charlie, since alpha is at cursor 0)
+        let target = state.focus().unwrap();
+        assert!(
+            matches!(target, FocusTarget::Table(n) if n == "charlie"),
+            "Expected expanded table charlie, got {:?}",
+            target
+        );
+    }
+
+    #[test]
+    fn bracket_e_no_expanded_shows_status() {
+        let state = sample_state();
+        // No items expanded
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("No other expanded items")
+        );
+    }
+
+    #[test]
+    fn bracket_e_prev_navigates_backward() {
+        let mut schema = Schema::new();
+        for name in ["alpha", "bravo", "charlie"] {
+            schema.add_table(Table::new(name));
+        }
+        let mut state = AppState::new(schema, "test".into(), None).with_viewport_height(30);
+
+        // Expand all three
+        state.expanded.insert("alpha".into());
+        state.expanded.insert("bravo".into());
+        state.expanded.insert("charlie".into());
+        state.rebuild_doc();
+
+        // Navigate forward twice
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char(']')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        let forward_cursor = state.cursor;
+
+        // [e should go back
+        let state = handle_key_no_pool(state, key(KeyCode::Char('[')));
+        let state = handle_key_no_pool(state, key(KeyCode::Char('e')));
+        assert!(state.cursor < forward_cursor);
     }
 
     // --- Ctrl-z revert ---
