@@ -177,17 +177,23 @@ fn install_panic_hook() -> Result<()> {
 
 /// Resolve the directory for log files.
 ///
-/// Uses `$XDG_STATE_HOME/inara/` (typically `~/.local/state/inara/`),
-/// creating it if needed. Falls back to the current directory if the
-/// XDG path is unavailable or directory creation fails.
+/// Uses `$XDG_STATE_HOME/inara/` if set, otherwise `$HOME/.local/state/inara/`.
+/// Creates the directory if needed. Falls back to the current directory if
+/// neither env var is available or directory creation fails.
 fn log_dir() -> std::path::PathBuf {
-    if let Some(mut dir) = dirs::state_dir() {
-        dir.push("inara");
-        if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
-            return dir;
-        }
+    let base = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        std::path::PathBuf::from(xdg)
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".local/state")
+    } else {
+        return std::path::PathBuf::from(".");
+    };
+    let dir = base.join("inara");
+    if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        std::path::PathBuf::from(".")
     }
-    std::path::PathBuf::from(".")
 }
 
 /// Initialize tracing to log to a file instead of stdout/stderr.
@@ -1076,22 +1082,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_dir_returns_valid_path() {
+    fn log_dir_uses_xdg_state_home_when_set() {
+        let tmp = std::env::temp_dir().join("inara_test_xdg_state");
+        std::env::set_var("XDG_STATE_HOME", &tmp);
         let dir = log_dir();
-        // Should always return a path (XDG state dir or fallback ".")
-        assert!(!dir.as_os_str().is_empty());
+        std::env::remove_var("XDG_STATE_HOME");
+        assert_eq!(dir, tmp.join("inara"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn log_dir_prefers_xdg_state() {
+    fn log_dir_falls_back_to_home_local_state() {
+        let orig_xdg = std::env::var("XDG_STATE_HOME").ok();
+        std::env::remove_var("XDG_STATE_HOME");
         let dir = log_dir();
-        // On systems with a home directory, should resolve to XDG state path
-        if dirs::state_dir().is_some() {
-            assert!(dir.ends_with("inara"));
-            assert!(dir.exists(), "log_dir should create the directory");
-        } else {
-            // Fallback to current directory
-            assert_eq!(dir, std::path::PathBuf::from("."));
+        if let Some(v) = orig_xdg {
+            std::env::set_var("XDG_STATE_HOME", v);
+        }
+        // With HOME set (typical), should resolve to $HOME/.local/state/inara
+        if let Ok(home) = std::env::var("HOME") {
+            let expected = std::path::PathBuf::from(home).join(".local/state/inara");
+            assert_eq!(dir, expected);
         }
     }
 }
