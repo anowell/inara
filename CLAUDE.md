@@ -2,10 +2,6 @@
 
 Inara is a terminal-native schema explorer and migration generator for sqlx + Postgres, written in Rust.
 
-## Before Starting Work
-
-Run `bd onboard` to understand the current project state and available issues.
-
 ## Essential Reading
 
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Development standards, testing requirements, architecture patterns, and workflow. Read this first.
@@ -16,7 +12,7 @@ Run `bd onboard` to understand the current project state and available issues.
 ## Key Commands
 
 ```sh
-just check            # Format + lint + test (MUST pass before completing any bead)
+just check            # Format + lint + test (MUST pass before completing any task)
 just test             # Unit tests
 just test-integration # Integration tests (requires DATABASE_URL)
 just db-check         # Verify database connectivity
@@ -24,10 +20,8 @@ just db-check         # Verify database connectivity
 
 ## Rules
 
-- Every bead must be proven with tests. "It compiles" is not done.
-- `just check` must pass before marking any bead complete.
-- Use `jj` for version control, never `git` directly.
-- Use `bd` to track work status and add completion summaries.
+- Every task must be proven with tests. "It compiles" is not done.
+- `just check` must pass before marking any task complete.
 - Follow helix editor patterns for all navigation and UX decisions.
 - Use sqlx for all database access. Query pg_catalog for introspection.
 - Schema model uses BTreeMap for deterministic ordering.

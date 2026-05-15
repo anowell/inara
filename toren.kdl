@@ -1,0 +1,12 @@
+var dbname="inara-{{ ws.name }}"
+
+setup {
+    copy src="target"
+    run "just boostrap" {
+        env PGDATABASE={{ vars.dbname }}
+    }
+}
+
+destroy {
+    run "dropdb {{ vars.dbname }}"
+}
