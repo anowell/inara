@@ -265,20 +265,87 @@ struct SqlEffect {
 fn analyze_sql(sql: &str) -> Vec<SqlEffect> {
     let mut effects = Vec::new();
 
-    for statement in split_statements(sql) {
-        let normalized = normalize_whitespace(&statement);
-        let upper = normalized.to_uppercase();
+    // Strip comments first so statements that frameworks (e.g. Prisma) prefix
+    // with marker comments like `-- CreateTable` are still recognized.
+    let cleaned = strip_sql_comments(sql);
 
-        if let Some(effect) = parse_create_table(&upper, &statement) {
+    for statement in split_statements(&cleaned) {
+        let normalized = normalize_whitespace(&statement);
+
+        if let Some(effect) = parse_create_table(&normalized, &statement) {
             effects.push(effect);
-        } else if let Some(effect) = parse_alter_table(&upper, &statement) {
+        } else if let Some(effect) = parse_alter_table(&normalized, &statement) {
             effects.push(effect);
-        } else if let Some(effect) = parse_drop_table(&upper, &statement) {
+        } else if let Some(effect) = parse_drop_table(&normalized, &statement) {
             effects.push(effect);
         }
     }
 
     effects
+}
+
+/// Remove SQL comments (`-- line` and `/* block */`) from SQL text.
+///
+/// Single-quoted string literals and double-quoted identifiers are copied
+/// verbatim so comment markers inside them are preserved.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                // Quoted literal/identifier — copy through the closing quote,
+                // honoring doubled-quote escapes (`''` / `""`).
+                out.push(c);
+                while let Some(q) = chars.next() {
+                    out.push(q);
+                    if q == c {
+                        if chars.peek() == Some(&c) {
+                            out.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment — drop through end of line.
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment — drop through the closing `*/`.
+                chars.next();
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Case-insensitive `strip_prefix` for ASCII prefixes.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let p = prefix.as_bytes();
+    let b = s.as_bytes();
+    if b.len() >= p.len() && b[..p.len()].eq_ignore_ascii_case(p) {
+        Some(&s[p.len()..])
+    } else {
+        None
+    }
 }
 
 /// Split SQL content into individual statements on semicolons.
@@ -300,9 +367,9 @@ fn normalize_whitespace(s: &str) -> String {
 /// Extract table name from a CREATE TABLE statement.
 ///
 /// Handles: `CREATE TABLE name (`, `CREATE TABLE IF NOT EXISTS name (`
-fn parse_create_table(upper: &str, original: &str) -> Option<SqlEffect> {
-    let rest = upper.strip_prefix("CREATE TABLE ")?;
-    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+fn parse_create_table(normalized: &str, original: &str) -> Option<SqlEffect> {
+    let rest = strip_prefix_ci(normalized, "CREATE TABLE ")?;
+    let rest = strip_prefix_ci(rest, "IF NOT EXISTS ").unwrap_or(rest);
 
     let table = extract_identifier(rest)?;
 
@@ -351,10 +418,10 @@ fn extract_create_table_columns(sql: &str) -> Vec<String> {
             continue;
         }
 
-        // First word is the column name
-        if let Some(name) = extract_identifier(trimmed) {
+        // First token is the column name
+        if let Some((name, consumed)) = extract_identifier_token(trimmed) {
             // Validate it looks like a column def (has a type after the name)
-            let rest = trimmed[name.len()..].trim();
+            let rest = trimmed[consumed..].trim();
             if !rest.is_empty() {
                 columns.push(name);
             }
@@ -373,32 +440,34 @@ fn extract_create_table_columns(sql: &str) -> Vec<String> {
 /// - ALTER TABLE name RENAME COLUMN old TO new
 /// - ALTER TABLE name ADD CONSTRAINT ...
 /// - ALTER TABLE name DROP CONSTRAINT ...
-fn parse_alter_table(upper: &str, original: &str) -> Option<SqlEffect> {
-    let rest = upper.strip_prefix("ALTER TABLE ")?;
-    let table = extract_identifier(rest)?;
-    let after_table = rest[table.len()..].trim();
+fn parse_alter_table(normalized: &str, original: &str) -> Option<SqlEffect> {
+    let rest = strip_prefix_ci(normalized, "ALTER TABLE ")?;
+    let rest = strip_prefix_ci(rest, "IF EXISTS ").unwrap_or(rest);
+    let (table, consumed) = extract_identifier_token(rest)?;
+    let after_table = rest[consumed..].trim();
 
     let mut columns = Vec::new();
 
-    if let Some(rest) = after_table.strip_prefix("ADD COLUMN ") {
+    if let Some(rest) = strip_prefix_ci(after_table, "ADD COLUMN ") {
+        let rest = strip_prefix_ci(rest, "IF NOT EXISTS ").unwrap_or(rest);
         if let Some(col) = extract_identifier(rest) {
             columns.push(col);
         }
-    } else if let Some(rest) = after_table.strip_prefix("ALTER COLUMN ") {
+    } else if let Some(rest) = strip_prefix_ci(after_table, "ALTER COLUMN ") {
         if let Some(col) = extract_identifier(rest) {
             columns.push(col);
         }
-    } else if let Some(rest) = after_table.strip_prefix("DROP COLUMN ") {
-        let rest = rest.strip_prefix("IF EXISTS ").unwrap_or(rest);
+    } else if let Some(rest) = strip_prefix_ci(after_table, "DROP COLUMN ") {
+        let rest = strip_prefix_ci(rest, "IF EXISTS ").unwrap_or(rest);
         if let Some(col) = extract_identifier(rest) {
             columns.push(col);
         }
-    } else if let Some(rest) = after_table.strip_prefix("RENAME COLUMN ") {
-        if let Some(old_name) = extract_identifier(rest) {
-            columns.push(old_name.clone());
+    } else if let Some(rest) = strip_prefix_ci(after_table, "RENAME COLUMN ") {
+        if let Some((old_name, old_consumed)) = extract_identifier_token(rest) {
+            columns.push(old_name);
             // Also capture the new name after TO
-            let after_old = rest[old_name.len()..].trim();
-            if let Some(rest) = after_old.strip_prefix("TO ") {
+            let after_old = rest[old_consumed..].trim();
+            if let Some(rest) = strip_prefix_ci(after_old, "TO ") {
                 if let Some(new_name) = extract_identifier(rest) {
                     columns.push(new_name);
                 }
@@ -415,9 +484,9 @@ fn parse_alter_table(upper: &str, original: &str) -> Option<SqlEffect> {
 }
 
 /// Extract table name from DROP TABLE statements.
-fn parse_drop_table(upper: &str, original: &str) -> Option<SqlEffect> {
-    let rest = upper.strip_prefix("DROP TABLE ")?;
-    let rest = rest.strip_prefix("IF EXISTS ").unwrap_or(rest);
+fn parse_drop_table(normalized: &str, original: &str) -> Option<SqlEffect> {
+    let rest = strip_prefix_ci(normalized, "DROP TABLE ")?;
+    let rest = strip_prefix_ci(rest, "IF EXISTS ").unwrap_or(rest);
     let table = extract_identifier(rest)?;
 
     Some(SqlEffect {
@@ -428,32 +497,41 @@ fn parse_drop_table(upper: &str, original: &str) -> Option<SqlEffect> {
 }
 
 /// Extract an SQL identifier from the start of a string.
+fn extract_identifier(s: &str) -> Option<String> {
+    extract_identifier_token(s).map(|(name, _)| name)
+}
+
+/// Extract an SQL identifier and the number of bytes it consumed.
 ///
 /// Handles unquoted identifiers (alphanumeric + underscore) and
-/// double-quoted identifiers.
-fn extract_identifier(s: &str) -> Option<String> {
-    let s = s.trim();
-    if s.is_empty() {
+/// double-quoted identifiers. Double-quoted identifiers preserve their case
+/// (Postgres stores them verbatim); unquoted identifiers fold to lowercase.
+/// The consumed length covers any leading whitespace and the surrounding
+/// quotes, so callers can advance past the whole token.
+fn extract_identifier_token(s: &str) -> Option<(String, usize)> {
+    let leading_ws = s.len() - s.trim_start().len();
+    let rest = &s[leading_ws..];
+    if rest.is_empty() {
         return None;
     }
 
-    if let Some(stripped) = s.strip_prefix('"') {
-        // Quoted identifier
+    if let Some(stripped) = rest.strip_prefix('"') {
+        // Quoted identifier — case-preserving
         let end = stripped.find('"')?;
         let name = &stripped[..end];
         if name.is_empty() {
             return None;
         }
-        Some(name.to_lowercase())
+        Some((name.to_string(), leading_ws + 1 + end + 1))
     } else {
-        // Unquoted identifier
-        let end = s
+        // Unquoted identifier — Postgres folds to lowercase
+        let end = rest
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .unwrap_or(s.len());
+            .unwrap_or(rest.len());
         if end == 0 {
             return None;
         }
-        Some(s[..end].to_lowercase())
+        Some((rest[..end].to_lowercase(), leading_ws + end))
     }
 }
 
@@ -708,6 +786,74 @@ CREATE TABLE posts (
         assert!(effects.is_empty());
     }
 
+    // --- Prisma-style migrations: leading comments + quoted identifiers ---
+
+    #[test]
+    fn analyze_create_table_with_leading_comment() {
+        // Prisma prefixes every statement with a marker comment.
+        let sql = "-- CreateTable\nCREATE TABLE \"Account\" (\n    \"id\" TEXT NOT NULL,\n    \"userId\" TEXT NOT NULL\n);";
+        let effects = analyze_sql(sql);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].table, "Account");
+        assert!(effects[0].columns.contains(&"id".to_string()));
+        assert!(effects[0].columns.contains(&"userId".to_string()));
+    }
+
+    #[test]
+    fn analyze_alter_table_with_leading_comment_and_quotes() {
+        let sql = "-- AlterTable\nALTER TABLE \"User\" ADD COLUMN \"bio\" TEXT;";
+        let effects = analyze_sql(sql);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].table, "User");
+        assert_eq!(effects[0].columns, vec!["bio"]);
+    }
+
+    #[test]
+    fn analyze_preserves_quoted_identifier_case() {
+        let sql = "CREATE TABLE \"UserProfile\" (\"avatarUrl\" TEXT);";
+        let effects = analyze_sql(sql);
+        assert_eq!(effects[0].table, "UserProfile");
+        assert_eq!(effects[0].columns, vec!["avatarUrl"]);
+    }
+
+    #[test]
+    fn analyze_unquoted_identifiers_fold_to_lowercase() {
+        let sql = "CREATE TABLE MyTable (MyCol text);";
+        let effects = analyze_sql(sql);
+        assert_eq!(effects[0].table, "mytable");
+        assert_eq!(effects[0].columns, vec!["mycol"]);
+    }
+
+    #[test]
+    fn analyze_block_comment_is_ignored() {
+        let sql = "/* a block comment */ ALTER TABLE users ADD COLUMN bio text;";
+        let effects = analyze_sql(sql);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].table, "users");
+        assert_eq!(effects[0].columns, vec!["bio"]);
+    }
+
+    #[test]
+    fn strip_sql_comments_preserves_string_literals() {
+        let sql = "ALTER TABLE t ALTER COLUMN c SET DEFAULT '-- not a comment';";
+        let cleaned = strip_sql_comments(sql);
+        assert!(cleaned.contains("-- not a comment"));
+    }
+
+    #[test]
+    fn build_index_from_prisma_style_migration() {
+        let migrations = vec![MigrationFile {
+            timestamp: "20231025045316".into(),
+            description: "add users".into(),
+            path: PathBuf::from("migrations/20231025045316_add_users/migration.sql"),
+            sql: "-- CreateTable\nCREATE TABLE \"User\" (\n    \"id\" TEXT NOT NULL,\n    \"email\" TEXT NOT NULL\n);".into(),
+        }];
+        let index = build_index(&migrations);
+        assert!(index.tables.contains_key("User"));
+        assert!(index.columns.contains_key("User.email"));
+        assert!(index.columns.contains_key("User.id"));
+    }
+
     // --- Index building ---
 
     #[test]
@@ -835,7 +981,8 @@ CREATE TABLE posts (
 
     #[test]
     fn extract_quoted_identifier() {
-        assert_eq!(extract_identifier("\"Users\" ("), Some("users".into()));
+        // Quoted identifiers preserve case — Postgres stores them verbatim.
+        assert_eq!(extract_identifier("\"Users\" ("), Some("Users".into()));
     }
 
     #[test]
