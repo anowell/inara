@@ -1,6 +1,9 @@
 pub mod diff;
+pub mod insight;
 pub mod introspect;
 pub mod parse;
+pub mod profile;
+pub mod profile_load;
 pub mod relations;
 pub mod render;
 pub mod type_map;
@@ -187,6 +190,58 @@ pub enum Constraint {
     },
 }
 
+/// The access method used by an index.
+///
+/// These correspond to the `amname` values in the Postgres `pg_am` catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexMethod {
+    #[default]
+    Btree,
+    Hash,
+    Gist,
+    Gin,
+    Brin,
+    SpGist,
+    Other(String),
+}
+
+impl IndexMethod {
+    /// Parse a Postgres `pg_am.amname` value into an `IndexMethod`.
+    ///
+    /// Unrecognized methods fall back to `Other`.
+    pub fn parse(name: &str) -> IndexMethod {
+        match name {
+            "btree" => IndexMethod::Btree,
+            "hash" => IndexMethod::Hash,
+            "gist" => IndexMethod::Gist,
+            "gin" => IndexMethod::Gin,
+            "brin" => IndexMethod::Brin,
+            "spgist" => IndexMethod::SpGist,
+            other => IndexMethod::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<&str> for IndexMethod {
+    fn from(name: &str) -> Self {
+        IndexMethod::parse(name)
+    }
+}
+
+impl std::fmt::Display for IndexMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexMethod::Btree => f.write_str("btree"),
+            IndexMethod::Hash => f.write_str("hash"),
+            IndexMethod::Gist => f.write_str("gist"),
+            IndexMethod::Gin => f.write_str("gin"),
+            IndexMethod::Brin => f.write_str("brin"),
+            IndexMethod::SpGist => f.write_str("spgist"),
+            IndexMethod::Other(s) => f.write_str(s),
+        }
+    }
+}
+
 /// A table index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Index {
@@ -194,6 +249,7 @@ pub struct Index {
     pub columns: Vec<String>,
     pub unique: bool,
     pub partial: Option<String>,
+    pub method: IndexMethod,
 }
 
 /// A Postgres enum type.
@@ -277,6 +333,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table
     }
@@ -499,6 +556,7 @@ mod tests {
             columns: vec!["email".into()],
             unique: true,
             partial: None,
+            method: IndexMethod::Btree,
         };
         assert!(idx.unique);
         assert!(idx.partial.is_none());
@@ -511,6 +569,7 @@ mod tests {
             columns: vec!["email".into()],
             unique: false,
             partial: Some("WHERE active = true".into()),
+            method: IndexMethod::Btree,
         };
         assert!(!idx.unique);
         assert_eq!(idx.partial.as_deref(), Some("WHERE active = true"));
@@ -523,6 +582,7 @@ mod tests {
             columns: vec!["tenant_id".into(), "created_at".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         };
         assert_eq!(idx.columns.len(), 2);
     }
@@ -573,6 +633,31 @@ mod tests {
             }
             _ => panic!("expected Range"),
         }
+    }
+
+    #[test]
+    fn index_method_parse_and_display() {
+        let cases = [
+            ("btree", IndexMethod::Btree),
+            ("hash", IndexMethod::Hash),
+            ("gist", IndexMethod::Gist),
+            ("gin", IndexMethod::Gin),
+            ("brin", IndexMethod::Brin),
+            ("spgist", IndexMethod::SpGist),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(IndexMethod::parse(name), expected);
+            assert_eq!(IndexMethod::from(name), expected);
+            assert_eq!(expected.to_string(), name);
+        }
+
+        // Unknown methods fall back to Other and round-trip verbatim.
+        let other = IndexMethod::parse("bloom");
+        assert_eq!(other, IndexMethod::Other("bloom".into()));
+        assert_eq!(other.to_string(), "bloom");
+
+        // Default is btree.
+        assert_eq!(IndexMethod::default(), IndexMethod::Btree);
     }
 
     #[test]

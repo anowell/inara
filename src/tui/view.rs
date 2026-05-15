@@ -695,7 +695,7 @@ mod tests {
     use super::*;
     use crate::schema::types::{Expression, ForeignKeyRef, PgType, ReferentialAction};
     use crate::schema::{
-        Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, Schema, Table,
+        Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, IndexMethod, Schema, Table,
     };
     use crate::tui::app::AppState;
 
@@ -864,6 +864,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(posts);
 

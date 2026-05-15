@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::schema::diff::{Change, ColumnChanges, DefaultChange};
-use crate::schema::{Column, Constraint, Index, Table};
+use crate::schema::{Column, Constraint, Index, IndexMethod, Table};
 
 /// Generate SQL statements from a list of structural changes.
 ///
@@ -308,11 +308,12 @@ fn write_add_constraint(out: &mut String, table: &str, constraint: &Constraint) 
 fn write_create_index(out: &mut String, table: &str, index: &Index) {
     let unique = if index.unique { "UNIQUE " } else { "" };
     let cols = index.columns.join(", ");
-    let _ = write!(
-        out,
-        "CREATE {unique}INDEX {} ON {table} ({cols})",
-        index.name
-    );
+    let _ = write!(out, "CREATE {unique}INDEX {} ON {table}", index.name);
+    // Omit `USING btree` since btree is the implicit default.
+    if index.method != IndexMethod::Btree {
+        let _ = write!(out, " USING {}", index.method);
+    }
+    let _ = write!(out, " ({cols})");
     if let Some(ref where_clause) = index.partial {
         let _ = write!(out, " {where_clause}");
     }
@@ -324,7 +325,7 @@ mod tests {
     use super::*;
     use crate::schema::diff::{Change, ColumnChanges, DefaultChange};
     use crate::schema::types::{Expression, ForeignKeyRef, PgType, ReferentialAction};
-    use crate::schema::{Column, Constraint, Index, Table};
+    use crate::schema::{Column, Constraint, Index, IndexMethod, Table};
 
     // ── Helpers ──────────────────────────────────────────
 
@@ -376,6 +377,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         t
     }
@@ -600,6 +602,7 @@ mod tests {
                 columns: vec!["author_id".into()],
                 unique: false,
                 partial: None,
+                method: IndexMethod::Btree,
             },
         }];
         let sql = generate_sql(&changes);
@@ -615,6 +618,7 @@ mod tests {
                 columns: vec!["email".into()],
                 unique: true,
                 partial: None,
+                method: IndexMethod::Btree,
             },
         }];
         let sql = generate_sql(&changes);
@@ -630,6 +634,7 @@ mod tests {
                 columns: vec!["email".into()],
                 unique: false,
                 partial: Some("WHERE active = true".into()),
+                method: IndexMethod::Btree,
             },
         }];
         let sql = generate_sql(&changes);
@@ -641,6 +646,42 @@ mod tests {
         let changes = vec![Change::DropIndex("posts_author_idx".into())];
         let sql = generate_sql(&changes);
         insta::assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn add_index_emits_using_for_non_btree() {
+        let changes = vec![Change::AddIndex {
+            table: "docs".into(),
+            index: Index {
+                name: "docs_body_idx".into(),
+                columns: vec!["body".into()],
+                unique: false,
+                partial: None,
+                method: IndexMethod::Gin,
+            },
+        }];
+        let sql = generate_sql(&changes);
+        assert_eq!(
+            sql,
+            "CREATE INDEX docs_body_idx ON docs USING gin (body);\n"
+        );
+    }
+
+    #[test]
+    fn add_index_omits_using_for_btree() {
+        let changes = vec![Change::AddIndex {
+            table: "docs".into(),
+            index: Index {
+                name: "docs_id_idx".into(),
+                columns: vec!["id".into()],
+                unique: false,
+                partial: None,
+                method: IndexMethod::Btree,
+            },
+        }];
+        let sql = generate_sql(&changes);
+        assert_eq!(sql, "CREATE INDEX docs_id_idx ON docs (id);\n");
+        assert!(!sql.contains("USING"));
     }
 
     #[test]
@@ -710,6 +751,7 @@ mod tests {
                     columns: vec!["bio".into()],
                     unique: false,
                     partial: Some("WHERE bio IS NOT NULL".into()),
+                    method: IndexMethod::Btree,
                 },
             },
         ];
@@ -730,6 +772,7 @@ mod tests {
                     columns: vec!["col".into()],
                     unique: false,
                     partial: None,
+                    method: IndexMethod::Btree,
                 },
             },
             Change::AddTable(Table::new("new_table")),

@@ -444,7 +444,7 @@ fn collect_custom_type_targets(
 mod tests {
     use super::*;
     use crate::schema::types::{ForeignKeyRef, ReferentialAction};
-    use crate::schema::{Column, Constraint, EnumType, Index, Table};
+    use crate::schema::{Column, Constraint, EnumType, Index, IndexMethod, Table};
 
     fn test_schema() -> Schema {
         let mut schema = Schema::new();
@@ -463,6 +463,7 @@ mod tests {
             columns: vec!["email".into()],
             unique: true,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(users);
 
@@ -491,6 +492,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(posts);
 
@@ -525,6 +527,7 @@ mod tests {
             columns: vec!["post_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(comments);
 

@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use sqlx::PgPool;
 
 use super::types::{Expression, ForeignKeyRef, PgType, ReferentialAction};
-use super::{Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, Schema, Table};
+use super::{
+    Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, IndexMethod, Schema, Table,
+};
 
 /// Errors that can occur during schema introspection.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +73,7 @@ struct IndexRow {
     columns: Vec<String>,
     is_unique: bool,
     filter_condition: Option<String>,
+    access_method: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -354,10 +357,12 @@ async fn load_indexes(
                  ORDER BY a.attnum
              ) AS columns,
              ix.indisunique AS is_unique,
-             pg_get_expr(ix.indpred, ix.indrelid) AS filter_condition
+             pg_get_expr(ix.indpred, ix.indrelid) AS filter_condition,
+             am.amname AS access_method
          FROM pg_index ix
          JOIN pg_class c_index ON c_index.oid = ix.indexrelid
          JOIN pg_class c_table ON c_table.oid = ix.indrelid
+         JOIN pg_am am ON am.oid = c_index.relam
          JOIN pg_namespace n ON n.oid = c_table.relnamespace
          WHERE n.nspname = $1
            AND NOT ix.indisprimary
@@ -382,6 +387,7 @@ async fn load_indexes(
             columns: row.columns,
             unique: row.is_unique,
             partial: row.filter_condition,
+            method: IndexMethod::parse(&row.access_method),
         });
     }
 

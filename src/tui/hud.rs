@@ -1,3 +1,20 @@
+//! The Query HUD — a fast, instant-feeling glimpse at a table or column.
+//!
+//! The HUD is built on a **tiered** model:
+//!
+//! * **Tier 0** — catalog & planner statistics. The default. It reads only
+//!   metadata Postgres already maintains ([`profile_load`]), never a user
+//!   table's heap, so opening the HUD is a lookup, not a query — instant
+//!   regardless of table size, and needing no safety gate.
+//! * **Tier 1** — bounded *exact* probes (`COUNT(*)`, `COUNT(DISTINCT)`, JSONB
+//!   key sampling). These do touch the heap, so they are opt-in: the HUD
+//!   *offers* escalation and the user presses a key to run it.
+//!
+//! Measurement is kept separate from interpretation: the data layer
+//! ([`profile`](crate::schema::profile)) holds raw numbers, the pure schema
+//! layer ([`insight`](crate::schema::insight)) turns them into meaning, and
+//! this module only dispatches and renders.
+
 use std::sync::{Arc, Mutex};
 
 use ratatui::layout::Rect;
@@ -7,27 +24,44 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use sqlx::PgPool;
 
+use crate::schema::insight::{
+    self, ColumnContext, ColumnInsights, ColumnTag, Distinctness, Ordering, Skew, Sparsity,
+    TableRole, TypeClass,
+};
+use crate::schema::profile::{ColumnProfile, TableProfile};
+use crate::schema::profile_load::{load_column_profile, load_table_profile};
 use crate::schema::types::PgType;
+use crate::schema::{IndexMethod, Table};
 
-/// Row count threshold above which we warn before running column stats
-/// on an unindexed column.
-const LARGE_TABLE_THRESHOLD: f32 = 100_000.0;
+/// A table is "cheap" to probe exactly when it has fewer rows than this.
+const CHEAP_ROW_LIMIT: i64 = 50_000;
+/// …or when its heap is smaller than this many bytes (32 MiB).
+const CHEAP_BYTE_LIMIT: i64 = 32 * 1024 * 1024;
+/// Rows sampled when extracting top-level JSONB keys (Tier 1, kept bounded).
+const JSONB_SAMPLE_ROWS: i64 = 500;
+/// More secondary indexes than this and the HUD says "heavily indexed".
+const HEAVY_INDEX_COUNT: usize = 6;
+
+// ── HUD state ─────────────────────────────────────────────────────────
 
 /// HUD query state — stored in `AppState` when mode is HUD.
 #[derive(Debug, Clone)]
 pub struct HudState {
-    /// What we're querying.
+    /// The Postgres schema being inspected. Multi-schema support is tracked
+    /// separately; for now this is always `public`.
+    pub schema: String,
+    /// What we're inspecting.
     pub target: HudTarget,
-    /// Current query status.
+    /// Current load/result status.
     pub status: HudStatus,
 }
 
 /// What the HUD is focused on.
 #[derive(Debug, Clone)]
 pub enum HudTarget {
-    /// Table-level stats.
+    /// A table.
     Table { name: String },
-    /// Column-level stats.
+    /// A column.
     Column {
         table: String,
         column: String,
@@ -35,43 +69,96 @@ pub enum HudTarget {
     },
 }
 
-/// Query lifecycle status.
+/// HUD lifecycle status.
 #[derive(Debug, Clone)]
 pub enum HudStatus {
-    /// Query is running.
+    /// Tier-0 load in flight.
     Loading,
-    /// Table-level results.
-    TableResult(TableStats),
-    /// Column-level results.
-    ColumnResult(ColumnStats),
-    /// Safety warning — table is large and column is not indexed.
-    SafetyWarning {
-        row_estimate: f32,
-        table: String,
-        column: String,
-        pg_type: PgType,
-    },
-    /// Query failed.
+    /// Tier-0 table result.
+    Table(Box<TableHud>),
+    /// Tier-0 column result.
+    Column(Box<ColumnHud>),
+    /// Load failed.
     Error(String),
 }
 
-/// Table-level statistics returned by the HUD query.
+/// Tier-0 result for a table, plus the escalation offer.
 #[derive(Debug, Clone)]
-pub struct TableStats {
-    pub row_count: i64,
-    pub size_bytes: i64,
-    pub size_display: String,
-    pub indexed_columns: Vec<String>,
+pub struct TableHud {
+    pub profile: TableProfile,
+    pub role: Option<TableRole>,
+    pub indexes: IndexSummary,
+    pub escalation: Escalation,
 }
 
-/// Column-level statistics returned by the HUD query.
+/// Tier-0 result for a column, plus interpretation and the escalation offer.
 #[derive(Debug, Clone)]
-pub struct ColumnStats {
-    pub null_count: i64,
-    pub distinct_count: i64,
-    pub min_value: Option<String>,
-    pub max_value: Option<String>,
-    pub avg_value: Option<String>,
+pub struct ColumnHud {
+    pub profile: ColumnProfile,
+    /// Table row estimate — needed to resolve `n_distinct` ratios.
+    pub estimated_rows: Option<i64>,
+    pub pg_type: PgType,
+    pub type_class: TypeClass,
+    pub insights: ColumnInsights,
+    /// Enum variants, when the column's type is a Postgres enum.
+    pub enum_variants: Option<Vec<String>>,
+    /// `table.column` the foreign key points at, when this column is an FK.
+    pub fk_target: Option<String>,
+    /// Indexes covering this column, as `(name, method)`.
+    pub covering_indexes: Vec<(String, IndexMethod)>,
+    pub escalation: Escalation,
+}
+
+/// State of the Tier-1 escalation offer for a HUD result.
+#[derive(Debug, Clone)]
+pub enum Escalation {
+    /// Deeper profiling does not apply to this target.
+    Unavailable,
+    /// Exact profiling is offered. `cheap` reflects the escalation
+    /// heuristics — when false, the probe may scan a large table.
+    Offered { cheap: bool },
+    /// A Tier-1 probe is in flight.
+    Running,
+    /// A Tier-1 probe completed.
+    Done(ExactProbe),
+    /// A Tier-1 probe failed.
+    Failed(String),
+}
+
+/// Results of a Tier-1 exact probe.
+#[derive(Debug, Clone, Default)]
+pub struct ExactProbe {
+    /// Exact `COUNT(*)`.
+    pub exact_rows: i64,
+    /// Exact `COUNT(DISTINCT col)`, when the column type supports it.
+    pub exact_distinct: Option<i64>,
+    /// Sampled top-level JSONB keys with their occurrence counts.
+    pub jsonb_keys: Vec<(String, i64)>,
+    /// Number of rows sampled for [`Self::jsonb_keys`].
+    pub jsonb_sample_rows: i64,
+}
+
+/// A compact summary of a table's indexes, built purely from the schema model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexSummary {
+    /// The table has a primary key.
+    pub has_pk: bool,
+    /// Number of `UNIQUE` constraints.
+    pub unique_count: usize,
+    /// Access method of each secondary (non-PK, non-unique) index.
+    pub secondary: Vec<IndexMethod>,
+    /// FK column lists with no covering index — an operational hazard.
+    pub unindexed_fks: Vec<String>,
+}
+
+/// Schema-derived context for a column HUD, gathered before the async load so
+/// the async task does pure IO.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnHudInput {
+    pub ctx: ColumnContext,
+    pub enum_variants: Option<Vec<String>>,
+    pub fk_target: Option<String>,
+    pub covering_indexes: Vec<(String, IndexMethod)>,
 }
 
 /// Shared handle for receiving async query results.
@@ -82,309 +169,342 @@ pub fn new_result_handle() -> HudResultHandle {
     Arc::new(Mutex::new(None))
 }
 
-// ── Async query functions ─────────────────────────────────────────────
+fn deliver(handle: &HudResultHandle, status: HudStatus) {
+    if let Ok(mut guard) = handle.lock() {
+        *guard = Some(status);
+    }
+}
 
-/// Spawn a background task that queries table-level stats and writes
-/// the result into the shared handle.
-pub fn spawn_table_query(pool: PgPool, schema: String, table: String, handle: HudResultHandle) {
+// ── Tier 0: spawning catalog loads ────────────────────────────────────
+
+/// Spawn the Tier-0 catalog load for a table.
+pub fn spawn_table_hud(pool: PgPool, schema: String, table: Table, handle: HudResultHandle) {
     tokio::spawn(async move {
-        let result = query_table_stats(&pool, &schema, &table).await;
-        let status = match result {
-            Ok(stats) => HudStatus::TableResult(stats),
+        let status = match build_table_hud(&pool, &schema, &table).await {
+            Ok(hud) => HudStatus::Table(Box::new(hud)),
             Err(e) => HudStatus::Error(e.to_string()),
         };
-        if let Ok(mut guard) = handle.lock() {
-            *guard = Some(status);
-        }
+        deliver(&handle, status);
     });
 }
 
-/// Spawn a background task that checks safety and then queries column stats.
-pub fn spawn_column_query(
+/// Spawn the Tier-0 catalog load for a column.
+pub fn spawn_column_hud(
     pool: PgPool,
     schema: String,
     table: String,
     column: String,
     pg_type: PgType,
+    input: ColumnHudInput,
     handle: HudResultHandle,
 ) {
     tokio::spawn(async move {
-        let result = query_column_stats(&pool, &schema, &table, &column, &pg_type).await;
-        let status = match result {
-            Ok(stats) => HudStatus::ColumnResult(stats),
+        let status = match build_column_hud(&pool, &schema, &table, &column, pg_type, input).await {
+            Ok(hud) => HudStatus::Column(Box::new(hud)),
             Err(e) => HudStatus::Error(e.to_string()),
         };
-        if let Ok(mut guard) = handle.lock() {
-            *guard = Some(status);
-        }
+        deliver(&handle, status);
     });
 }
 
-/// Check reltuples and index coverage to determine if a safety warning is needed.
-pub async fn check_safety(
+async fn build_table_hud(
+    pool: &PgPool,
+    schema: &str,
+    table: &Table,
+) -> Result<TableHud, sqlx::Error> {
+    let profile = load_table_profile(pool, schema, &table.name).await?;
+    let role = insight::infer_table_role(&profile, table);
+    let indexes = summarize_indexes(table);
+    let escalation = Escalation::Offered {
+        cheap: is_cheap(&profile),
+    };
+    Ok(TableHud {
+        profile,
+        role,
+        indexes,
+        escalation,
+    })
+}
+
+async fn build_column_hud(
     pool: &PgPool,
     schema: &str,
     table: &str,
     column: &str,
-) -> Result<Option<f32>, sqlx::Error> {
-    // Get estimated row count from pg_class
-    let row: (f32,) = sqlx::query_as(
-        "SELECT COALESCE(c.reltuples, 0)
-         FROM pg_class c
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = $1 AND c.relname = $2",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_one(pool)
-    .await?;
+    pg_type: PgType,
+    input: ColumnHudInput,
+) -> Result<ColumnHud, sqlx::Error> {
+    // The table profile is catalog-only and instant; we need its row estimate
+    // to resolve the column's `n_distinct` ratio form.
+    let table_profile = load_table_profile(pool, schema, table).await?;
+    let estimated_rows = table_profile.estimated_rows;
+    let profile = load_column_profile(pool, schema, table, column).await?;
+    let type_class = insight::classify_type(&pg_type);
+    let insights = insight::derive_column_insights(&profile, &pg_type, estimated_rows, input.ctx);
 
-    let reltuples = row.0;
+    let escalation = Escalation::Offered {
+        cheap: is_cheap(&table_profile),
+    };
 
-    if reltuples < LARGE_TABLE_THRESHOLD {
-        return Ok(None); // Safe to query
-    }
-
-    // Check if column has an index
-    let indexed: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM pg_index ix
-            JOIN pg_class ci ON ci.oid = ix.indexrelid
-            JOIN pg_attribute a ON a.attrelid = ix.indrelid
-            JOIN pg_class ct ON ct.oid = ix.indrelid
-            JOIN pg_namespace n ON n.oid = ct.relnamespace
-            WHERE n.nspname = $1
-              AND ct.relname = $2
-              AND a.attname = $3
-              AND a.attnum = ANY(ix.indkey)
-        )",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(column)
-    .fetch_one(pool)
-    .await?;
-
-    if indexed {
-        Ok(None) // Indexed, safe to query
-    } else {
-        Ok(Some(reltuples)) // Needs warning
-    }
+    Ok(ColumnHud {
+        profile,
+        estimated_rows,
+        pg_type,
+        type_class,
+        insights,
+        enum_variants: input.enum_variants,
+        fk_target: input.fk_target,
+        covering_indexes: input.covering_indexes,
+        escalation,
+    })
 }
 
-/// Spawn a safety check, writing a warning or triggering the column query.
-pub fn spawn_safety_check(
+// ── Tier 1: spawning exact probes ─────────────────────────────────────
+
+/// Spawn a Tier-1 exact probe for a table, escalating an existing result.
+pub fn spawn_table_escalation(
+    pool: PgPool,
+    schema: String,
+    name: String,
+    mut hud: TableHud,
+    handle: HudResultHandle,
+) {
+    tokio::spawn(async move {
+        hud.escalation = match probe_table(&pool, &schema, &name).await {
+            Ok(probe) => Escalation::Done(probe),
+            Err(e) => Escalation::Failed(e.to_string()),
+        };
+        deliver(&handle, HudStatus::Table(Box::new(hud)));
+    });
+}
+
+/// Spawn a Tier-1 exact probe for a column, escalating an existing result.
+pub fn spawn_column_escalation(
     pool: PgPool,
     schema: String,
     table: String,
     column: String,
     pg_type: PgType,
+    mut hud: ColumnHud,
     handle: HudResultHandle,
 ) {
     tokio::spawn(async move {
-        match check_safety(&pool, &schema, &table, &column).await {
-            Ok(Some(row_estimate)) => {
-                // Needs confirmation
-                let status = HudStatus::SafetyWarning {
-                    row_estimate,
-                    table,
-                    column,
-                    pg_type,
-                };
-                if let Ok(mut guard) = handle.lock() {
-                    *guard = Some(status);
-                }
-            }
-            Ok(None) => {
-                // Safe — run the query directly
-                let result = query_column_stats(&pool, &schema, &table, &column, &pg_type).await;
-                let status = match result {
-                    Ok(stats) => HudStatus::ColumnResult(stats),
-                    Err(e) => HudStatus::Error(e.to_string()),
-                };
-                if let Ok(mut guard) = handle.lock() {
-                    *guard = Some(status);
-                }
-            }
-            Err(e) => {
-                if let Ok(mut guard) = handle.lock() {
-                    *guard = Some(HudStatus::Error(e.to_string()));
-                }
-            }
-        }
+        hud.escalation = match probe_column(&pool, &schema, &table, &column, &pg_type).await {
+            Ok(probe) => Escalation::Done(probe),
+            Err(e) => Escalation::Failed(e.to_string()),
+        };
+        deliver(&handle, HudStatus::Column(Box::new(hud)));
     });
 }
 
-// ── Database queries ──────────────────────────────────────────────────
-
-pub async fn query_table_stats(
+pub async fn probe_table(
     pool: &PgPool,
     schema: &str,
     table: &str,
-) -> Result<TableStats, sqlx::Error> {
-    // Row count (exact via count(*))
-    let count_query = format!(
+) -> Result<ExactProbe, sqlx::Error> {
+    let sql = format!(
         "SELECT COUNT(*) FROM {}.{}",
         quote_ident(schema),
         quote_ident(table)
     );
-    let row_count: (i64,) = sqlx::query_as(&count_query).fetch_one(pool).await?;
-
-    // Table size from pg_class (relpages * 8192)
-    let size_row: (i64,) = sqlx::query_as(
-        "SELECT (c.relpages * 8192)::bigint
-         FROM pg_class c
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = $1 AND c.relname = $2",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_one(pool)
-    .await?;
-
-    // Indexed columns
-    let indexed_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT a.attname
-         FROM pg_index ix
-         JOIN pg_class ci ON ci.oid = ix.indexrelid
-         JOIN pg_attribute a ON a.attrelid = ix.indrelid
-         JOIN pg_class ct ON ct.oid = ix.indrelid
-         JOIN pg_namespace n ON n.oid = ct.relnamespace
-         WHERE n.nspname = $1
-           AND ct.relname = $2
-           AND a.attnum = ANY(ix.indkey)
-           AND a.attnum > 0
-         ORDER BY a.attname",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-
-    let indexed_columns: Vec<String> = indexed_rows.into_iter().map(|r| r.0).collect();
-    let size_display = format_size(size_row.0);
-
-    Ok(TableStats {
-        row_count: row_count.0,
-        size_bytes: size_row.0,
-        size_display,
-        indexed_columns,
+    let (exact_rows,): (i64,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+    Ok(ExactProbe {
+        exact_rows,
+        ..ExactProbe::default()
     })
 }
 
-pub async fn query_column_stats(
+pub async fn probe_column(
     pool: &PgPool,
     schema: &str,
     table: &str,
     column: &str,
     pg_type: &PgType,
-) -> Result<ColumnStats, sqlx::Error> {
-    let col_ref = format!(
-        "{}.{}.{}",
-        quote_ident(schema),
-        quote_ident(table),
-        quote_ident(column)
-    );
+) -> Result<ExactProbe, sqlx::Error> {
     let table_ref = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let col_ref = quote_ident(column);
 
-    // Base stats: null count and distinct count
-    let base_query = format!(
-        "SELECT
-            COUNT(*) FILTER (WHERE {col} IS NULL) AS null_count,
-            COUNT(DISTINCT {col}) AS distinct_count
-         FROM {tbl}",
-        col = col_ref,
-        tbl = table_ref,
-    );
-    let base: (i64, i64) = sqlx::query_as(&base_query).fetch_one(pool).await?;
+    let class = insight::classify_type(pg_type);
 
-    let mut stats = ColumnStats {
-        null_count: base.0,
-        distinct_count: base.1,
-        min_value: None,
-        max_value: None,
-        avg_value: None,
+    // `json` has no equality operator, so COUNT(DISTINCT) is invalid for it;
+    // `jsonb` is profiled by key sampling instead of a distinct count.
+    let want_distinct = !matches!(pg_type, PgType::Json | PgType::Jsonb);
+
+    let probe = if want_distinct {
+        let sql = format!(
+            "SELECT COUNT(*)::bigint, COUNT(DISTINCT {col})::bigint FROM {tbl}",
+            col = col_ref,
+            tbl = table_ref,
+        );
+        let (exact_rows, exact_distinct): (i64, i64) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        ExactProbe {
+            exact_rows,
+            exact_distinct: Some(exact_distinct),
+            ..ExactProbe::default()
+        }
+    } else {
+        let sql = format!("SELECT COUNT(*)::bigint FROM {table_ref}");
+        let (exact_rows,): (i64,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        ExactProbe {
+            exact_rows,
+            ..ExactProbe::default()
+        }
     };
 
-    // min/max for numeric and date/time types
-    if is_numeric_type(pg_type) {
-        let agg_query = format!(
-            "SELECT
-                MIN({col})::text,
-                MAX({col})::text,
-                AVG({col})::text
-             FROM {tbl}",
-            col = col_ref,
-            tbl = table_ref,
-        );
-        let agg: (Option<String>, Option<String>, Option<String>) =
-            sqlx::query_as(&agg_query).fetch_one(pool).await?;
-        stats.min_value = agg.0;
-        stats.max_value = agg.1;
-        stats.avg_value = agg.2;
-    } else if is_temporal_type(pg_type) {
-        let agg_query = format!(
-            "SELECT
-                MIN({col})::text,
-                MAX({col})::text
-             FROM {tbl}",
-            col = col_ref,
-            tbl = table_ref,
-        );
-        let agg: (Option<String>, Option<String>) =
-            sqlx::query_as(&agg_query).fetch_one(pool).await?;
-        stats.min_value = agg.0;
-        stats.max_value = agg.1;
+    if class == TypeClass::Json && matches!(pg_type, PgType::Jsonb) {
+        let mut probe = probe;
+        probe.jsonb_sample_rows = JSONB_SAMPLE_ROWS;
+        probe.jsonb_keys = probe_jsonb_keys(pool, &table_ref, &col_ref).await?;
+        Ok(probe)
+    } else {
+        Ok(probe)
     }
-
-    Ok(stats)
 }
 
-// ── Type classification ───────────────────────────────────────────────
-
-fn is_numeric_type(pg_type: &PgType) -> bool {
-    matches!(
-        pg_type,
-        PgType::SmallInt
-            | PgType::Integer
-            | PgType::BigInt
-            | PgType::Real
-            | PgType::DoublePrecision
-            | PgType::Numeric(_)
-    )
+/// Sample top-level JSONB keys from a bounded number of rows — deliberately
+/// kept fast (a `LIMIT`ed scan), never a full-table key inference.
+async fn probe_jsonb_keys(
+    pool: &PgPool,
+    table_ref: &str,
+    col_ref: &str,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let sql = format!(
+        "SELECT k, COUNT(*)::bigint AS n
+         FROM (
+             SELECT jsonb_object_keys({col}) AS k
+             FROM (
+                 SELECT {col} FROM {tbl}
+                 WHERE {col} IS NOT NULL
+                 LIMIT {limit}
+             ) sample
+         ) keys
+         GROUP BY k
+         ORDER BY n DESC, k
+         LIMIT 25",
+        col = col_ref,
+        tbl = table_ref,
+        limit = JSONB_SAMPLE_ROWS,
+    );
+    sqlx::query_as(&sql).fetch_all(pool).await
 }
 
-fn is_temporal_type(pg_type: &PgType) -> bool {
-    matches!(
-        pg_type,
-        PgType::Timestamp | PgType::Timestamptz | PgType::Date | PgType::Time | PgType::Timetz
-    )
+// ── Escalation heuristics & index summary (pure) ──────────────────────
+
+/// Whether the escalation heuristics consider exact probing of this table
+/// cheap enough to run without hesitation.
+pub fn is_cheap(profile: &TableProfile) -> bool {
+    let small_rows = matches!(profile.estimated_rows, Some(r) if r < CHEAP_ROW_LIMIT);
+    let small_heap = profile.heap_bytes < CHEAP_BYTE_LIMIT;
+    small_rows || small_heap
+}
+
+/// Build the [`IndexSummary`] for a table from the schema model alone.
+pub fn summarize_indexes(table: &Table) -> IndexSummary {
+    use crate::schema::Constraint;
+
+    let has_pk = table.primary_key().is_some();
+    let unique_count = table
+        .constraints
+        .iter()
+        .filter(|c| matches!(c, Constraint::Unique { .. }))
+        .count();
+    let secondary: Vec<IndexMethod> = table.indexes.iter().map(|i| i.method.clone()).collect();
+
+    let unindexed_fks = table
+        .foreign_keys()
+        .iter()
+        .filter_map(|c| match c {
+            Constraint::ForeignKey { columns, .. } if !fk_is_covered(table, columns) => {
+                Some(columns.join(", "))
+            }
+            _ => None,
+        })
+        .collect();
+
+    IndexSummary {
+        has_pk,
+        unique_count,
+        secondary,
+        unindexed_fks,
+    }
+}
+
+/// Whether the given FK columns are covered by an index whose leading columns
+/// match — a PK, a unique constraint, or a secondary index.
+fn fk_is_covered(table: &Table, fk_columns: &[String]) -> bool {
+    use crate::schema::Constraint;
+
+    let starts_with =
+        |cols: &[String]| cols.len() >= fk_columns.len() && cols[..fk_columns.len()] == *fk_columns;
+
+    let constraint_covers = table.constraints.iter().any(|c| match c {
+        Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
+            starts_with(columns)
+        }
+        _ => false,
+    });
+    let index_covers = table.indexes.iter().any(|i| starts_with(&i.columns));
+    constraint_covers || index_covers
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Quote a SQL identifier to prevent injection.
 fn quote_ident(ident: &str) -> String {
-    // Double any existing quotes and wrap in quotes
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Format byte size into human-readable string.
+/// Format a byte size into a human-readable string.
 fn format_size(bytes: i64) -> String {
-    const KB: i64 = 1024;
-    const MB: i64 = 1024 * 1024;
-    const GB: i64 = 1024 * 1024 * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Format an exact integer with thousands separators.
+fn format_number(n: i64) -> String {
+    let neg = n < 0;
+    let s = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3 + 1);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if neg {
+        out.push('-');
+    }
+    out.chars().rev().collect()
+}
+
+/// Format an *estimated* count compactly: `942`, `12k`, `1.4M`, `3.1B`.
+fn format_approx(n: i64) -> String {
+    let a = n.unsigned_abs();
+    if a < 1_000 {
+        n.to_string()
+    } else if a < 1_000_000 {
+        format!("{}k", (n as f64 / 1_000.0).round() as i64)
+    } else if a < 1_000_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    }
+}
+
+/// Render a `0.0..=1.0` fraction as a whole-number percent.
+fn format_pct(frac: f64) -> String {
+    format!("{}%", (frac * 100.0).round() as i64)
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
@@ -392,42 +512,31 @@ fn format_size(bytes: i64) -> String {
 const HUD_BORDER_STYLE: Style = Style::new().fg(Color::Magenta);
 const HUD_LABEL_STYLE: Style = Style::new().fg(Color::DarkGray);
 const HUD_VALUE_STYLE: Style = Style::new().fg(Color::White);
+const HUD_TAG_STYLE: Style = Style::new().fg(Color::Cyan);
 const HUD_WARN_STYLE: Style = Style::new().fg(Color::Yellow);
 const HUD_ERROR_STYLE: Style = Style::new().fg(Color::Red);
+const HUD_DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
 
 /// Render the HUD overlay on top of the existing frame.
 pub fn render_hud(frame: &mut Frame, area: Rect, hud: &HudState) {
-    let (title, lines) = match &hud.status {
-        HudStatus::Loading => {
-            let title = hud_title(&hud.target);
-            let lines = vec![Line::from(Span::styled("  Loading...", HUD_LABEL_STYLE))];
-            (title, lines)
-        }
-        HudStatus::TableResult(stats) => render_table_stats(&hud.target, stats),
-        HudStatus::ColumnResult(stats) => render_column_stats(&hud.target, stats),
-        HudStatus::SafetyWarning {
-            row_estimate,
-            table,
-            column,
-            ..
-        } => render_safety_warning(row_estimate, table, column),
-        HudStatus::Error(msg) => {
-            let title = hud_title(&hud.target);
-            let lines = vec![Line::from(Span::styled(
-                format!("  Error: {msg}"),
-                HUD_ERROR_STYLE,
-            ))];
-            (title, lines)
-        }
+    let title = hud_title(&hud.target);
+    let lines = match &hud.status {
+        HudStatus::Loading => vec![dim_line("  loading…")],
+        HudStatus::Table(t) => table_hud_lines(t),
+        HudStatus::Column(c) => column_hud_lines(c),
+        HudStatus::Error(msg) => vec![Line::from(Span::styled(
+            format!("  error: {msg}"),
+            HUD_ERROR_STYLE,
+        ))],
     };
 
-    let content_height = lines.len() as u16 + 2; // +2 for border
+    let content_height = lines.len() as u16 + 2;
     let content_width = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.width()).sum::<usize>())
         .max()
         .unwrap_or(20) as u16
-        + 4; // +4 for border + padding
+        + 4;
 
     let popup = centered_rect(
         content_width.min(area.width.saturating_sub(4)),
@@ -436,7 +545,6 @@ pub fn render_hud(frame: &mut Frame, area: Rect, hud: &HudState) {
     );
 
     frame.render_widget(Clear, popup);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(HUD_BORDER_STYLE)
@@ -446,12 +554,9 @@ pub fn render_hud(frame: &mut Frame, area: Rect, hud: &HudState) {
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         );
-
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn hud_title(target: &HudTarget) -> String {
@@ -461,92 +566,424 @@ fn hud_title(target: &HudTarget) -> String {
     }
 }
 
-fn render_table_stats(target: &HudTarget, stats: &TableStats) -> (String, Vec<Line<'static>>) {
-    let title = hud_title(target);
+// ── Table rendering ───────────────────────────────────────────────────
 
-    let indexed = if stats.indexed_columns.is_empty() {
-        "none".to_string()
+/// Build the rendered lines for a table HUD. Pure — also used by snapshot tests.
+pub fn table_hud_lines(hud: &TableHud) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    // Role badge.
+    if let Some(role) = hud.role {
+        lines.push(tag_line(&[role.to_string()]));
+    }
+
+    // Rows.
+    match hud.profile.estimated_rows {
+        Some(rows) => lines.push(fact("rows", &format!("~{}", format_approx(rows)))),
+        None => lines.push(warn_fact("rows", "unknown — never analyzed")),
+    }
+
+    // Size.
+    lines.push(fact(
+        "size",
+        &format!(
+            "{} heap · {} indexes",
+            format_size(hud.profile.heap_bytes),
+            format_size(hud.profile.index_bytes),
+        ),
+    ));
+
+    // Index summary.
+    lines.push(fact("indexes", &render_index_summary(&hud.indexes)));
+    for fk in &hud.indexes.unindexed_fks {
+        lines.push(warn_line(&format!("FK without index: {fk}")));
+    }
+
+    // Stale-stats note (decision Q3 — surfacing it is itself a signal).
+    if let Some(line) = analyze_age_line(&hud.profile) {
+        lines.push(line);
+    }
+
+    escalation_lines(&hud.escalation, &mut lines, escalation_table_summary);
+    lines
+}
+
+fn render_index_summary(s: &IndexSummary) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if s.has_pk {
+        parts.push("PK".into());
+    }
+    if s.unique_count > 0 {
+        parts.push(format!("{} UNIQUE", s.unique_count));
+    }
+    if s.secondary.len() > HEAVY_INDEX_COUNT {
+        parts.push(format!("heavily indexed ({})", s.secondary.len()));
     } else {
-        stats.indexed_columns.join(", ")
+        // Group secondary indexes by method, preserving first-seen order.
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        for m in &s.secondary {
+            let name = m.to_string();
+            match groups.iter_mut().find(|(g, _)| *g == name) {
+                Some((_, count)) => *count += 1,
+                None => groups.push((name, 1)),
+            }
+        }
+        for (name, count) in groups {
+            parts.push(if count > 1 {
+                format!("{count}×{name}")
+            } else {
+                name
+            });
+        }
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn escalation_table_summary(probe: &ExactProbe) -> Vec<Line<'static>> {
+    vec![fact("exact rows", &format_number(probe.exact_rows))]
+}
+
+// ── Column rendering ──────────────────────────────────────────────────
+
+/// Build the rendered lines for a column HUD. Pure — also used by snapshot tests.
+pub fn column_hud_lines(hud: &ColumnHud) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    // Header: type plus interpretive tags.
+    let mut header = vec![Span::styled(format!("  {}", hud.pg_type), HUD_VALUE_STYLE)];
+    let tag_text: Vec<String> = hud
+        .insights
+        .tags
+        .iter()
+        .map(|t| tag_label(*t).into())
+        .collect();
+    if !tag_text.is_empty() {
+        header.push(Span::styled("  ·  ", HUD_DIM_STYLE));
+        header.push(Span::styled(tag_text.join(", "), HUD_TAG_STYLE));
+    }
+    lines.push(Line::from(header));
+
+    // No statistics at all — make that explicit (decision Q3).
+    if !hud.profile.analyzed {
+        lines.push(warn_line("no statistics — column not analyzed"));
+        // FK target is structural and still worth showing.
+        if let Some(target) = &hud.fk_target {
+            lines.push(fact("→", target));
+        }
+        escalation_lines(&hud.escalation, &mut lines, escalation_column_summary);
+        return lines;
+    }
+
+    // Universal: sparsity / fill.
+    if let Some(sparsity) = hud.insights.sparsity {
+        lines.push(sparsity_line(sparsity, hud.profile.null_frac));
+    }
+
+    // Type-dispatched body.
+    match hud.type_class {
+        TypeClass::Text => render_text_column(hud, &mut lines),
+        TypeClass::Boolean => render_boolean_column(hud, &mut lines),
+        TypeClass::Integer | TypeClass::Numeric => render_numeric_column(hud, &mut lines),
+        TypeClass::Temporal => render_temporal_column(hud, &mut lines),
+        TypeClass::Uuid => render_uuid_column(hud, &mut lines),
+        TypeClass::Json => render_json_column(hud, &mut lines),
+        TypeClass::Array => render_array_column(hud, &mut lines),
+        TypeClass::Other => render_other_column(hud, &mut lines),
+    }
+
+    // FK target line — high-value, shown for every FK column.
+    if let Some(target) = &hud.fk_target {
+        lines.push(fact("→", target));
+        // An FK with no covering index is a major operational hazard.
+        if hud.insights.tags.contains(&ColumnTag::FkUnindexed) {
+            lines.push(warn_line("foreign key has no index"));
+        }
+    }
+
+    // Ordering / append correlation.
+    if let Some(ord) = hud.insights.ordering {
+        if let Some(text) = ordering_text(ord) {
+            lines.push(fact("ordering", text));
+        }
+    }
+
+    escalation_lines(&hud.escalation, &mut lines, escalation_column_summary);
+    lines
+}
+
+fn render_text_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    push_distinctness(hud, lines);
+    if hud.profile.avg_width > 0 {
+        lines.push(fact("avg", &format!("{} chars", hud.profile.avg_width)));
+    }
+    push_top_values(&hud.profile, lines);
+}
+
+fn render_boolean_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    // Boolean MCV are rendered by Postgres as `t` / `f`.
+    let freq_of = |needle: &str| {
+        hud.profile
+            .mcv
+            .iter()
+            .position(|v| v == needle)
+            .and_then(|i| hud.profile.mcv_freqs.get(i).copied())
     };
-
-    let lines = vec![
-        hud_kv("Rows", &format_number(stats.row_count)),
-        hud_kv("Size", &stats.size_display),
-        hud_kv("Indexed", &indexed),
-    ];
-
-    (title, lines)
+    match (freq_of("t"), freq_of("f")) {
+        (Some(t), _) => lines.push(fact("TRUE", &format_pct(t))),
+        (None, Some(f)) => lines.push(fact("FALSE", &format_pct(f))),
+        (None, None) => {}
+    }
 }
 
-fn render_column_stats(target: &HudTarget, stats: &ColumnStats) -> (String, Vec<Line<'static>>) {
-    let title = hud_title(target);
-
-    let mut lines = vec![
-        hud_kv("Nulls", &format_number(stats.null_count)),
-        hud_kv("Distinct", &format_number(stats.distinct_count)),
-    ];
-
-    if let Some(min) = &stats.min_value {
-        lines.push(hud_kv("Min", min));
+fn render_numeric_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    if let Some((lo, hi)) = hud.profile.value_range() {
+        lines.push(fact("range", &format!("{lo} → {hi}")));
     }
-    if let Some(max) = &stats.max_value {
-        lines.push(hud_kv("Max", max));
+    if let Some(median) = hud.profile.approx_median() {
+        lines.push(fact("p50", &format!("~{median}")));
     }
-    if let Some(avg) = &stats.avg_value {
-        lines.push(hud_kv("Avg", avg));
+    match insight::numeric_skew(&hud.profile) {
+        Some(Skew::RightSkewed) => lines.push(fact("shape", "right-skewed")),
+        Some(Skew::LeftSkewed) => lines.push(fact("shape", "left-skewed")),
+        _ => {}
     }
-
-    (title, lines)
+    push_distinctness(hud, lines);
 }
 
-fn render_safety_warning(
-    row_estimate: &f32,
-    table: &str,
-    column: &str,
-) -> (String, Vec<Line<'static>>) {
-    let title = format!("HUD: {table}.{column}");
-    let lines = vec![
-        Line::from(Span::styled(
-            format!("  Table has ~{} rows", format_number(*row_estimate as i64)),
-            HUD_WARN_STYLE,
-        )),
-        Line::from(Span::styled(
-            format!("  Column \"{column}\" is not indexed"),
-            HUD_WARN_STYLE,
-        )),
-        Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            "  Press 'y' to query, Esc to cancel",
-            HUD_LABEL_STYLE,
-        )),
-    ];
-    (title, lines)
+fn render_temporal_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    if let Some((lo, hi)) = hud.profile.value_range() {
+        lines.push(fact("range", &format!("{lo} → {hi}")));
+    }
+    push_distinctness(hud, lines);
 }
 
-/// Create a key-value line for the HUD.
-fn hud_kv(label: &str, value: &str) -> Line<'static> {
+fn render_uuid_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    push_distinctness(hud, lines);
+}
+
+fn render_json_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    if hud.profile.avg_width > 0 {
+        lines.push(fact("avg size", &format_size(hud.profile.avg_width as i64)));
+    }
+    let gin = hud
+        .covering_indexes
+        .iter()
+        .any(|(_, m)| matches!(m, IndexMethod::Gin));
+    if gin {
+        lines.push(fact("index", "GIN"));
+    }
+}
+
+fn render_array_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    if hud.profile.avg_width > 0 {
+        lines.push(fact("avg size", &format_size(hud.profile.avg_width as i64)));
+    }
+    push_distinctness(hud, lines);
+}
+
+fn render_other_column(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    // Enums are the high-value case here: list the variants.
+    if let Some(variants) = &hud.enum_variants {
+        lines.push(fact("enum", &format!("{} values", variants.len())));
+        if !variants.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", variants.join(" · ")),
+                HUD_TAG_STYLE,
+            )));
+        }
+    } else {
+        push_distinctness(hud, lines);
+    }
+}
+
+fn push_distinctness(hud: &ColumnHud, lines: &mut Vec<Line<'static>>) {
+    let Some(distinctness) = hud.insights.distinctness else {
+        return;
+    };
+    let abs = hud.profile.distinct_estimate(hud.estimated_rows);
+    let value = match (distinctness, abs) {
+        (Distinctness::Constant, _) => "≈1 (constant)".to_string(),
+        (_, Some(a)) => format!(
+            "~{} ({})",
+            format_approx(a as i64),
+            distinctness_word(distinctness)
+        ),
+        (_, None) => distinctness_word(distinctness).to_string(),
+    };
+    lines.push(fact("distinct", &value));
+}
+
+fn push_top_values(profile: &ColumnProfile, lines: &mut Vec<Line<'static>>) {
+    if profile.mcv.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = profile
+        .mcv
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(i, v)| match profile.mcv_freqs.get(i) {
+            Some(&f) => format!("{v} {}", format_pct(f)),
+            None => v.clone(),
+        })
+        .collect();
+    lines.push(fact("top", &parts.join(", ")));
+}
+
+fn distinctness_word(d: Distinctness) -> &'static str {
+    match d {
+        Distinctness::Constant => "constant",
+        Distinctness::Categorical => "categorical",
+        Distinctness::Grouped => "distinct",
+        Distinctness::Unique => "≈unique",
+    }
+}
+
+fn sparsity_line(s: Sparsity, null_frac: f64) -> Line<'static> {
+    match s {
+        Sparsity::Full => fact("filled", "100%"),
+        Sparsity::MostlyFull => fact("filled", &format_pct(1.0 - null_frac)),
+        Sparsity::Sparse => warn_fact(
+            "filled",
+            &format!("{} — mostly unused", format_pct(1.0 - null_frac)),
+        ),
+        Sparsity::Empty => warn_fact("filled", "0% — entirely null"),
+    }
+}
+
+fn ordering_text(o: Ordering) -> Option<&'static str> {
+    match o {
+        Ordering::Clustered => Some("insertion-ordered (BRIN-friendly)"),
+        Ordering::Loose => Some("partially ordered"),
+        Ordering::Scattered => None,
+    }
+}
+
+fn tag_label(t: ColumnTag) -> &'static str {
+    match t {
+        ColumnTag::EnumIsh => "enum-ish",
+        ColumnTag::Freeform => "freeform",
+        ColumnTag::MostlyUnique => "mostly unique",
+        ColumnTag::LikelyIdentifier => "likely identifier",
+        ColumnTag::MonotonicId => "monotonic id",
+        ColumnTag::AppendCorrelated => "append-correlated",
+        ColumnTag::FkWellIndexed => "FK · indexed",
+        ColumnTag::FkUnindexed => "FK · UNINDEXED",
+    }
+}
+
+// ── Shared rendering helpers ──────────────────────────────────────────
+
+fn escalation_lines(
+    escalation: &Escalation,
+    lines: &mut Vec<Line<'static>>,
+    on_done: impl Fn(&ExactProbe) -> Vec<Line<'static>>,
+) {
+    match escalation {
+        Escalation::Unavailable => {}
+        Escalation::Offered { cheap } => {
+            lines.push(divider());
+            let hint = if *cheap {
+                "  p  profile — exact counts".to_string()
+            } else {
+                "  p  profile — exact counts (may scan a large table)".to_string()
+            };
+            lines.push(Line::from(Span::styled(hint, HUD_DIM_STYLE)));
+        }
+        Escalation::Running => {
+            lines.push(divider());
+            lines.push(dim_line("  profiling…"));
+        }
+        Escalation::Done(probe) => {
+            lines.push(divider());
+            lines.extend(on_done(probe));
+        }
+        Escalation::Failed(e) => {
+            lines.push(divider());
+            lines.push(Line::from(Span::styled(
+                format!("  profile failed: {e}"),
+                HUD_ERROR_STYLE,
+            )));
+        }
+    }
+}
+
+fn escalation_column_summary(probe: &ExactProbe) -> Vec<Line<'static>> {
+    let mut lines = vec![fact("exact rows", &format_number(probe.exact_rows))];
+    if let Some(distinct) = probe.exact_distinct {
+        lines.push(fact("exact distinct", &format_number(distinct)));
+    }
+    if !probe.jsonb_keys.is_empty() {
+        lines.push(fact(
+            "keys",
+            &format!("sampled {} rows", probe.jsonb_sample_rows),
+        ));
+        let keys: Vec<String> = probe
+            .jsonb_keys
+            .iter()
+            .take(8)
+            .map(|(k, _)| k.clone())
+            .collect();
+        lines.push(Line::from(Span::styled(
+            format!("  {}", keys.join(" · ")),
+            HUD_TAG_STYLE,
+        )));
+    }
+    lines
+}
+
+fn analyze_age_line(profile: &TableProfile) -> Option<Line<'static>> {
+    match profile.analyze_age_days {
+        Some(days) if profile.stats_are_stale() => Some(warn_fact(
+            "analyzed",
+            &format!("{days}d ago — stats may be stale"),
+        )),
+        Some(days) => Some(Line::from(vec![
+            Span::styled("  analyzed: ", HUD_LABEL_STYLE),
+            Span::styled(format!("{days}d ago"), HUD_DIM_STYLE),
+        ])),
+        None => Some(warn_fact("analyzed", "never")),
+    }
+}
+
+/// A `label: value` fact line.
+fn fact(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {label}: "), HUD_LABEL_STYLE),
         Span::styled(value.to_string(), HUD_VALUE_STYLE),
     ])
 }
 
-/// Format a number with thousand separators.
-fn format_number(n: i64) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
+/// A `label: value` fact line styled as a warning.
+fn warn_fact(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label}: "), HUD_LABEL_STYLE),
+        Span::styled(value.to_string(), HUD_WARN_STYLE),
+    ])
+}
 
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    result.chars().rev().collect()
+/// A standalone warning line.
+fn warn_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(format!("  ⚠ {text}"), HUD_WARN_STYLE))
+}
+
+fn dim_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), HUD_DIM_STYLE))
+}
+
+fn tag_line(tags: &[String]) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {}", tags.join(", ")),
+        HUD_TAG_STYLE,
+    ))
+}
+
+fn divider() -> Line<'static> {
+    Line::from(Span::styled("  ─────", HUD_DIM_STYLE))
 }
 
 /// Calculate a centered rectangle within the given area.
@@ -556,182 +993,316 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
-// ── Unit tests ────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::insight::ColumnContext;
+    use crate::schema::{Column, Constraint, Index};
+
+    /// Flatten rendered lines to plain text, one line per row.
+    fn lines_to_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn analyzed(n_distinct: f64) -> ColumnProfile {
+        ColumnProfile {
+            n_distinct,
+            analyzed: true,
+            ..ColumnProfile::unavailable()
+        }
+    }
+
+    fn column_hud(pg_type: PgType, profile: ColumnProfile) -> ColumnHud {
+        let type_class = insight::classify_type(&pg_type);
+        let insights = insight::derive_column_insights(
+            &profile,
+            &pg_type,
+            Some(1_000_000),
+            ColumnContext::default(),
+        );
+        ColumnHud {
+            profile,
+            estimated_rows: Some(1_000_000),
+            pg_type,
+            type_class,
+            insights,
+            enum_variants: None,
+            fk_target: None,
+            covering_indexes: Vec::new(),
+            escalation: Escalation::Offered { cheap: true },
+        }
+    }
+
+    // ── pure helpers ──
 
     #[test]
-    fn format_size_bytes() {
-        assert_eq!(format_size(0), "0 B");
+    fn format_size_units() {
         assert_eq!(format_size(512), "512 B");
-    }
-
-    #[test]
-    fn format_size_kilobytes() {
-        assert_eq!(format_size(1024), "1.0 KB");
         assert_eq!(format_size(2048), "2.0 KB");
-        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(10 * 1024 * 1024), "10.0 MB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 
     #[test]
-    fn format_size_megabytes() {
-        assert_eq!(format_size(1048576), "1.0 MB");
-        assert_eq!(format_size(10 * 1048576), "10.0 MB");
-    }
-
-    #[test]
-    fn format_size_gigabytes() {
-        assert_eq!(format_size(1073741824), "1.0 GB");
-    }
-
-    #[test]
-    fn format_number_small() {
+    fn format_number_separators() {
         assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(42), "42");
         assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+        assert_eq!(format_number(-4200), "-4,200");
     }
 
     #[test]
-    fn format_number_thousands() {
-        assert_eq!(format_number(1000), "1,000");
-        assert_eq!(format_number(12345), "12,345");
-        assert_eq!(format_number(1234567), "1,234,567");
+    fn format_approx_compacts() {
+        assert_eq!(format_approx(942), "942");
+        assert_eq!(format_approx(12_000), "12k");
+        assert_eq!(format_approx(1_400_000), "1.4M");
+        assert_eq!(format_approx(3_100_000_000), "3.1B");
     }
 
     #[test]
-    fn quote_ident_simple() {
+    fn quote_ident_escapes_quotes() {
         assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 
     #[test]
-    fn quote_ident_with_quotes() {
-        assert_eq!(quote_ident("my\"table"), "\"my\"\"table\"");
-    }
-
-    #[test]
-    fn is_numeric_type_positive() {
-        assert!(is_numeric_type(&PgType::Integer));
-        assert!(is_numeric_type(&PgType::BigInt));
-        assert!(is_numeric_type(&PgType::Numeric(Some((10, 2)))));
-        assert!(is_numeric_type(&PgType::DoublePrecision));
-    }
-
-    #[test]
-    fn is_numeric_type_negative() {
-        assert!(!is_numeric_type(&PgType::Text));
-        assert!(!is_numeric_type(&PgType::Uuid));
-        assert!(!is_numeric_type(&PgType::Timestamptz));
-    }
-
-    #[test]
-    fn is_temporal_type_positive() {
-        assert!(is_temporal_type(&PgType::Timestamp));
-        assert!(is_temporal_type(&PgType::Timestamptz));
-        assert!(is_temporal_type(&PgType::Date));
-    }
-
-    #[test]
-    fn is_temporal_type_negative() {
-        assert!(!is_temporal_type(&PgType::Integer));
-        assert!(!is_temporal_type(&PgType::Text));
-    }
-
-    #[test]
-    fn hud_title_table() {
-        let target = HudTarget::Table {
-            name: "users".into(),
+    fn is_cheap_by_rows_or_size() {
+        let mut p = TableProfile {
+            estimated_rows: Some(10_000),
+            heap_bytes: 1 << 30, // 1 GiB
+            index_bytes: 0,
+            inserts: 0,
+            updates: 0,
+            deletes: 0,
+            analyze_age_days: Some(0),
         };
-        assert_eq!(hud_title(&target), "HUD: users");
+        assert!(is_cheap(&p)); // cheap by row count
+        p.estimated_rows = Some(10_000_000);
+        assert!(!is_cheap(&p)); // huge rows + huge heap
+        p.heap_bytes = 1024;
+        assert!(is_cheap(&p)); // cheap by heap size
+    }
+
+    // ── index summary ──
+
+    fn fk_table() -> Table {
+        let mut t = Table::new("posts");
+        t.add_column(Column::new("id", PgType::Uuid));
+        t.add_column(Column::new("author_id", PgType::Uuid));
+        t.add_constraint(Constraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        t.add_constraint(Constraint::ForeignKey {
+            name: None,
+            columns: vec!["author_id".into()],
+            references: crate::schema::types::ForeignKeyRef {
+                table: "users".into(),
+                columns: vec!["id".into()],
+            },
+            on_delete: None,
+            on_update: None,
+        });
+        t
     }
 
     #[test]
-    fn hud_title_column() {
-        let target = HudTarget::Column {
-            table: "users".into(),
-            column: "email".into(),
-            pg_type: PgType::Text,
-        };
-        assert_eq!(hud_title(&target), "HUD: users.email");
+    fn summarize_indexes_flags_unindexed_fk() {
+        let summary = summarize_indexes(&fk_table());
+        assert!(summary.has_pk);
+        assert_eq!(summary.unindexed_fks, vec!["author_id".to_string()]);
     }
 
     #[test]
-    fn table_stats_rendering() {
-        let target = HudTarget::Table {
-            name: "users".into(),
-        };
-        let stats = TableStats {
-            row_count: 1500,
-            size_bytes: 8192,
-            size_display: "8.0 KB".into(),
-            indexed_columns: vec!["id".into(), "email".into()],
-        };
-        let (title, lines) = render_table_stats(&target, &stats);
-        assert_eq!(title, "HUD: users");
-        assert_eq!(lines.len(), 3);
+    fn summarize_indexes_clears_warning_when_fk_indexed() {
+        let mut t = fk_table();
+        t.add_index(Index {
+            name: "posts_author_idx".into(),
+            columns: vec!["author_id".into()],
+            unique: false,
+            partial: None,
+            method: IndexMethod::Btree,
+        });
+        let summary = summarize_indexes(&t);
+        assert!(summary.unindexed_fks.is_empty());
     }
 
     #[test]
-    fn column_stats_rendering_numeric() {
-        let target = HudTarget::Column {
-            table: "users".into(),
-            column: "age".into(),
-            pg_type: PgType::Integer,
+    fn render_index_summary_groups_methods() {
+        let summary = IndexSummary {
+            has_pk: true,
+            unique_count: 2,
+            secondary: vec![IndexMethod::Gin, IndexMethod::Btree, IndexMethod::Btree],
+            unindexed_fks: vec![],
         };
-        let stats = ColumnStats {
-            null_count: 10,
-            distinct_count: 50,
-            min_value: Some("18".into()),
-            max_value: Some("99".into()),
-            avg_value: Some("42.5".into()),
-        };
-        let (title, lines) = render_column_stats(&target, &stats);
-        assert_eq!(title, "HUD: users.age");
-        assert_eq!(lines.len(), 5); // nulls, distinct, min, max, avg
+        assert_eq!(
+            render_index_summary(&summary),
+            "PK · 2 UNIQUE · gin · 2×btree"
+        );
     }
 
     #[test]
-    fn column_stats_rendering_text() {
-        let target = HudTarget::Column {
-            table: "users".into(),
-            column: "name".into(),
-            pg_type: PgType::Text,
+    fn render_index_summary_heavy() {
+        let summary = IndexSummary {
+            has_pk: true,
+            unique_count: 0,
+            secondary: vec![IndexMethod::Btree; 9],
+            unindexed_fks: vec![],
         };
-        let stats = ColumnStats {
-            null_count: 0,
-            distinct_count: 100,
-            min_value: None,
-            max_value: None,
-            avg_value: None,
+        assert_eq!(render_index_summary(&summary), "PK · heavily indexed (9)");
+    }
+
+    // ── rendering snapshots ──
+
+    #[test]
+    fn snapshot_text_enum_column() {
+        let mut p = analyzed(4.0);
+        p.mcv = vec!["pending".into(), "active".into(), "disabled".into()];
+        p.mcv_freqs = vec![0.51, 0.33, 0.16];
+        p.avg_width = 8;
+        let hud = column_hud(PgType::Text, p);
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_numeric_column() {
+        let mut p = analyzed(-1.0);
+        p.histogram = vec!["0".into(), "42".into(), "18222".into()];
+        p.correlation = Some(0.99);
+        let hud = column_hud(PgType::BigInt, p);
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_boolean_column() {
+        let mut p = analyzed(2.0);
+        p.mcv = vec!["t".into(), "f".into()];
+        p.mcv_freqs = vec![0.987, 0.013];
+        let hud = column_hud(PgType::Boolean, p);
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_unanalyzed_column() {
+        let hud = column_hud(PgType::Text, ColumnProfile::unavailable());
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_unindexed_fk_column() {
+        let mut hud = column_hud(PgType::Uuid, analyzed(-1.0));
+        hud.fk_target = Some("users.id".into());
+        hud.insights = insight::derive_column_insights(
+            &hud.profile,
+            &hud.pg_type,
+            hud.estimated_rows,
+            ColumnContext {
+                is_foreign_key: true,
+                is_indexed: false,
+                ..ColumnContext::default()
+            },
+        );
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_enum_column() {
+        let mut hud = column_hud(PgType::Custom("job_status".into()), analyzed(5.0));
+        hud.enum_variants = Some(vec![
+            "draft".into(),
+            "queued".into(),
+            "running".into(),
+            "failed".into(),
+            "complete".into(),
+        ]);
+        insta::assert_snapshot!(lines_to_text(&column_hud_lines(&hud)));
+    }
+
+    #[test]
+    fn snapshot_table_hud() {
+        let hud = TableHud {
+            profile: TableProfile {
+                estimated_rows: Some(82_000_000),
+                heap_bytes: 14 * 1024 * 1024 * 1024,
+                index_bytes: 9 * 1024 * 1024 * 1024,
+                inserts: 82_000_000,
+                updates: 10,
+                deletes: 0,
+                analyze_age_days: Some(2),
+            },
+            role: Some(TableRole::EventLog),
+            indexes: IndexSummary {
+                has_pk: true,
+                unique_count: 1,
+                secondary: vec![IndexMethod::Gin],
+                unindexed_fks: vec![],
+            },
+            escalation: Escalation::Offered { cheap: false },
         };
-        let (_title, lines) = render_column_stats(&target, &stats);
-        assert_eq!(lines.len(), 2); // nulls, distinct only
+        insta::assert_snapshot!(lines_to_text(&table_hud_lines(&hud)));
     }
 
     #[test]
-    fn safety_warning_rendering() {
-        let (title, lines) = render_safety_warning(&150_000.0, "big_table", "unindexed_col");
-        assert_eq!(title, "HUD: big_table.unindexed_col");
-        assert_eq!(lines.len(), 4);
+    fn snapshot_table_hud_escalated() {
+        let hud = TableHud {
+            profile: TableProfile {
+                estimated_rows: Some(940),
+                heap_bytes: 64 * 1024,
+                index_bytes: 16 * 1024,
+                inserts: 940,
+                updates: 0,
+                deletes: 0,
+                analyze_age_days: Some(0),
+            },
+            role: Some(TableRole::LookupTable),
+            indexes: IndexSummary {
+                has_pk: true,
+                unique_count: 0,
+                secondary: vec![],
+                unindexed_fks: vec![],
+            },
+            escalation: Escalation::Done(ExactProbe {
+                exact_rows: 942,
+                ..ExactProbe::default()
+            }),
+        };
+        insta::assert_snapshot!(lines_to_text(&table_hud_lines(&hud)));
     }
 
     #[test]
-    fn centered_rect_calculation() {
-        let area = Rect::new(0, 0, 80, 24);
-        let popup = centered_rect(40, 10, area);
-        assert_eq!(popup.x, 20);
-        assert_eq!(popup.y, 7);
-        assert_eq!(popup.width, 40);
-        assert_eq!(popup.height, 10);
+    fn unanalyzed_column_has_no_type_dispatch_body() {
+        let hud = column_hud(PgType::Integer, ColumnProfile::unavailable());
+        let text = lines_to_text(&column_hud_lines(&hud));
+        assert!(text.contains("not analyzed"));
+        assert!(!text.contains("range:"));
     }
 
     #[test]
-    fn centered_rect_larger_than_area() {
-        let area = Rect::new(0, 0, 20, 10);
-        let popup = centered_rect(40, 20, area);
-        // Should clamp to area dimensions
-        assert_eq!(popup.width, 20);
-        assert_eq!(popup.height, 10);
+    fn type_class_dispatch_is_exhaustive() {
+        // Every TypeClass renders without panicking.
+        for ty in [
+            PgType::Text,
+            PgType::Boolean,
+            PgType::Integer,
+            PgType::Numeric(None),
+            PgType::Timestamptz,
+            PgType::Uuid,
+            PgType::Jsonb,
+            PgType::Array(Box::new(PgType::Text)),
+            PgType::Bytea,
+        ] {
+            let hud = column_hud(ty.clone(), analyzed(10.0));
+            let _ = column_hud_lines(&hud);
+            assert_eq!(hud.type_class, insight::classify_type(&ty));
+        }
     }
 }

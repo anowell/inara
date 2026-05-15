@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use super::{Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, Schema, Table};
+use super::{
+    Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, IndexMethod, Schema, Table,
+};
 
 /// Render a complete schema to the declarative text format.
 pub fn render_schema(schema: &Schema) -> String {
@@ -257,10 +259,15 @@ fn render_constraint(out: &mut String, constraint: &Constraint) {
 fn render_index(out: &mut String, index: &Index) {
     let cols = index.columns.join(", ");
     if index.unique {
-        let _ = write!(out, "    UNIQUE INDEX {}({cols})", index.name);
+        let _ = write!(out, "    UNIQUE INDEX {}", index.name);
     } else {
-        let _ = write!(out, "    INDEX {}({cols})", index.name);
+        let _ = write!(out, "    INDEX {}", index.name);
     }
+    // Omit `USING btree` since btree is the implicit default.
+    if index.method != IndexMethod::Btree {
+        let _ = write!(out, " USING {}", index.method);
+    }
+    let _ = write!(out, "({cols})");
     if let Some(where_clause) = &index.partial {
         let _ = write!(out, " {where_clause}");
     }
@@ -362,6 +369,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(posts);
 
@@ -416,12 +424,14 @@ mod tests {
             columns: vec!["user_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table.add_index(Index {
             name: "orders_status_idx".into(),
             columns: vec!["status".into()],
             unique: false,
             partial: Some("WHERE status != 'completed'".into()),
+            method: IndexMethod::Btree,
         });
 
         schema.add_table(table);
@@ -497,6 +507,7 @@ mod tests {
             columns: vec!["email".into()],
             unique: true,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(users);
 
@@ -551,6 +562,7 @@ mod tests {
             columns: vec!["user_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(members);
 
@@ -697,10 +709,63 @@ mod tests {
             columns: vec!["active".into()],
             unique: true,
             partial: Some("WHERE active = true".into()),
+            method: IndexMethod::Btree,
         });
         schema.add_table(table);
         let rendered = render_schema(&schema);
         assert!(rendered.contains("UNIQUE INDEX events_active_idx(active) WHERE active = true"));
+    }
+
+    #[test]
+    fn index_method_renders_using_for_non_btree() {
+        let mut schema = Schema::new();
+        let mut table = Table::new("docs");
+        table.add_column(Column::new("id", PgType::BigInt));
+        table.add_column(Column::new("body", PgType::Jsonb));
+        table.add_index(Index {
+            name: "docs_btree_idx".into(),
+            columns: vec!["id".into()],
+            unique: false,
+            partial: None,
+            method: IndexMethod::Btree,
+        });
+        table.add_index(Index {
+            name: "docs_gin_idx".into(),
+            columns: vec!["body".into()],
+            unique: false,
+            partial: None,
+            method: IndexMethod::Gin,
+        });
+        schema.add_table(table);
+        let rendered = render_schema(&schema);
+        // btree is the implicit default and is omitted.
+        assert!(rendered.contains("INDEX docs_btree_idx(id)"));
+        assert!(!rendered.contains("USING btree"));
+        // Non-btree methods are rendered explicitly.
+        assert!(rendered.contains("INDEX docs_gin_idx USING gin(body)"));
+    }
+
+    #[test]
+    fn index_method_render_parse_round_trip() {
+        use crate::schema::parse::parse_schema;
+        let mut schema = Schema::new();
+        let mut table = Table::new("docs");
+        table.add_column(Column::new("id", PgType::BigInt));
+        table.add_column(Column::new("body", PgType::Jsonb));
+        table.add_index(Index {
+            name: "docs_gin_idx".into(),
+            columns: vec!["body".into()],
+            unique: false,
+            partial: None,
+            method: IndexMethod::Gin,
+        });
+        schema.add_table(table);
+        let rendered = render_schema(&schema);
+        let reparsed = parse_schema(&rendered).unwrap();
+        assert_eq!(
+            reparsed.table("docs").unwrap().indexes[0].method,
+            IndexMethod::Gin
+        );
     }
 
     #[test]

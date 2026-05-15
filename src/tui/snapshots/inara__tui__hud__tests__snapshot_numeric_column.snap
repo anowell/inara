@@ -1,0 +1,13 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  bigint  ·  monotonic id
+  filled: 100%
+  range: 0 → 18222
+  p50: ~42
+  shape: right-skewed
+  distinct: ~1.0M (≈unique)
+  ordering: insertion-ordered (BRIN-friendly)
+  ─────
+  p  profile — exact counts

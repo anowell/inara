@@ -1,0 +1,11 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  text  ·  enum-ish
+  filled: 100%
+  distinct: ~4 (categorical)
+  avg: 8 chars
+  top: pending 51%, active 33%, disabled 16%
+  ─────
+  p  profile — exact counts

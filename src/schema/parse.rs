@@ -6,7 +6,7 @@ use winnow::ModalResult;
 
 use super::{
     types::{Expression, ForeignKeyRef, PgType, ReferentialAction},
-    Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, Schema, Table,
+    Column, Constraint, CustomType, CustomTypeKind, EnumType, Index, IndexMethod, Schema, Table,
 };
 
 /// Error returned when parsing the declarative schema format fails.
@@ -486,6 +486,19 @@ fn parse_index(table: &mut Table, input: &mut &str, unique_prefix: bool) -> Moda
         "INDEX ".parse_next(input)?;
     }
     let name = identifier(input)?;
+
+    // Optional `USING <method>` clause. When absent, defaults to btree.
+    take_while(0.., |c: char| c == ' ' || c == '\t').parse_next(input)?;
+    let method = if input.starts_with("USING ") || input.starts_with("using ") {
+        let _: &str = take_while(5, |_| true).parse_next(input)?; // consume "USING"
+        take_while(1.., |c: char| c == ' ' || c == '\t').parse_next(input)?;
+        let method_name = identifier(input)?;
+        IndexMethod::parse(&method_name.to_ascii_lowercase())
+    } else {
+        IndexMethod::Btree
+    };
+
+    take_while(0.., |c: char| c == ' ' || c == '\t').parse_next(input)?;
     "(".parse_next(input)?;
     let cols = column_list(input)?;
     ")".parse_next(input)?;
@@ -510,6 +523,7 @@ fn parse_index(table: &mut Table, input: &mut &str, unique_prefix: bool) -> Moda
         columns: cols,
         unique: unique_prefix,
         partial,
+        method,
     });
     Ok(())
 }
@@ -918,6 +932,50 @@ table orders {
             table.indexes[1].partial.as_deref(),
             Some("WHERE status != 'completed'")
         );
+
+        // No USING clause defaults to btree.
+        assert_eq!(table.indexes[0].method, IndexMethod::Btree);
+        assert_eq!(table.indexes[1].method, IndexMethod::Btree);
+    }
+
+    #[test]
+    fn parse_index_with_using_method() {
+        let input = "\
+table docs {
+    id    bigint  NOT NULL
+    body  jsonb   NOT NULL
+    tags  jsonb   NOT NULL
+
+    INDEX docs_body_idx USING gin(body)
+    INDEX docs_tags_idx USING brin(tags)
+    INDEX docs_id_idx(id)
+}
+";
+        let schema = parse_schema(input).unwrap();
+        let table = schema.table("docs").unwrap();
+        assert_eq!(table.indexes.len(), 3);
+
+        let by_name = |n: &str| table.indexes.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(by_name("docs_body_idx").method, IndexMethod::Gin);
+        assert_eq!(by_name("docs_tags_idx").method, IndexMethod::Brin);
+        // No USING clause defaults to btree.
+        assert_eq!(by_name("docs_id_idx").method, IndexMethod::Btree);
+    }
+
+    #[test]
+    fn parse_unique_index_with_using_method() {
+        let input = "\
+table docs {
+    id    bigint  NOT NULL
+    body  jsonb   NOT NULL
+
+    UNIQUE INDEX docs_body_idx USING gist(body)
+}
+";
+        let schema = parse_schema(input).unwrap();
+        let table = schema.table("docs").unwrap();
+        assert_eq!(table.indexes[0].method, IndexMethod::Gist);
+        assert!(table.indexes[0].unique);
     }
 
     #[test]

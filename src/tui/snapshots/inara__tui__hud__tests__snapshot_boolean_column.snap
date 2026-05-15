@@ -1,0 +1,9 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  boolean
+  filled: 100%
+  TRUE: 99%
+  ─────
+  p  profile — exact counts

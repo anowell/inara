@@ -361,6 +361,7 @@ pub enum DefaultChange {
 mod tests {
     use super::*;
     use crate::schema::types::{ForeignKeyRef, ReferentialAction};
+    use crate::schema::IndexMethod;
 
     // ── Helpers ──────────────────────────────────────────
 
@@ -403,6 +404,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         t
     }
@@ -993,6 +995,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         new.add_table(t);
 
@@ -1009,6 +1012,41 @@ mod tests {
     }
 
     #[test]
+    fn diff_index_method_change_is_drop_and_recreate() {
+        let make = |method: IndexMethod| {
+            let mut schema = Schema::new();
+            let mut t = Table::new("docs");
+            t.add_column(Column::new("body", PgType::Jsonb));
+            t.add_index(Index {
+                name: "docs_body_idx".into(),
+                columns: vec!["body".into()],
+                unique: false,
+                partial: None,
+                method,
+            });
+            schema.add_table(t);
+            schema
+        };
+
+        let old = make(IndexMethod::Btree);
+        let new = make(IndexMethod::Gin);
+
+        let changes = diff(&old, &new, &[]);
+        // Postgres cannot ALTER an index's access method, so a method change
+        // must become DROP INDEX + CREATE INDEX.
+        assert_eq!(changes.len(), 2);
+        assert!(matches!(
+            &changes[0],
+            Change::DropIndex(name) if name == "docs_body_idx"
+        ));
+        assert!(matches!(
+            &changes[1],
+            Change::AddIndex { index, .. }
+                if index.name == "docs_body_idx" && index.method == IndexMethod::Gin
+        ));
+    }
+
+    #[test]
     fn diff_drop_index() {
         let mut old = Schema::new();
         let mut t = Table::new("posts");
@@ -1018,6 +1056,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         old.add_table(t);
 
@@ -1174,6 +1213,7 @@ mod tests {
             columns: vec!["title".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         new.add_table(new_posts);
 
@@ -1279,6 +1319,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         old.add_table(t);
 
@@ -1290,6 +1331,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: true, // Changed to unique
             partial: None,
+            method: IndexMethod::Btree,
         });
         new.add_table(t);
 

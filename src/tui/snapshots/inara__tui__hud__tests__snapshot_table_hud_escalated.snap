@@ -1,0 +1,11 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&table_hud_lines(&hud))
+---
+  lookup table
+  rows: ~940
+  size: 64.0 KB heap · 16.0 KB indexes
+  indexes: PK
+  analyzed: 0d ago
+  ─────
+  exact rows: 942

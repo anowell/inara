@@ -1,5 +1,14 @@
+//! Integration tests for the Query HUD.
+//!
+//! Tier 0 (catalog / `pg_stats` loading) and Tier 1 (exact probes) both run
+//! real SQL against a Postgres instance, so these are `#[ignore]`d and run via
+//! `just test-integration`. They validate that the queries are *valid* and
+//! return correct exact values; the pure interpretation logic is unit-tested
+//! separately and needs no database.
+
 use std::path::Path;
 
+use inara::schema::profile_load::{load_column_profile, load_table_profile};
 use inara::schema::types::PgType;
 use inara::tui::hud;
 use sqlx::PgPool;
@@ -36,87 +45,117 @@ async fn run_fixture(pool: &PgPool, filename: &str) {
     }
 }
 
-async fn setup_test_schema(pool: &PgPool) {
-    run_fixture(pool, "setup.sql").await;
-}
-
-async fn teardown_test_schema(pool: &PgPool) {
-    run_fixture(pool, "teardown.sql").await;
-}
-
 async fn with_test_schema<F, Fut>(f: F)
 where
     F: FnOnce(PgPool) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     let pool = setup_pool().await;
-    setup_test_schema(&pool).await;
+    run_fixture(&pool, "setup.sql").await;
     f(pool.clone()).await;
-    teardown_test_schema(&pool).await;
+    run_fixture(&pool, "teardown.sql").await;
 }
 
-/// Insert known test data for HUD queries.
-async fn insert_test_data(pool: &PgPool) {
-    // Insert users
+/// Insert known test data and `ANALYZE` so planner statistics exist.
+async fn insert_and_analyze(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO inara_test.users (id, email, name, status, age, bio, created_at) VALUES
          ('a0000000-0000-0000-0000-000000000001', 'alice@test.com', 'Alice', 'active', 30, 'Hello', '2025-01-01T00:00:00Z'),
          ('a0000000-0000-0000-0000-000000000002', 'bob@test.com', 'Bob', 'inactive', 25, NULL, '2025-06-15T12:00:00Z'),
-         ('a0000000-0000-0000-0000-000000000003', 'carol@test.com', 'Carol', 'pending', 40, 'Hi', '2025-12-31T23:59:59Z')"
+         ('a0000000-0000-0000-0000-000000000003', 'carol@test.com', 'Carol', 'pending', 40, 'Hi', '2025-12-31T23:59:59Z')",
     )
     .execute(pool)
     .await
     .expect("insert users");
 
-    // Insert posts
     sqlx::query(
-        "INSERT INTO inara_test.posts (author_id, title, body, score, published, created_at) VALUES
-         ('a0000000-0000-0000-0000-000000000001', 'Post 1', 'Body 1', 4.50, true, '2025-02-01T00:00:00Z'),
-         ('a0000000-0000-0000-0000-000000000001', 'Post 2', NULL, 2.00, false, '2025-03-01T00:00:00Z'),
-         ('a0000000-0000-0000-0000-000000000002', 'Post 3', 'Body 3', 0.00, true, '2025-04-01T00:00:00Z')"
+        "INSERT INTO inara_test.posts (author_id, title, body, metadata, score, published, created_at) VALUES
+         ('a0000000-0000-0000-0000-000000000001', 'Post 1', 'Body 1', '{\"views\": 10, \"featured\": true}', 4.50, true, '2025-02-01T00:00:00Z'),
+         ('a0000000-0000-0000-0000-000000000001', 'Post 2', NULL, '{\"views\": 3, \"featured\": false}', 2.00, false, '2025-03-01T00:00:00Z'),
+         ('a0000000-0000-0000-0000-000000000002', 'Post 3', 'Body 3', '{\"views\": 7}', 0.00, true, '2025-04-01T00:00:00Z')",
     )
     .execute(pool)
     .await
     .expect("insert posts");
+
+    sqlx::query("ANALYZE inara_test.users")
+        .execute(pool)
+        .await
+        .expect("analyze users");
+    sqlx::query("ANALYZE inara_test.posts")
+        .execute(pool)
+        .await
+        .expect("analyze posts");
 }
 
-// ── Table-level HUD tests ──────────────────────────────────────────
+// ── Tier 0: table profile ──────────────────────────────────────────
 
 #[tokio::test]
 #[ignore]
-async fn hud_table_stats_row_count() {
+async fn table_profile_estimates_rows_after_analyze() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        insert_and_analyze(&pool).await;
 
-        let stats = hud::query_table_stats(&pool, TEST_SCHEMA, "users")
+        let profile = load_table_profile(&pool, TEST_SCHEMA, "users")
             .await
-            .expect("query_table_stats should succeed");
+            .expect("load_table_profile should succeed");
 
-        assert_eq!(stats.row_count, 3, "users should have 3 rows");
+        assert!(profile.is_analyzed(), "users has been analyzed");
+        assert_eq!(profile.estimated_rows, Some(3), "users has 3 rows");
     })
     .await;
 }
 
 #[tokio::test]
 #[ignore]
-async fn hud_table_stats_size() {
+async fn table_profile_reports_sizes() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        insert_and_analyze(&pool).await;
 
-        // Run ANALYZE to update pg_class stats
-        sqlx::query("ANALYZE inara_test.users")
-            .execute(&pool)
+        let profile = load_table_profile(&pool, TEST_SCHEMA, "users")
             .await
-            .expect("analyze");
+            .expect("load_table_profile should succeed");
 
-        let stats = hud::query_table_stats(&pool, TEST_SCHEMA, "users")
+        assert!(profile.heap_bytes > 0, "non-empty table has a heap");
+        assert!(profile.index_bytes > 0, "users has a PK + unique indexes");
+        assert!(profile.total_bytes() >= profile.heap_bytes);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn table_profile_loads_for_empty_table() {
+    with_test_schema(|pool| async move {
+        // categories has no rows and has not been analyzed — must still load.
+        let profile = load_table_profile(&pool, TEST_SCHEMA, "categories")
             .await
-            .expect("query_table_stats should succeed");
+            .expect("load_table_profile should succeed for an empty table");
 
-        assert!(stats.size_bytes >= 0, "size should be non-negative");
+        assert!(profile.heap_bytes >= 0);
+        assert!(profile.index_bytes >= 0);
+    })
+    .await;
+}
+
+// ── Tier 0: column profile ─────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn column_profile_reports_null_fraction() {
+    with_test_schema(|pool| async move {
+        insert_and_analyze(&pool).await;
+
+        // bio: Alice "Hello", Bob NULL, Carol "Hi" — 1 of 3 is null.
+        let profile = load_column_profile(&pool, TEST_SCHEMA, "users", "bio")
+            .await
+            .expect("load_column_profile should succeed");
+
+        assert!(profile.analyzed, "bio has pg_stats after ANALYZE");
         assert!(
-            !stats.size_display.is_empty(),
-            "size_display should not be empty"
+            profile.null_frac > 0.0,
+            "bio has a null value, expected null_frac > 0, got {}",
+            profile.null_frac
         );
     })
     .await;
@@ -124,26 +163,19 @@ async fn hud_table_stats_size() {
 
 #[tokio::test]
 #[ignore]
-async fn hud_table_stats_indexed_columns() {
+async fn column_profile_loads_enum_column() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        insert_and_analyze(&pool).await;
 
-        // users table has indexes on: id (PK), email (unique), name+email (composite unique)
-        let stats = hud::query_table_stats(&pool, TEST_SCHEMA, "users")
+        // status is a Postgres enum — exercises the anyarray->text cast path.
+        let profile = load_column_profile(&pool, TEST_SCHEMA, "users", "status")
             .await
-            .expect("query_table_stats should succeed");
+            .expect("load_column_profile should succeed for an enum column");
 
+        assert!(profile.analyzed);
         assert!(
-            stats.indexed_columns.contains(&"id".to_string()),
-            "id should be indexed (PK)"
-        );
-        assert!(
-            stats.indexed_columns.contains(&"email".to_string()),
-            "email should be indexed (unique constraint)"
-        );
-        assert!(
-            stats.indexed_columns.contains(&"name".to_string()),
-            "name should be indexed (composite unique index)"
+            profile.n_distinct != 0.0,
+            "status has a distinctness signal"
         );
     })
     .await;
@@ -151,54 +183,75 @@ async fn hud_table_stats_indexed_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn hud_table_stats_posts() {
+async fn column_profile_unavailable_when_not_analyzed() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
-
-        let stats = hud::query_table_stats(&pool, TEST_SCHEMA, "posts")
+        // No inserts, no ANALYZE — pg_stats has no row for this column.
+        let profile = load_column_profile(&pool, TEST_SCHEMA, "users", "bio")
             .await
-            .expect("query_table_stats should succeed");
+            .expect("load_column_profile should succeed even with no stats");
 
-        assert_eq!(stats.row_count, 3, "posts should have 3 rows");
-
-        // posts has indexes on: id (PK), author_id, (author_id, created_at), created_at (partial)
         assert!(
-            stats.indexed_columns.contains(&"id".to_string()),
-            "id should be indexed"
-        );
-        assert!(
-            stats.indexed_columns.contains(&"author_id".to_string()),
-            "author_id should be indexed"
+            !profile.analyzed,
+            "an unanalyzed column reports no statistics"
         );
     })
     .await;
 }
 
-// ── Column-level HUD tests ─────────────────────────────────────────
+// ── Tier 1: exact probes ───────────────────────────────────────────
 
 #[tokio::test]
 #[ignore]
-async fn hud_column_stats_null_count() {
+async fn probe_table_counts_rows_exactly() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        insert_and_analyze(&pool).await;
 
-        let stats = hud::query_column_stats(&pool, TEST_SCHEMA, "users", "bio", &PgType::Text)
+        let probe = hud::probe_table(&pool, TEST_SCHEMA, "users")
             .await
-            .expect("query_column_stats should succeed");
+            .expect("probe_table should succeed");
 
-        // Alice has bio "Hello", Bob has NULL, Carol has "Hi"
-        assert_eq!(stats.null_count, 1, "bio should have 1 null");
+        assert_eq!(probe.exact_rows, 3);
     })
     .await;
 }
 
 #[tokio::test]
 #[ignore]
-async fn hud_column_stats_distinct_count() {
+async fn probe_table_handles_empty_table() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        let probe = hud::probe_table(&pool, TEST_SCHEMA, "categories")
+            .await
+            .expect("probe_table should succeed");
 
-        let stats = hud::query_column_stats(
+        assert_eq!(probe.exact_rows, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn probe_column_counts_distinct() {
+    with_test_schema(|pool| async move {
+        insert_and_analyze(&pool).await;
+
+        // bio: "Hello", NULL, "Hi" — 2 distinct non-null values.
+        let probe = hud::probe_column(&pool, TEST_SCHEMA, "users", "bio", &PgType::Text)
+            .await
+            .expect("probe_column should succeed");
+
+        assert_eq!(probe.exact_rows, 3);
+        assert_eq!(probe.exact_distinct, Some(2));
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn probe_column_distinct_for_enum() {
+    with_test_schema(|pool| async move {
+        insert_and_analyze(&pool).await;
+
+        let probe = hud::probe_column(
             &pool,
             TEST_SCHEMA,
             "users",
@@ -206,256 +259,40 @@ async fn hud_column_stats_distinct_count() {
             &PgType::Custom("status".into()),
         )
         .await
-        .expect("query_column_stats should succeed");
+        .expect("probe_column should succeed");
 
-        // 3 users with 3 different statuses: active, inactive, pending
-        assert_eq!(
-            stats.distinct_count, 3,
-            "status should have 3 distinct values"
-        );
+        assert_eq!(probe.exact_distinct, Some(3), "3 distinct statuses");
     })
     .await;
 }
 
 #[tokio::test]
 #[ignore]
-async fn hud_column_stats_numeric_min_max_avg() {
+async fn probe_column_samples_jsonb_keys() {
     with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        insert_and_analyze(&pool).await;
 
-        let stats = hud::query_column_stats(&pool, TEST_SCHEMA, "users", "age", &PgType::Integer)
+        let probe = hud::probe_column(&pool, TEST_SCHEMA, "posts", "metadata", &PgType::Jsonb)
             .await
-            .expect("query_column_stats should succeed");
+            .expect("probe_column should succeed for jsonb");
 
-        // Ages: 30, 25, 40 (Bob has NULL age? No — check: age is nullable)
-        // Actually per fixture, Alice=30, Bob=25, Carol=40
-        assert_eq!(
-            stats.min_value.as_deref(),
-            Some("25"),
-            "min age should be 25"
-        );
-        assert_eq!(
-            stats.max_value.as_deref(),
-            Some("40"),
-            "max age should be 40"
-        );
-        assert!(
-            stats.avg_value.is_some(),
-            "avg should be present for numeric"
-        );
-    })
-    .await;
-}
+        assert_eq!(probe.exact_rows, 3);
+        assert!(probe.jsonb_sample_rows > 0, "a sample bound was applied");
 
-#[tokio::test]
-#[ignore]
-async fn hud_column_stats_date_min_max() {
-    with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
+        let keys: Vec<&str> = probe.jsonb_keys.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"views"), "sampled keys: {keys:?}");
+        assert!(keys.contains(&"featured"), "sampled keys: {keys:?}");
 
-        let stats = hud::query_column_stats(
-            &pool,
-            TEST_SCHEMA,
-            "users",
-            "created_at",
-            &PgType::Timestamptz,
-        )
-        .await
-        .expect("query_column_stats should succeed");
-
-        assert!(
-            stats.min_value.is_some(),
-            "min should be present for timestamptz"
-        );
-        assert!(
-            stats.max_value.is_some(),
-            "max should be present for timestamptz"
-        );
-        assert!(
-            stats.avg_value.is_none(),
-            "avg should NOT be present for timestamptz"
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn hud_column_stats_text_no_min_max() {
-    with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
-
-        let stats = hud::query_column_stats(
-            &pool,
-            TEST_SCHEMA,
-            "users",
-            "name",
-            &PgType::Varchar(Some(255)),
-        )
-        .await
-        .expect("query_column_stats should succeed");
-
-        // Text/varchar columns should NOT have min/max/avg
-        assert!(
-            stats.min_value.is_none(),
-            "text columns should not have min"
-        );
-        assert!(
-            stats.max_value.is_none(),
-            "text columns should not have max"
-        );
-        assert!(
-            stats.avg_value.is_none(),
-            "text columns should not have avg"
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn hud_column_stats_numeric_score() {
-    with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
-
-        let stats = hud::query_column_stats(
-            &pool,
-            TEST_SCHEMA,
-            "posts",
-            "score",
-            &PgType::Numeric(Some((5, 2))),
-        )
-        .await
-        .expect("query_column_stats should succeed");
-
-        // Scores: 4.50, 2.00, 0.00
-        assert_eq!(stats.min_value.as_deref(), Some("0.00"), "min score");
-        assert_eq!(stats.max_value.as_deref(), Some("4.50"), "max score");
-        assert!(stats.avg_value.is_some(), "avg should be present");
-        assert_eq!(stats.null_count, 0, "no null scores");
-        assert_eq!(stats.distinct_count, 3, "3 distinct scores");
-    })
-    .await;
-}
-
-// ── Safety check tests ─────────────────────────────────────────────
-
-#[tokio::test]
-#[ignore]
-async fn hud_safety_check_small_table() {
-    with_test_schema(|pool| async move {
-        insert_test_data(&pool).await;
-
-        // Run ANALYZE so pg_class.reltuples is accurate
-        sqlx::query("ANALYZE inara_test.users")
-            .execute(&pool)
-            .await
-            .expect("analyze");
-
-        // users table has only 3 rows — well below the threshold
-        let result = hud::check_safety(&pool, TEST_SCHEMA, "users", "bio")
-            .await
-            .expect("check_safety should succeed");
-
-        assert!(
-            result.is_none(),
-            "small table should not trigger safety warning"
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn hud_safety_check_large_unindexed_triggers_warning() {
-    with_test_schema(|pool| async move {
-        // Artificially set reltuples to a high value to simulate a large table
-        // We do this by directly updating pg_class (requires superuser or owner)
-        sqlx::query(
-            "UPDATE pg_class
-             SET reltuples = 500000
-             WHERE relname = 'users'
-               AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)",
-        )
-        .bind(TEST_SCHEMA)
-        .execute(&pool)
-        .await
-        .expect("update reltuples");
-
-        // bio column is NOT indexed
-        let result = hud::check_safety(&pool, TEST_SCHEMA, "users", "bio")
-            .await
-            .expect("check_safety should succeed");
-
-        assert!(
-            result.is_some(),
-            "large table with unindexed column should trigger warning"
-        );
-        let estimate = result.unwrap();
-        assert!(estimate >= 100_000.0, "row estimate should be >= threshold");
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn hud_safety_check_large_indexed_no_warning() {
-    with_test_schema(|pool| async move {
-        // Set reltuples high
-        sqlx::query(
-            "UPDATE pg_class
-             SET reltuples = 500000
-             WHERE relname = 'users'
-               AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)",
-        )
-        .bind(TEST_SCHEMA)
-        .execute(&pool)
-        .await
-        .expect("update reltuples");
-
-        // id column IS indexed (PK)
-        let result = hud::check_safety(&pool, TEST_SCHEMA, "users", "id")
-            .await
-            .expect("check_safety should succeed");
-
-        assert!(
-            result.is_none(),
-            "indexed column should not trigger warning even on large table"
-        );
-    })
-    .await;
-}
-
-// ── Empty table edge case ───────────────────────────────────────────
-
-#[tokio::test]
-#[ignore]
-async fn hud_table_stats_empty_table() {
-    with_test_schema(|pool| async move {
-        // categories table has no inserted data
-        let stats = hud::query_table_stats(&pool, TEST_SCHEMA, "categories")
-            .await
-            .expect("query_table_stats should succeed");
-
-        assert_eq!(stats.row_count, 0, "empty table should have 0 rows");
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn hud_column_stats_empty_table() {
-    with_test_schema(|pool| async move {
-        let stats =
-            hud::query_column_stats(&pool, TEST_SCHEMA, "categories", "name", &PgType::Text)
-                .await
-                .expect("query_column_stats should succeed");
-
-        assert_eq!(stats.null_count, 0, "empty table null count should be 0");
-        assert_eq!(
-            stats.distinct_count, 0,
-            "empty table distinct count should be 0"
-        );
+        // `views` is present in all 3 rows, `featured` in 2.
+        let count_of = |needle: &str| {
+            probe
+                .jsonb_keys
+                .iter()
+                .find(|(k, _)| k == needle)
+                .map(|(_, n)| *n)
+        };
+        assert_eq!(count_of("views"), Some(3));
+        assert_eq!(count_of("featured"), Some(2));
     })
     .await;
 }

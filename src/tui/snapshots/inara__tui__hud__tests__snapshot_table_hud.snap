@@ -1,0 +1,11 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&table_hud_lines(&hud))
+---
+  event log
+  rows: ~82.0M
+  size: 14.0 GB heap · 9.0 GB indexes
+  indexes: PK · 1 UNIQUE · gin
+  analyzed: 2d ago
+  ─────
+  p  profile — exact counts (may scan a large table)

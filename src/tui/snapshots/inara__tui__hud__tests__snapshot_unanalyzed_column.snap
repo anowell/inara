@@ -1,0 +1,8 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  text
+  ⚠ no statistics — column not analyzed
+  ─────
+  p  profile — exact counts

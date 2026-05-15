@@ -118,7 +118,7 @@ impl RelationMap {
 mod tests {
     use super::*;
     use crate::schema::types::{Expression, PgType};
-    use crate::schema::{Column, Index, Table};
+    use crate::schema::{Column, Index, IndexMethod, Table};
 
     fn users_table() -> Table {
         let mut table = Table::new("users");
@@ -155,6 +155,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table
     }
@@ -196,12 +197,14 @@ mod tests {
             columns: vec!["post_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table.add_index(Index {
             name: "comments_author_idx".into(),
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table
     }
@@ -348,12 +351,14 @@ mod tests {
             columns: vec!["created_at".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         table.add_index(Index {
             name: "events_recent_idx".into(),
             columns: vec!["created_at".into()],
             unique: false,
             partial: Some("WHERE created_at > now() - interval '7 days'".into()),
+            method: IndexMethod::Btree,
         });
 
         let mut schema = Schema::new();
@@ -376,6 +381,7 @@ mod tests {
             columns: vec!["tenant_id".into(), "created_at".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
 
         let mut schema = Schema::new();

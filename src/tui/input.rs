@@ -9,7 +9,9 @@ use super::app::{
 use super::edit;
 use super::fuzzy::SearchFilter;
 use super::goto::{self, GotoResult};
-use super::hud::{self, HudResultHandle, HudState, HudStatus, HudTarget};
+use super::hud::{
+    self, ColumnHudInput, Escalation, HudResultHandle, HudState, HudStatus, HudTarget,
+};
 use crate::llm::{self, LlmResultHandle};
 use crate::migration::overlay::PendingOverlay;
 use crate::migration::warnings::MigrationWarning;
@@ -1252,20 +1254,21 @@ fn handle_hud(
 ) -> (AppState, Option<HudResultHandle>) {
     match key.code {
         KeyCode::Esc => (state.with_mode(Mode::Normal), None),
-        KeyCode::Char('y') => confirm_safety_warning(state, pool),
+        // Escalate to a Tier-1 exact profile. `y` is kept for muscle memory.
+        KeyCode::Char('p') | KeyCode::Char('y') => escalate_hud(state, pool),
         _ => (state, None),
     }
 }
 
 /// Open the HUD for the currently focused element.
+///
+/// This only kicks off the instant Tier-0 catalog load — no heap is touched.
 fn open_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle>) {
+    // Multi-schema support is tracked separately (inara-fxr); always `public`.
+    let schema_name = "public".to_string();
     let focus = state.focus().cloned();
 
-    let (target, schema_name) = match focus {
-        Some(FocusTarget::Table(ref name)) => (
-            HudTarget::Table { name: name.clone() },
-            "public".to_string(),
-        ),
+    let target = match focus {
         Some(FocusTarget::Column(ref table, ref col)) => {
             let pg_type = state
                 .schema
@@ -1273,60 +1276,126 @@ fn open_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle
                 .and_then(|t| t.column(col))
                 .map(|c| c.pg_type.clone())
                 .unwrap_or(crate::schema::types::PgType::Text);
-            (
-                HudTarget::Column {
-                    table: table.clone(),
-                    column: col.clone(),
-                    pg_type,
-                },
-                "public".to_string(),
-            )
-        }
-        // For other table-related targets, use the table
-        Some(ref target) => {
-            if let Some(name) = target.table_name() {
-                (
-                    HudTarget::Table {
-                        name: name.to_string(),
-                    },
-                    "public".to_string(),
-                )
-            } else {
-                return (state, None); // Can't open HUD for non-table elements
+            HudTarget::Column {
+                table: table.clone(),
+                column: col.clone(),
+                pg_type,
             }
         }
+        Some(ref focus) => match focus.table_name() {
+            Some(name) => HudTarget::Table {
+                name: name.to_string(),
+            },
+            None => return (state, None), // Not a table-related element.
+        },
         None => return (state, None),
     };
 
     let handle = hud::new_result_handle();
-
     match &target {
-        HudTarget::Table { name } => {
-            hud::spawn_table_query(pool.clone(), schema_name, name.clone(), handle.clone());
-        }
+        HudTarget::Table { name } => match state.schema.table(name) {
+            Some(table) => hud::spawn_table_hud(
+                pool.clone(),
+                schema_name.clone(),
+                table.clone(),
+                handle.clone(),
+            ),
+            None => return (state, None),
+        },
         HudTarget::Column {
             table,
             column,
             pg_type,
         } => {
-            hud::spawn_safety_check(
+            let input = build_column_input(&state, table, column, pg_type);
+            hud::spawn_column_hud(
                 pool.clone(),
-                schema_name,
+                schema_name.clone(),
                 table.clone(),
                 column.clone(),
                 pg_type.clone(),
+                input,
                 handle.clone(),
             );
         }
     }
 
     let hud_state = HudState {
+        schema: schema_name,
         target,
         status: HudStatus::Loading,
     };
-
     let state = state.with_mode(Mode::HUD).with_hud(Some(hud_state));
     (state, Some(handle))
+}
+
+/// Gather the schema-derived context a column HUD needs, so the async task is
+/// pure IO.
+fn build_column_input(
+    state: &AppState,
+    table: &str,
+    column: &str,
+    pg_type: &crate::schema::types::PgType,
+) -> ColumnHudInput {
+    use crate::schema::insight::ColumnContext;
+    use crate::schema::types::PgType;
+    use crate::schema::Constraint;
+
+    let schema = &state.schema;
+    let rmap = &state.relation_map;
+    let tbl = schema.table(table);
+
+    let in_pk = tbl
+        .and_then(|t| t.primary_key())
+        .is_some_and(|pk| match pk {
+            Constraint::PrimaryKey { columns, .. } => columns.iter().any(|c| c == column),
+            _ => false,
+        });
+    let in_unique = tbl.is_some_and(|t| {
+        t.constraints.iter().any(|c| match c {
+            Constraint::Unique { columns, .. } => columns.iter().any(|x| x == column),
+            _ => false,
+        })
+    });
+
+    let secondary = rmap.indexes_for_column(table, column);
+    let is_indexed = !secondary.is_empty() || in_pk || in_unique;
+
+    let fk = rmap
+        .outgoing(table)
+        .iter()
+        .find(|fk| fk.columns.iter().any(|c| c == column));
+    let fk_target = fk.map(|fk| {
+        format!(
+            "{}.{}",
+            fk.references.table,
+            fk.references.columns.join(", ")
+        )
+    });
+
+    let covering_indexes = secondary
+        .iter()
+        .filter_map(|name| {
+            tbl.and_then(|t| t.indexes.iter().find(|i| &i.name == name))
+                .map(|i| (i.name.clone(), i.method.clone()))
+        })
+        .collect();
+
+    let enum_variants = match pg_type {
+        PgType::Custom(name) => schema.enum_type(name).map(|e| e.variants.clone()),
+        _ => None,
+    };
+
+    ColumnHudInput {
+        ctx: ColumnContext {
+            is_primary_key: in_pk,
+            is_foreign_key: fk.is_some(),
+            is_indexed,
+        },
+        enum_variants,
+        fk_target,
+        covering_indexes,
+    }
 }
 
 /// Handle key events in MigrationPreview mode (public for integration tests).
@@ -1420,31 +1489,61 @@ fn confirm_migration(state: AppState) -> AppState {
     }
 }
 
-/// Handle 'y' key in HUD mode to confirm a safety warning and run the query.
-fn confirm_safety_warning(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle>) {
-    let hud = match &state.hud {
-        Some(hud) => hud,
-        None => return (state, None),
+/// Escalate the HUD to a Tier-1 exact probe.
+///
+/// Replaces the old press-`y`-to-confirm-a-dangerous-query flow: the Tier-0
+/// HUD is already safe and instant, so the keypress now *opts in* to deeper,
+/// heap-touching profiling rather than waving away a hazard.
+fn escalate_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle>) {
+    let Some(hud) = &state.hud else {
+        return (state, None);
     };
+    let schema = hud.schema.clone();
 
-    // Only respond to 'y' when showing a safety warning
     match &hud.status {
-        HudStatus::SafetyWarning {
-            table,
-            column,
-            pg_type,
-            ..
-        } => {
+        HudStatus::Table(table_hud)
+            if matches!(table_hud.escalation, Escalation::Offered { .. }) =>
+        {
+            let HudTarget::Table { name } = &hud.target else {
+                return (state, None);
+            };
+            let name = name.clone();
+            let mut table_hud = (**table_hud).clone();
+            table_hud.escalation = Escalation::Running;
             let handle = hud::new_result_handle();
-            hud::spawn_column_query(
+            hud::spawn_table_escalation(
                 pool.clone(),
-                "public".to_string(),
-                table.clone(),
-                column.clone(),
-                pg_type.clone(),
+                schema,
+                name,
+                table_hud.clone(),
                 handle.clone(),
             );
-            let state = state.with_hud_status(HudStatus::Loading);
+            let state = state.with_hud_status(HudStatus::Table(Box::new(table_hud)));
+            (state, Some(handle))
+        }
+        HudStatus::Column(col_hud) if matches!(col_hud.escalation, Escalation::Offered { .. }) => {
+            let HudTarget::Column {
+                table,
+                column,
+                pg_type,
+            } = &hud.target
+            else {
+                return (state, None);
+            };
+            let (table, column, pg_type) = (table.clone(), column.clone(), pg_type.clone());
+            let mut col_hud = (**col_hud).clone();
+            col_hud.escalation = Escalation::Running;
+            let handle = hud::new_result_handle();
+            hud::spawn_column_escalation(
+                pool.clone(),
+                schema,
+                table,
+                column,
+                pg_type,
+                col_hud.clone(),
+                handle.clone(),
+            );
+            let state = state.with_hud_status(HudStatus::Column(Box::new(col_hud)));
             (state, Some(handle))
         }
         _ => (state, None),
@@ -2111,6 +2210,7 @@ mod tests {
     #[test]
     fn hud_state_cleared_on_mode_exit() {
         let state = sample_state().with_mode(Mode::HUD).with_hud(Some(HudState {
+            schema: "public".into(),
             target: HudTarget::Table {
                 name: "test".into(),
             },
@@ -2127,7 +2227,7 @@ mod tests {
     /// Create a state with FKs for goto testing.
     fn goto_state() -> AppState {
         use crate::schema::types::{ForeignKeyRef, PgType, ReferentialAction};
-        use crate::schema::{Column, Constraint, EnumType, Index};
+        use crate::schema::{Column, Constraint, EnumType, Index, IndexMethod};
 
         let mut schema = Schema::new();
 
@@ -2144,6 +2244,7 @@ mod tests {
             columns: vec!["email".into()],
             unique: true,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(users);
 
@@ -2170,6 +2271,7 @@ mod tests {
             columns: vec!["author_id".into()],
             unique: false,
             partial: None,
+            method: IndexMethod::Btree,
         });
         schema.add_table(posts);
 

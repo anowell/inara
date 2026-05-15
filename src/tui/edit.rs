@@ -4,7 +4,7 @@ use super::app::{AppState, DefaultPromptTarget, FocusTarget, Mode, RenameMetadat
 use crate::migration::overlay::ChangeMarker;
 use crate::schema::render::render_single_table;
 use crate::schema::types::{Expression, PgType};
-use crate::schema::{Constraint, Index};
+use crate::schema::{Constraint, Index, IndexMethod};
 
 /// An editor request produced by the `e` keybinding.
 ///
@@ -98,6 +98,7 @@ pub fn toggle_column_index(state: AppState) -> AppState {
                 columns: vec![col_name],
                 unique: false,
                 partial: None,
+                method: IndexMethod::Btree,
             });
         }
     }

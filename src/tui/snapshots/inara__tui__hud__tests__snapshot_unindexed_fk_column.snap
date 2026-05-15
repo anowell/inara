@@ -1,0 +1,11 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  uuid  ·  FK · UNINDEXED, mostly unique
+  filled: 100%
+  distinct: ~1.0M (≈unique)
+  →: users.id
+  ⚠ foreign key has no index
+  ─────
+  p  profile — exact counts

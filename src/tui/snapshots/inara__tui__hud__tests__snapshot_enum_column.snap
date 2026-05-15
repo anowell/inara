@@ -1,0 +1,10 @@
+---
+source: src/tui/hud.rs
+expression: lines_to_text(&column_hud_lines(&hud))
+---
+  job_status  ·  enum-ish
+  filled: 100%
+  enum: 5 values
+  draft · queued · running · failed · complete
+  ─────
+  p  profile — exact counts
