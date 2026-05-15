@@ -48,6 +48,35 @@ test-all: test test-integration
 
 # --- Database ---
 
+# Create a local database and write DATABASE_URL to .env (idempotent)
+bootstrap:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Resolve connection settings from the standard PG* env vars, falling
+    # back to local defaults. Prepopulating PG* lets each workspace bootstrap
+    # its own database.
+    host="${PGHOST:-localhost}"
+    port="${PGPORT:-5432}"
+    user="${PGUSER:-postgres}"
+    password="${PGPASSWORD:-pass}"
+    db="${PGDATABASE:-inara}"
+    echo "Bootstrapping database '${db}' on ${host}:${port} as '${user}'…"
+    if PGPASSWORD="$password" psql -h "$host" -p "$port" -U "$user" -d postgres \
+        -tAc "SELECT 1 FROM pg_database WHERE datname = '${db}'" 2>/dev/null | grep -q 1; then
+        echo "Database '${db}' already exists."
+    else
+        PGPASSWORD="$password" createdb -h "$host" -p "$port" -U "$user" "$db"
+        echo "Created database '${db}'."
+    fi
+    # Persist DATABASE_URL only when it is not already set. `set dotenv-load`
+    # loads .env on the next run, so a written value makes this a no-op.
+    if [ -z "${DATABASE_URL:-}" ]; then
+        echo "DATABASE_URL=postgres://${user}:${password}@${host}:${port}/${db}" >> .env
+        echo "Wrote DATABASE_URL to .env"
+    else
+        echo "DATABASE_URL already set — leaving .env untouched."
+    fi
+
 # Check database connectivity
 db-check:
     @psql "$DATABASE_URL" -c "SELECT 1 AS connected;" --no-align --tuples-only | grep -q 1 && echo "Database connection OK" || echo "Database connection FAILED"
