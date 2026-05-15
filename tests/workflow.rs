@@ -438,10 +438,11 @@ fn overlay_shows_added_table_marker() {
     assert!(state.show_pending_overlay);
     let lines = view::render_document(&state);
 
-    // "users" is not affected → no marker
+    // "users" is not affected → blank marker slot in the gutter (column 1).
     let users_text = spans_to_string(&lines[0]);
-    assert!(
-        !users_text.starts_with("+ ") && !users_text.starts_with("- "),
+    assert_eq!(
+        users_text.chars().nth(1),
+        Some(' '),
         "unaffected table should have no overlay marker, got: {users_text}"
     );
 }
@@ -471,8 +472,9 @@ fn overlay_shows_modified_table_marker_with_columns() {
 
     let lines = view::render_document(&state);
     let header = spans_to_string(&lines[0]);
-    assert!(
-        header.starts_with("~ "),
+    assert_eq!(
+        header.chars().nth(1),
+        Some('~'),
         "table with column changes should have ~ marker, got: {header}"
     );
 }
@@ -495,8 +497,9 @@ fn overlay_empty_shows_no_markers() {
 
     let lines = view::render_document(&state);
     let text = spans_to_string(&lines[0]);
-    assert!(
-        !text.starts_with("+ ") && !text.starts_with("- ") && !text.starts_with("~ "),
+    assert_eq!(
+        text.chars().nth(1),
+        Some(' '),
         "empty overlay should show no markers, got: {text}"
     );
 }
@@ -520,8 +523,9 @@ fn overlay_toggle_on_off() {
     // Overlay is on → should have marker
     let lines = view::render_document(&state);
     let text = spans_to_string(&lines[0]);
-    assert!(
-        text.starts_with("+ "),
+    assert_eq!(
+        text.chars().nth(1),
+        Some('+'),
         "overlay on → added table marker, got: {text}"
     );
 
@@ -529,8 +533,9 @@ fn overlay_toggle_on_off() {
     let state = state.toggle_pending_overlay();
     let lines = view::render_document(&state);
     let text = spans_to_string(&lines[0]);
-    assert!(
-        !text.starts_with("+ "),
+    assert_eq!(
+        text.chars().nth(1),
+        Some(' '),
         "overlay off → no marker, got: {text}"
     );
 }

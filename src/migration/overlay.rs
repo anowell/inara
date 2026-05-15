@@ -155,6 +155,15 @@ impl ChangeMarker {
             ChangeMarker::Modified => "~ ",
         }
     }
+
+    /// The single-character symbol for gutter display (no trailing space).
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            ChangeMarker::Added => "+",
+            ChangeMarker::Removed => "-",
+            ChangeMarker::Modified => "~",
+        }
+    }
 }
 
 /// Query the _sqlx_migrations table for applied migration versions.
@@ -611,6 +620,13 @@ mod tests {
         assert_eq!(ChangeMarker::Added.prefix(), "+ ");
         assert_eq!(ChangeMarker::Removed.prefix(), "- ");
         assert_eq!(ChangeMarker::Modified.prefix(), "~ ");
+    }
+
+    #[test]
+    fn change_marker_symbol() {
+        assert_eq!(ChangeMarker::Added.symbol(), "+");
+        assert_eq!(ChangeMarker::Removed.symbol(), "-");
+        assert_eq!(ChangeMarker::Modified.symbol(), "~");
     }
 
     #[test]

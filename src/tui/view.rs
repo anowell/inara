@@ -19,6 +19,18 @@ const SEARCH_MATCH_BG: Color = Color::Indexed(58); // dark olive/yellow
 /// Current search match highlight background color.
 const SEARCH_CURRENT_BG: Color = Color::Indexed(94); // orange/brown
 
+/// Background color for the line under the cursor.
+///
+/// A slate blue, deliberately a distinct hue from the olive/orange search
+/// highlights so the cursor line is never mistaken for a search match.
+const CURSOR_LINE_BG: Color = Color::Indexed(60);
+/// Symbol shown in the gutter for the line under the cursor.
+///
+/// `❯` is a narrow (East-Asian-neutral) glyph, so the gutter stays exactly
+/// 2 cells wide in every terminal/locale — unlike `▶`, which some terminals
+/// render double-width.
+const CURSOR_GUTTER_SYMBOL: &str = "❯";
+
 /// Extract plain text from a document line for search matching.
 ///
 /// Returns the concatenated content of all spans that would be rendered
@@ -89,7 +101,10 @@ pub fn render_document(state: &AppState) -> Vec<Line<'static>> {
                 render_line(state, &doc_line.target, is_focused)
             };
 
-            // Apply search match highlighting (focus style takes priority)
+            // Apply search match highlighting. The focused line takes priority,
+            // so when the cursor sits on the current search match the
+            // cursor-line style wins; SEARCH_CURRENT_BG is only seen once the
+            // cursor moves off the match.
             if !is_focused {
                 if let Some(matches) = search_matches {
                     if Some(line_index) == current_match_line {
@@ -140,6 +155,27 @@ fn edit_marker(state: &AppState, target: &FocusTarget) -> Option<ChangeMarker> {
     }
 }
 
+/// Build the fixed 2-char gutter prepended to every document line.
+///
+/// Column 0 holds the cursor indicator (only on the focused line); column 1
+/// holds the change marker (`+`/`-`/`~`) when the line has one. Both columns
+/// are blank when not applicable, so document content stays aligned.
+fn render_gutter(is_focused: bool, marker: Option<ChangeMarker>) -> Vec<Span<'static>> {
+    let cursor = if is_focused {
+        Span::styled(
+            CURSOR_GUTTER_SYMBOL,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(" ")
+    };
+    let mark = match marker {
+        Some(m) => Span::styled(m.symbol(), marker_style(m)),
+        None => Span::raw(" "),
+    };
+    vec![cursor, mark]
+}
+
 /// Get the style for a change marker.
 fn marker_style(marker: ChangeMarker) -> Style {
     match marker {
@@ -172,7 +208,7 @@ fn render_line_inner(
         edit_marker(state, target).or_else(|| overlay_marker(state, target))
     };
 
-    let mut spans = if is_ghost {
+    let content = if is_ghost {
         // Ghost lines render from original_schema data with dim+strikethrough
         render_ghost_spans(state, target)
     } else {
@@ -193,14 +229,11 @@ fn render_line_inner(
         }
     };
 
-    // Prepend overlay marker if applicable
-    if let Some(m) = marker {
-        spans.insert(0, Span::styled(m.prefix().to_string(), marker_style(m)));
-    }
-
-    if is_ghost {
-        // Apply dim+strikethrough to all spans for ghost lines
-        let spans: Vec<Span> = spans
+    // Ghost lines render dim + struck-through. Apply that to the content only,
+    // not the gutter — the cursor indicator must keep its prominence even on a
+    // focused removed line, and the change marker keeps its color.
+    let content: Vec<Span> = if is_ghost {
+        content
             .into_iter()
             .map(|s| {
                 Span::styled(
@@ -208,31 +241,35 @@ fn render_line_inner(
                     DIM_STYLE.add_modifier(Modifier::CROSSED_OUT),
                 )
             })
-            .collect();
-        if is_focused {
-            let spans: Vec<Span> = spans
-                .into_iter()
-                .map(|s| Span::styled(s.content.into_owned(), s.style.bg(Color::Indexed(236))))
-                .collect();
-            Line::from(spans)
-        } else {
-            Line::from(spans)
-        }
-    } else if is_focused {
-        // Apply focus background to all spans
-        let spans: Vec<Span> = spans
-            .into_iter()
-            .map(|s| {
-                Span::styled(
-                    s.content.into_owned(),
-                    s.style.bg(Color::Indexed(236)).add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect();
-        Line::from(spans)
+            .collect()
     } else {
-        Line::from(spans)
+        content
+    };
+
+    // Prepend the fixed 2-char gutter (cursor indicator + change marker).
+    let mut spans = render_gutter(is_focused, marker);
+    spans.extend(content);
+
+    if !is_focused {
+        return Line::from(spans);
     }
+
+    // Apply the cursor-line background to every span. Bold the content for
+    // extra prominence, except on ghost lines where the dim styling is
+    // intentional (the gutter's own bold styling is preserved either way).
+    let spans: Vec<Span> = spans
+        .into_iter()
+        .map(|s| {
+            let style = s.style.bg(CURSOR_LINE_BG);
+            let style = if is_ghost {
+                style
+            } else {
+                style.add_modifier(Modifier::BOLD)
+            };
+            Span::styled(s.content.into_owned(), style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// Render an enum header: `enum name {` or `enum name { }`
@@ -733,18 +770,51 @@ mod tests {
         assert!(email_text.contains("UNIQUE"));
 
         let close_text = spans_to_string(&lines[3]);
-        assert_eq!(close_text, "}");
+        assert_eq!(close_text.trim(), "}");
     }
 
     #[test]
     fn focus_highlights_current_line() {
         let state = simple_state().with_viewport_height(10);
         let lines = render_document(&state);
-        // The focused line (cursor=0) should have the highlight background
+        // The focused line (cursor=0) should have the cursor-line background.
         assert!(lines[0]
             .spans
             .iter()
-            .any(|s| s.style.bg == Some(Color::Indexed(236))));
+            .any(|s| s.style.bg == Some(CURSOR_LINE_BG)));
+    }
+
+    #[test]
+    fn cursor_line_bg_distinct_from_search_highlights() {
+        // The cursor-line background must be a different color from both
+        // search-highlight backgrounds so the two are never confused.
+        assert_ne!(CURSOR_LINE_BG, SEARCH_MATCH_BG);
+        assert_ne!(CURSOR_LINE_BG, SEARCH_CURRENT_BG);
+    }
+
+    #[test]
+    fn focused_line_starts_with_cursor_symbol() {
+        let state = simple_state().with_viewport_height(10);
+        let lines = render_document(&state);
+        // cursor=0 → line 0 is focused and shows the gutter cursor symbol.
+        let text = spans_to_string(&lines[0]);
+        assert!(
+            text.starts_with(CURSOR_GUTTER_SYMBOL),
+            "focused line should start with the cursor symbol, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn unfocused_line_has_blank_two_char_gutter() {
+        let state = simple_state().with_viewport_height(20).toggle_expand();
+        let lines = render_document(&state);
+        // Line 1 is a column; cursor is on the header (line 0), so it is unfocused.
+        let text = spans_to_string(&lines[1]);
+        assert!(
+            text.starts_with("  "),
+            "unfocused line should have a blank 2-char gutter, got: {text:?}"
+        );
+        assert!(!text.starts_with(CURSOR_GUTTER_SYMBOL));
     }
 
     #[test]
@@ -1111,9 +1181,11 @@ mod tests {
             .map(|l| spans_to_string(l))
             .find(|s| s.contains("users"))
             .expect("should have users table line");
-        assert!(
-            users_line.starts_with("~ "),
-            "modified table should have ~ prefix, got: {users_line}"
+        // The change marker sits in gutter column 1 (column 0 is the cursor slot).
+        assert_eq!(
+            users_line.chars().nth(1),
+            Some('~'),
+            "modified table should have ~ marker in the gutter, got: {users_line}"
         );
     }
 
@@ -1130,11 +1202,10 @@ mod tests {
             .map(|l| spans_to_string(l))
             .find(|s| s.contains("email"))
             .expect("should have email column line");
-        assert!(
-            !email_line.starts_with("+ ")
-                && !email_line.starts_with("- ")
-                && !email_line.starts_with("~ "),
-            "unaffected column should have no marker, got: {email_line}"
+        assert_eq!(
+            email_line.chars().nth(1),
+            Some(' '),
+            "unaffected column should have a blank marker slot, got: {email_line}"
         );
     }
 
@@ -1144,9 +1215,10 @@ mod tests {
         let lines = render_document(&state);
         // "posts" is first in BTreeMap order, and is being AddTable'd
         let posts_line = spans_to_string(&lines[0]);
-        assert!(
-            posts_line.starts_with("+ "),
-            "added table should have + prefix, got: {posts_line}"
+        assert_eq!(
+            posts_line.chars().nth(1),
+            Some('+'),
+            "added table should have + marker in the gutter, got: {posts_line}"
         );
     }
 
@@ -1157,8 +1229,9 @@ mod tests {
         let lines = render_document(&state);
         // First line is "posts" which would have "+" when overlay is on
         let header = spans_to_string(&lines[0]);
-        assert!(
-            !header.starts_with("~ ") && !header.starts_with("+ ") && !header.starts_with("- "),
+        assert_eq!(
+            header.chars().nth(1),
+            Some(' '),
             "no overlay markers when overlay is off, got: {header}"
         );
     }
