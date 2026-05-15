@@ -226,6 +226,17 @@ pub async fn run(
     // Initialize file-based tracing before entering TUI mode
     init_file_tracing();
 
+    match &migrations_dir {
+        Some(dir) => {
+            eprintln!("Discovered migrations in {}", dir.display());
+            tracing::info!("Discovered migrations in {}", dir.display());
+        }
+        None => {
+            eprintln!("No migrations directory discovered — edit mode disabled");
+            tracing::info!("No migrations directory discovered");
+        }
+    }
+
     eprintln!("Connecting to {connection_info}...");
     tracing::info!("Connecting to database...");
     let connect_timeout = Duration::from_secs(5);
