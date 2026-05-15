@@ -319,8 +319,28 @@ pub async fn run(
         mapper
     };
 
-    let state =
+    let mut state =
         AppState::new(schema, connection_info, migrations_dir).with_type_mapper(type_mapper);
+
+    // Load the migration index from the discovered directory so migration
+    // lookups (goto migration, HUD) have data to work with.
+    if let Some(dir) = state.migrations_dir.clone() {
+        match crate::migration::loader::load_and_index_with_pattern(&dir, &state.migration_pattern)
+        {
+            Ok(index) => {
+                tracing::info!(
+                    "Migration index loaded: {} migrations, {} tables, {} columns",
+                    index.migrations.len(),
+                    index.tables.len(),
+                    index.columns.len()
+                );
+                state = state.with_migration_index(index);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load migration index from {}: {e}", dir.display());
+            }
+        }
+    }
 
     let result = run_event_loop(&mut terminal, state, pool);
 
