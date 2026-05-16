@@ -192,6 +192,14 @@ const HUD_BINDINGS: &[Binding] = &[
         desc: "Close HUD",
     },
     Binding {
+        key: "p",
+        desc: "Profile — exact counts",
+    },
+    Binding {
+        key: "a",
+        desc: "Analyze — collect statistics",
+    },
+    Binding {
         key: "y",
         desc: "Confirm safety warning",
     },

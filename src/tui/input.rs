@@ -1256,6 +1256,65 @@ fn handle_hud(
         KeyCode::Esc => (state.with_mode(Mode::Normal), None),
         // Escalate to a Tier-1 exact profile. `y` is kept for muscle memory.
         KeyCode::Char('p') | KeyCode::Char('y') => escalate_hud(state, pool),
+        // Run ANALYZE to collect statistics when the target has none.
+        KeyCode::Char('a') => analyze_hud(state, pool),
+        _ => (state, None),
+    }
+}
+
+/// Run `ANALYZE` on the HUD's target table when it has no statistics yet.
+///
+/// A no-op unless the current HUD result is an unanalyzed table or column.
+/// While the analyze runs the HUD shows the loading state; the refreshed
+/// result (or a permission error) is delivered through the returned handle.
+fn analyze_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHandle>) {
+    let Some(hud) = &state.hud else {
+        return (state, None);
+    };
+    let schema = hud.schema.clone();
+
+    match &hud.status {
+        HudStatus::Table(table_hud) if table_hud.profile.analyze_age_days.is_none() => {
+            let HudTarget::Table { name } = &hud.target else {
+                return (state, None);
+            };
+            let Some(table) = state.schema.table(name) else {
+                return (state, None);
+            };
+            let table = table.clone();
+            let handle = hud::new_result_handle();
+            hud::spawn_analyze_table(pool.clone(), schema, table, handle.clone());
+            let state = state
+                .with_hud_status(HudStatus::Loading)
+                .with_status("Running ANALYZE…");
+            (state, Some(handle))
+        }
+        HudStatus::Column(col_hud) if !col_hud.profile.analyzed => {
+            let HudTarget::Column {
+                table,
+                column,
+                pg_type,
+            } = &hud.target
+            else {
+                return (state, None);
+            };
+            let (table, column, pg_type) = (table.clone(), column.clone(), pg_type.clone());
+            let input = build_column_input(&state, &table, &column, &pg_type);
+            let handle = hud::new_result_handle();
+            hud::spawn_analyze_column(
+                pool.clone(),
+                schema,
+                table,
+                column,
+                pg_type,
+                input,
+                handle.clone(),
+            );
+            let state = state
+                .with_hud_status(HudStatus::Loading)
+                .with_status("Running ANALYZE…");
+            (state, Some(handle))
+        }
         _ => (state, None),
     }
 }

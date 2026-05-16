@@ -4,5 +4,6 @@ expression: lines_to_text(&column_hud_lines(&hud))
 ---
   text
   ⚠ no statistics — column not analyzed
+  a  analyze — collect statistics
   ─────
   p  profile — exact counts

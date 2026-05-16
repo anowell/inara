@@ -259,6 +259,87 @@ async fn build_column_hud(
     })
 }
 
+// ── ANALYZE: refreshing planner statistics ────────────────────────────
+
+/// Spawn an `ANALYZE` on `table`, then reload the table HUD.
+///
+/// On success the refreshed Tier-0 result is delivered. If the role lacks
+/// permission to analyze the table, an error status is delivered instead.
+pub fn spawn_analyze_table(pool: PgPool, schema: String, table: Table, handle: HudResultHandle) {
+    tokio::spawn(async move {
+        let status = match run_analyze(&pool, &schema, &table.name).await {
+            Ok(()) => match build_table_hud(&pool, &schema, &table).await {
+                Ok(hud) => HudStatus::Table(Box::new(hud)),
+                Err(e) => HudStatus::Error(e.to_string()),
+            },
+            Err(msg) => HudStatus::Error(msg),
+        };
+        deliver(&handle, status);
+    });
+}
+
+/// Spawn an `ANALYZE` on `table`, then reload the column HUD.
+pub fn spawn_analyze_column(
+    pool: PgPool,
+    schema: String,
+    table: String,
+    column: String,
+    pg_type: PgType,
+    input: ColumnHudInput,
+    handle: HudResultHandle,
+) {
+    tokio::spawn(async move {
+        let status = match run_analyze(&pool, &schema, &table).await {
+            Ok(()) => {
+                match build_column_hud(&pool, &schema, &table, &column, pg_type, input).await {
+                    Ok(hud) => HudStatus::Column(Box::new(hud)),
+                    Err(e) => HudStatus::Error(e.to_string()),
+                }
+            }
+            Err(msg) => HudStatus::Error(msg),
+        };
+        deliver(&handle, status);
+    });
+}
+
+/// Run `ANALYZE` on a table after verifying the role may do so.
+///
+/// `ANALYZE` only emits a warning (not an error) when the role lacks
+/// privileges, so permission is checked up front and reported clearly.
+async fn run_analyze(pool: &PgPool, schema: &str, table: &str) -> Result<(), String> {
+    if !can_analyze(pool, schema, table)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "ANALYZE: permission denied — must own \"{table}\" or be superuser"
+        ));
+    }
+    let sql = format!("ANALYZE {}.{}", quote_ident(schema), quote_ident(table));
+    sqlx::query(&sql)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("ANALYZE failed: {e}"))?;
+    Ok(())
+}
+
+/// Whether the current role may `ANALYZE` the table — i.e. it owns the table
+/// (directly or via role membership) or is a superuser.
+async fn can_analyze(pool: &PgPool, schema: &str, table: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE')
+                OR current_setting('is_superuser')::bool
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(b,)| b).unwrap_or(false))
+}
+
 // ── Tier 1: spawning exact probes ─────────────────────────────────────
 
 /// Spawn a Tier-1 exact probe for a table, escalating an existing result.
@@ -603,6 +684,10 @@ pub fn table_hud_lines(hud: &TableHud) -> Vec<Line<'static>> {
     if let Some(line) = analyze_age_line(&hud.profile) {
         lines.push(line);
     }
+    // Never analyzed — offer to collect statistics.
+    if hud.profile.analyze_age_days.is_none() {
+        lines.push(analyze_hint());
+    }
 
     escalation_lines(&hud.escalation, &mut lines, escalation_table_summary);
     lines
@@ -670,6 +755,7 @@ pub fn column_hud_lines(hud: &ColumnHud) -> Vec<Line<'static>> {
     // No statistics at all — make that explicit (decision Q3).
     if !hud.profile.analyzed {
         lines.push(warn_line("no statistics — column not analyzed"));
+        lines.push(analyze_hint());
         // FK target is structural and still worth showing.
         if let Some(target) = &hud.fk_target {
             lines.push(fact("→", target));
@@ -969,6 +1055,15 @@ fn warn_fact(label: &str, value: &str) -> Line<'static> {
 /// A standalone warning line.
 fn warn_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(format!("  ⚠ {text}"), HUD_WARN_STYLE))
+}
+
+/// Hint line offering the `a` key to run `ANALYZE`. Shown only when the
+/// target has no statistics.
+fn analyze_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "  a  analyze — collect statistics".to_string(),
+        HUD_DIM_STYLE,
+    ))
 }
 
 fn dim_line(text: &str) -> Line<'static> {
@@ -1284,6 +1379,47 @@ mod tests {
         let text = lines_to_text(&column_hud_lines(&hud));
         assert!(text.contains("not analyzed"));
         assert!(!text.contains("range:"));
+    }
+
+    fn table_hud_with_age(analyze_age_days: Option<i64>) -> TableHud {
+        TableHud {
+            profile: TableProfile {
+                estimated_rows: analyze_age_days.map(|_| 10),
+                heap_bytes: 0,
+                index_bytes: 0,
+                inserts: 0,
+                updates: 0,
+                deletes: 0,
+                analyze_age_days,
+            },
+            role: None,
+            indexes: IndexSummary::default(),
+            escalation: Escalation::Offered { cheap: true },
+        }
+    }
+
+    #[test]
+    fn unanalyzed_column_offers_analyze_hint() {
+        let hud = column_hud(PgType::Integer, ColumnProfile::unavailable());
+        assert!(lines_to_text(&column_hud_lines(&hud)).contains("a  analyze"));
+    }
+
+    #[test]
+    fn analyzed_column_omits_analyze_hint() {
+        let hud = column_hud(PgType::Integer, analyzed(-1.0));
+        assert!(!lines_to_text(&column_hud_lines(&hud)).contains("a  analyze"));
+    }
+
+    #[test]
+    fn never_analyzed_table_offers_analyze_hint() {
+        let hud = table_hud_with_age(None);
+        assert!(lines_to_text(&table_hud_lines(&hud)).contains("a  analyze"));
+    }
+
+    #[test]
+    fn analyzed_table_omits_analyze_hint() {
+        let hud = table_hud_with_age(Some(2));
+        assert!(!lines_to_text(&table_hud_lines(&hud)).contains("a  analyze"));
     }
 
     #[test]
