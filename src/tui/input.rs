@@ -1274,7 +1274,9 @@ fn analyze_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHan
     let schema = hud.schema.clone();
 
     match &hud.status {
-        HudStatus::Table(table_hud) if table_hud.profile.analyze_age_days.is_none() => {
+        HudStatus::Table(table_hud)
+            if table_hud.profile.analyze_age_days.is_none() && !table_hud.profile.is_empty() =>
+        {
             let HudTarget::Table { name } = &hud.target else {
                 return (state, None);
             };
@@ -1287,7 +1289,7 @@ fn analyze_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHan
             let state = state.with_hud_status(HudStatus::Analyzing);
             (state, Some(handle))
         }
-        HudStatus::Column(col_hud) if !col_hud.profile.analyzed => {
+        HudStatus::Column(col_hud) if !col_hud.profile.analyzed && !col_hud.table_is_empty => {
             let HudTarget::Column {
                 table,
                 column,

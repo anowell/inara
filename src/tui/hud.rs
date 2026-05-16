@@ -99,6 +99,9 @@ pub struct ColumnHud {
     pub profile: ColumnProfile,
     /// Table row estimate — needed to resolve `n_distinct` ratios.
     pub estimated_rows: Option<i64>,
+    /// The owning table holds no rows — statistics can never be collected,
+    /// so the HUD names it empty rather than offering `ANALYZE`.
+    pub table_is_empty: bool,
     pub pg_type: PgType,
     pub type_class: TypeClass,
     pub insights: ColumnInsights,
@@ -240,6 +243,7 @@ async fn build_column_hud(
     // to resolve the column's `n_distinct` ratio form.
     let table_profile = load_table_profile(pool, schema, table).await?;
     let estimated_rows = table_profile.estimated_rows;
+    let table_is_empty = table_profile.is_empty();
     let profile = load_column_profile(pool, schema, table, column).await?;
     let type_class = insight::classify_type(&pg_type);
     let insights = insight::derive_column_insights(&profile, &pg_type, estimated_rows, input.ctx);
@@ -251,6 +255,7 @@ async fn build_column_hud(
     Ok(ColumnHud {
         profile,
         estimated_rows,
+        table_is_empty,
         pg_type,
         type_class,
         insights,
@@ -662,9 +667,13 @@ pub fn table_hud_lines(hud: &TableHud) -> Vec<Line<'static>> {
     }
 
     // Rows.
-    match hud.profile.estimated_rows {
-        Some(rows) => lines.push(fact("rows", &format!("~{}", format_approx(rows)))),
-        None => lines.push(warn_fact("rows", "unknown — never analyzed")),
+    if hud.profile.is_empty() {
+        lines.push(fact("rows", "empty"));
+    } else {
+        match hud.profile.estimated_rows {
+            Some(rows) => lines.push(fact("rows", &format!("~{}", format_approx(rows)))),
+            None => lines.push(warn_fact("rows", "unknown — never analyzed")),
+        }
     }
 
     // Size.
@@ -687,8 +696,9 @@ pub fn table_hud_lines(hud: &TableHud) -> Vec<Line<'static>> {
     if let Some(line) = analyze_age_line(&hud.profile) {
         lines.push(line);
     }
-    // Never analyzed — offer to collect statistics.
-    if hud.profile.analyze_age_days.is_none() {
+    // Never analyzed — offer to collect statistics, unless the table is
+    // empty (ANALYZE cannot produce statistics from zero rows).
+    if hud.profile.analyze_age_days.is_none() && !hud.profile.is_empty() {
         lines.push(analyze_hint());
     }
 
@@ -757,8 +767,14 @@ pub fn column_hud_lines(hud: &ColumnHud) -> Vec<Line<'static>> {
 
     // No statistics at all — make that explicit (decision Q3).
     if !hud.profile.analyzed {
-        lines.push(warn_line("no statistics — column not analyzed"));
-        lines.push(analyze_hint());
+        if hud.table_is_empty {
+            // The table is empty — ANALYZE cannot produce statistics from
+            // zero rows, so say that plainly rather than offering `a`.
+            lines.push(warn_line("table is empty — no rows to profile"));
+        } else {
+            lines.push(warn_line("no statistics — column not analyzed"));
+            lines.push(analyze_hint());
+        }
         // FK target is structural and still worth showing.
         if let Some(target) = &hud.fk_target {
             lines.push(fact("→", target));
@@ -1130,6 +1146,7 @@ mod tests {
         ColumnHud {
             profile,
             estimated_rows: Some(1_000_000),
+            table_is_empty: false,
             pg_type,
             type_class,
             insights,
@@ -1384,11 +1401,11 @@ mod tests {
         assert!(!text.contains("range:"));
     }
 
-    fn table_hud_with_age(analyze_age_days: Option<i64>) -> TableHud {
+    fn table_hud(analyze_age_days: Option<i64>, heap_bytes: i64) -> TableHud {
         TableHud {
             profile: TableProfile {
                 estimated_rows: analyze_age_days.map(|_| 10),
-                heap_bytes: 0,
+                heap_bytes,
                 index_bytes: 0,
                 inserts: 0,
                 updates: 0,
@@ -1414,15 +1431,34 @@ mod tests {
     }
 
     #[test]
-    fn never_analyzed_table_offers_analyze_hint() {
-        let hud = table_hud_with_age(None);
+    fn never_analyzed_nonempty_table_offers_analyze_hint() {
+        let hud = table_hud(None, 8 * 1024);
         assert!(lines_to_text(&table_hud_lines(&hud)).contains("a  analyze"));
     }
 
     #[test]
     fn analyzed_table_omits_analyze_hint() {
-        let hud = table_hud_with_age(Some(2));
+        let hud = table_hud(Some(2), 8 * 1024);
         assert!(!lines_to_text(&table_hud_lines(&hud)).contains("a  analyze"));
+    }
+
+    #[test]
+    fn empty_table_column_shows_empty_not_unanalyzed() {
+        let mut hud = column_hud(PgType::Integer, ColumnProfile::unavailable());
+        hud.table_is_empty = true;
+        let text = lines_to_text(&column_hud_lines(&hud));
+        assert!(text.contains("table is empty"));
+        assert!(!text.contains("not analyzed"));
+        assert!(!text.contains("a  analyze"));
+    }
+
+    #[test]
+    fn zero_heap_table_is_empty_without_analyze() {
+        // heap_bytes == 0 marks a never-written table as empty with no query.
+        let hud = table_hud(None, 0);
+        let text = lines_to_text(&table_hud_lines(&hud));
+        assert!(text.contains("rows: empty"));
+        assert!(!text.contains("a  analyze"));
     }
 
     #[test]

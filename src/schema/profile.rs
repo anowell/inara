@@ -59,6 +59,16 @@ impl TableProfile {
     pub fn stats_are_stale(&self) -> bool {
         matches!(self.analyze_age_days, Some(days) if days >= STALE_ANALYZE_DAYS)
     }
+
+    /// Whether the table is known to hold no rows.
+    ///
+    /// True when the analyzed row estimate is zero, or the table has never
+    /// had a heap page written — a freshly created (or `TRUNCATE`d) table.
+    /// The latter is a free Tier-0 signal: it lets an empty table be named
+    /// as such without a `COUNT(*)`, even when it has never been analyzed.
+    pub fn is_empty(&self) -> bool {
+        self.estimated_rows == Some(0) || self.heap_bytes == 0
+    }
 }
 
 /// `ANALYZE` older than this many days marks the stats as stale.
