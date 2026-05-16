@@ -1284,9 +1284,7 @@ fn analyze_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHan
             let table = table.clone();
             let handle = hud::new_result_handle();
             hud::spawn_analyze_table(pool.clone(), schema, table, handle.clone());
-            let state = state
-                .with_hud_status(HudStatus::Loading)
-                .with_status("Running ANALYZE…");
+            let state = state.with_hud_status(HudStatus::Analyzing);
             (state, Some(handle))
         }
         HudStatus::Column(col_hud) if !col_hud.profile.analyzed => {
@@ -1310,9 +1308,7 @@ fn analyze_hud(state: AppState, pool: &PgPool) -> (AppState, Option<HudResultHan
                 input,
                 handle.clone(),
             );
-            let state = state
-                .with_hud_status(HudStatus::Loading)
-                .with_status("Running ANALYZE…");
+            let state = state.with_hud_status(HudStatus::Analyzing);
             (state, Some(handle))
         }
         _ => (state, None),

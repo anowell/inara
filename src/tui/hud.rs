@@ -74,6 +74,8 @@ pub enum HudTarget {
 pub enum HudStatus {
     /// Tier-0 load in flight.
     Loading,
+    /// An `ANALYZE` is in flight; the HUD reloads with fresh stats when done.
+    Analyzing,
     /// Tier-0 table result.
     Table(Box<TableHud>),
     /// Tier-0 column result.
@@ -603,6 +605,7 @@ pub fn render_hud(frame: &mut Frame, area: Rect, hud: &HudState) {
     let title = hud_title(&hud.target);
     let lines = match &hud.status {
         HudStatus::Loading => vec![dim_line("  loading…")],
+        HudStatus::Analyzing => vec![dim_line("  running ANALYZE — collecting statistics…")],
         HudStatus::Table(t) => table_hud_lines(t),
         HudStatus::Column(c) => column_hud_lines(c),
         HudStatus::Error(msg) => vec![Line::from(Span::styled(
