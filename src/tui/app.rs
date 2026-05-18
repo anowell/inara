@@ -1050,7 +1050,7 @@ impl AppState {
             current,
             ..search
         });
-        self.scroll_to_cursor()
+        self.scroll_to_focus()
     }
 
     /// Jump to the next in-document search match (wrapping).
@@ -1213,7 +1213,8 @@ impl AppState {
             }
             self.rebuild_doc();
         }
-        self
+        // Re-focus the object: expanding may have grown it past the fold.
+        self.scroll_to_focus()
     }
 
     /// Names of all expandable nodes (tables, enums, types).
@@ -1511,78 +1512,91 @@ impl AppState {
         self
     }
 
-    /// Smart scroll for goto/jump operations.
+    /// Scroll the viewport to focus the object under the cursor.
     ///
-    /// Priority:
-    /// 1. Center cursor — if full node also fits in view, this is ideal.
-    /// 2. Show full node (centered in viewport) — cursor is always inside.
-    /// 3. Center cursor as fallback when node is too large for viewport.
+    /// "Focus" is the standard way to bring an object — a table, enum, column,
+    /// etc. — into view. The policy, in terms of the object's first ("title")
+    /// line:
+    ///
+    /// - **Fully visible:** do nothing — never scroll when we don't have to.
+    /// - **Partially visible:** scroll the minimum needed, keeping the title
+    ///   line in the viewport. If the title is above the viewport, scroll up so
+    ///   it becomes the first visible line. Otherwise the object clips past the
+    ///   bottom, so scroll down by the minimum of the lines beyond the viewport
+    ///   and the free lines above the title — never pushing the title off-top.
+    /// - **Not visible:** center the title line, then scroll down just enough to
+    ///   reveal the rest of the object, again never pushing the title off-top.
+    ///
+    /// Multi-line objects are expanded tables, enums, and types; every other
+    /// line (columns, collapsed headers, blanks, …) is a single-line object,
+    /// for which this collapses to "do nothing if visible, else center".
     fn scroll_to_focus(mut self) -> Self {
-        if self.viewport_height == 0 {
+        if self.viewport_height == 0 || self.doc.is_empty() {
             return self;
         }
 
-        let (node_start, node_end) = self.node_range_at(self.cursor);
         let vh = self.viewport_height;
+        let vo = self.viewport_offset;
         let max_offset = self.doc.len().saturating_sub(vh);
+        let last_visible = vo + vh - 1;
 
-        // Centered offset for cursor
-        let centered = self.cursor.saturating_sub(vh / 2).min(max_offset);
+        // The focused object spans `start..=end`; `start` is its title line.
+        let (start, end) = self.focus_object_range(self.cursor);
 
-        // 1. Center cursor — check if full node is visible at that position
-        if node_start >= centered && node_end < centered + vh {
-            self.viewport_offset = centered;
-            return self;
-        }
+        let new_offset = if start >= vo && end <= last_visible {
+            // Fully visible — leave the viewport untouched.
+            vo
+        } else if start <= last_visible && end >= vo {
+            // Partially visible — scroll the minimum amount, title stays in view.
+            if start < vo {
+                // Title above the viewport: make it the first visible line.
+                start
+            } else {
+                // Title visible but the object clips past the bottom: scroll
+                // down just enough, without pushing the title off the top.
+                let lines_beyond = end - last_visible;
+                let lines_above_title = start - vo;
+                vo + lines_beyond.min(lines_above_title)
+            }
+        } else {
+            // Not visible — center the title line, then pull the rest of the
+            // object into view without pushing the title off the top.
+            let centered = start.saturating_sub(vh / 2);
+            let centered_last = centered + vh - 1;
+            if end > centered_last {
+                let lines_beyond = end - centered_last;
+                let lines_above_title = start - centered;
+                centered + lines_beyond.min(lines_above_title)
+            } else {
+                centered
+            }
+        };
 
-        // 2. Show full node centered in viewport (cursor is always inside the node)
-        let node_height = node_end - node_start + 1;
-        if node_height <= vh {
-            let offset = node_start
-                .saturating_sub((vh - node_height) / 2)
-                .min(max_offset);
-            self.viewport_offset = offset;
-            return self;
-        }
-
-        // 3. Fallback: center cursor (node too large for viewport)
-        self.viewport_offset = centered;
+        self.viewport_offset = new_offset.min(max_offset);
         self
     }
 
-    /// Find the range (start, end inclusive) of the block containing the given line.
+    /// The line range (start, end inclusive) of the object focused at `pos`.
     ///
-    /// Blocks are separated by `Blank` lines. Returns `(pos, pos)` for blank
-    /// lines or out-of-bounds positions.
-    fn node_range_at(&self, pos: usize) -> (usize, usize) {
-        if self.doc.is_empty() || pos >= self.doc.len() {
+    /// Expanded tables, enums, and types focus as a whole multi-line block,
+    /// spanning the header line through its matching close line; every other
+    /// line (columns, collapsed headers, blanks, …) is a single-line object.
+    fn focus_object_range(&self, pos: usize) -> (usize, usize) {
+        if pos >= self.doc.len() || self.is_single_line_block(pos) {
             return (pos, pos);
         }
-
-        if matches!(self.doc[pos].target, FocusTarget::Blank) {
-            return (pos, pos);
-        }
-
-        // A collapsed table/enum/type (single-line header with no expanded body)
-        // forms its own single-line block even without surrounding blanks.
-        if self.is_single_line_block(pos) {
-            return (pos, pos);
-        }
-
-        // Search backward for block start (line after a Blank, or start of doc)
-        let start = (0..pos)
-            .rev()
-            .find(|&i| matches!(self.doc[i].target, FocusTarget::Blank))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-
-        // Search forward for block end (line before a Blank, or end of doc)
-        let end = ((pos + 1)..self.doc.len())
-            .find(|&i| matches!(self.doc[i].target, FocusTarget::Blank))
-            .map(|i| i - 1)
-            .unwrap_or(self.doc.len() - 1);
-
-        (start, end)
+        // The close line that terminates an expanded node block.
+        let close = match &self.doc[pos].target {
+            FocusTarget::Table(name) => FocusTarget::TableClose(name.clone()),
+            FocusTarget::Enum(name) => FocusTarget::EnumClose(name.clone()),
+            FocusTarget::Type(name) => FocusTarget::TypeClose(name.clone()),
+            _ => return (pos, pos),
+        };
+        let end = self.doc[pos + 1..]
+            .iter()
+            .position(|l| l.target == close)
+            .map_or(pos, |i| pos + 1 + i);
+        (pos, end)
     }
 
     /// Returns true when the line at `pos` is a single-line block header
@@ -2298,163 +2312,239 @@ mod tests {
         assert_eq!(state.focus(), Some(&FocusTarget::Table("users".into())));
     }
 
-    // --- node_range_at tests ---
+    // --- focus_object_range tests ---
 
-    #[test]
-    fn node_range_collapsed_tables() {
-        let state = sample_state();
-        // Doc: alpha(0) bravo(1) charlie(2) delta(3) echo(4) — no blanks between collapsed tables
-        assert_eq!(state.node_range_at(0), (0, 0)); // alpha alone
-        assert_eq!(state.node_range_at(1), (1, 1)); // bravo alone
-        assert_eq!(state.node_range_at(2), (2, 2)); // charlie alone
-        assert_eq!(state.node_range_at(4), (4, 4)); // echo alone
+    /// Build a state with `n` collapsed tables — a doc of `n` single lines
+    /// (`t000`, `t001`, …) with no blank lines between them.
+    fn collapsed_tables(n: usize) -> AppState {
+        use crate::schema::Table;
+        let mut schema = Schema::new();
+        for i in 0..n {
+            schema.add_table(Table::new(format!("t{i:03}")));
+        }
+        let mut state = AppState::new(schema, String::new(), None);
+        state.rebuild_doc();
+        state
+    }
+
+    /// Build a state with `before` collapsed tables, then an expanded table
+    /// `mid` with `cols` columns. Returns the state and the header position.
+    fn doc_with_expanded(before: usize, cols: usize) -> (AppState, usize) {
+        use crate::schema::types::PgType;
+        use crate::schema::{Column, Table};
+        let mut schema = Schema::new();
+        for i in 0..before {
+            schema.add_table(Table::new(format!("a{i:03}")));
+        }
+        let mut table = Table::new("mid");
+        for i in 0..cols {
+            table.add_column(Column::new(format!("c{i:03}"), PgType::Text));
+        }
+        schema.add_table(table);
+        for i in 0..before {
+            schema.add_table(Table::new(format!("z{i:03}")));
+        }
+        let mut state = AppState::new(schema, String::new(), None);
+        state.expanded.insert("mid".into());
+        state.rebuild_doc();
+        let header = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("mid".into()))
+            .unwrap();
+        (state, header)
     }
 
     #[test]
-    fn node_range_expanded_table() {
-        use crate::schema::types::PgType;
-        use crate::schema::{Column, Table};
+    fn focus_range_collapsed_table_is_single_line() {
+        let state = collapsed_tables(5);
+        for i in 0..5 {
+            assert_eq!(state.focus_object_range(i), (i, i));
+        }
+    }
 
-        let mut schema = Schema::new();
-        let mut table = Table::new("aaa_users");
-        table.add_column(Column::new("id", PgType::Uuid));
-        table.add_column(Column::new("name", PgType::Text));
-        schema.add_table(table);
-        schema.add_table(Table::new("zzz_posts"));
+    #[test]
+    fn focus_range_expanded_table_spans_header_to_close() {
+        let (state, header) = doc_with_expanded(2, 3);
+        // header + 3 columns + close => 5-line object.
+        assert_eq!(state.focus_object_range(header), (header, header + 4));
+    }
 
-        let mut state = AppState::new(schema, String::new(), None);
-        state.expanded.insert("aaa_users".into());
-        state.rebuild_doc();
-        // Doc: aaa_users(0) id(1) name(2) close(3) blank(4) zzz_posts(5)
-
-        assert_eq!(state.node_range_at(0), (0, 3)); // table header
-        assert_eq!(state.node_range_at(1), (0, 3)); // column inside
-        assert_eq!(state.node_range_at(2), (0, 3)); // column inside
-        assert_eq!(state.node_range_at(3), (0, 3)); // close brace
-        assert_eq!(state.node_range_at(4), (4, 4)); // blank
-        assert_eq!(state.node_range_at(5), (5, 5)); // zzz_posts collapsed
+    #[test]
+    fn focus_range_column_is_single_line() {
+        let (state, header) = doc_with_expanded(2, 3);
+        // A column inside the expanded table is its own single-line object.
+        let col = header + 2;
+        assert!(matches!(state.doc[col].target, FocusTarget::Column(_, _)));
+        assert_eq!(state.focus_object_range(col), (col, col));
+        // The close brace is single-line too.
+        let close = header + 4;
+        assert_eq!(state.focus_object_range(close), (close, close));
     }
 
     // --- scroll_to_focus tests ---
 
-    #[test]
-    fn scroll_to_focus_centers_cursor_when_node_fits() {
-        use crate::schema::types::PgType;
-        use crate::schema::{Column, Table};
-
-        let mut schema = Schema::new();
-        // Create a table with 5 columns (7 lines expanded: header + 5 cols + close)
-        let mut table = Table::new("users");
-        for name in ["a", "b", "c", "d", "e"] {
-            table.add_column(Column::new(name, PgType::Text));
-        }
-        schema.add_table(table);
-        // Add padding tables so doc is long enough to need scrolling
-        for i in 0..10 {
-            schema.add_table(Table::new(format!("t{i:02}")));
-        }
-
-        let mut state = AppState::new(schema, String::new(), None);
-        state.expanded.insert("users".into());
-        state.rebuild_doc();
-        let state = state.with_viewport_height(20);
-
-        // Jump cursor to "users" table header (line 0)
-        // Node is lines 0-6, viewport 20 lines — node fits easily
-        let state = state.cursor_to(0);
-        let state = AppState {
-            cursor: state.cursor,
-            ..state
-        }
-        .scroll_to_focus();
-        // Centered offset for cursor 0 = 0 (can't go negative)
-        // Node 0-6 fits in viewport starting at 0
-        assert_eq!(state.viewport_offset, 0);
+    /// Apply `scroll_to_focus` with explicit viewport state and return the
+    /// resulting viewport offset.
+    fn focus_offset(mut state: AppState, vh: usize, vo: usize, cursor: usize) -> usize {
+        state.viewport_height = vh;
+        state.viewport_offset = vo;
+        state.cursor = cursor;
+        state.scroll_to_focus().viewport_offset
     }
 
     #[test]
-    fn scroll_to_focus_centers_node_when_centering_cursor_would_clip_node() {
+    fn focus_single_line_visible_does_not_scroll() {
+        // Object already in the viewport — don't scroll when we don't have to.
+        let state = collapsed_tables(100);
+        assert_eq!(focus_offset(state, 20, 10, 15), 10);
+    }
+
+    #[test]
+    fn focus_single_line_offscreen_below_centers() {
+        let state = collapsed_tables(100);
+        // Line 60 is below the viewport — center it: 60 - 20/2.
+        assert_eq!(focus_offset(state, 20, 0, 60), 50);
+    }
+
+    #[test]
+    fn focus_single_line_offscreen_above_centers() {
+        let state = collapsed_tables(100);
+        // Line 10 is above the viewport — center it: 10 - 20/2 = 0.
+        assert_eq!(focus_offset(state, 20, 70, 10), 0);
+    }
+
+    #[test]
+    fn focus_multiline_fully_visible_does_not_scroll() {
+        // Expanded table (header + 3 cols + close) entirely inside the viewport.
+        let (state, header) = doc_with_expanded(10, 3);
+        assert_eq!(focus_offset(state, 20, 0, header), 0);
+    }
+
+    #[test]
+    fn focus_multiline_title_above_scrolls_title_to_top() {
+        // Title line above the viewport — scroll up so it becomes line one.
+        let (state, header) = doc_with_expanded(10, 3);
+        assert_eq!(focus_offset(state, 10, header + 2, header), header);
+    }
+
+    #[test]
+    fn focus_multiline_clipped_below_scrolls_down_minimally() {
+        // header(5) + 4 cols + close = 6-line object spanning lines 5..=10.
+        // Viewport [0,7] shows the title but clips the tail; scroll down the
+        // minimum (min of 3 lines beyond, 5 lines above title) = 3.
+        let (state, header) = doc_with_expanded(5, 4);
+        assert_eq!(header, 5);
+        let vo = focus_offset(state, 8, 0, header);
+        assert_eq!(vo, 3);
+        // The whole object (5..=10) is now visible.
+        assert!(vo <= header && header + 5 < vo + 8);
+    }
+
+    #[test]
+    fn focus_multiline_offscreen_centers_title() {
+        // 5-line object far below the viewport — center its title line.
+        let (state, header) = doc_with_expanded(30, 3);
+        assert_eq!(focus_offset(state, 10, 0, header), header - 5);
+    }
+
+    #[test]
+    fn focus_multiline_offscreen_tall_pulls_full_object_into_view() {
+        // 8-line object offscreen; centering the title alone would clip the
+        // tail, so scroll down just enough to reveal all of it.
+        let (state, header) = doc_with_expanded(20, 6);
+        let vh = 10;
+        let vo = focus_offset(state, vh, 0, header);
+        // Centered title (header-5) then +3 to pull the tail in.
+        assert_eq!(vo, header - 2);
+        assert!(vo <= header && header + 7 < vo + vh);
+    }
+
+    #[test]
+    fn focus_multiline_taller_than_viewport_keeps_title_at_top() {
+        // 12-line object, 8-line viewport: the object can never fully fit, so
+        // the title line MUST stay visible — pinned to the top of the viewport.
+        let (state, header) = doc_with_expanded(3, 10);
+        let vo = focus_offset(state, 8, header + 5, header);
+        assert_eq!(vo, header);
+    }
+
+    #[test]
+    fn focus_clamps_to_doc_end() {
+        // Centering a near-end line would scroll past the doc; clamp instead.
+        let state = collapsed_tables(12);
+        // vh 10 over a 12-line doc → max offset 2.
+        assert_eq!(focus_offset(state, 10, 0, 11), 2);
+    }
+
+    #[test]
+    fn toggle_expand_brings_expanded_table_into_view() {
         use crate::schema::types::PgType;
         use crate::schema::{Column, Table};
 
         let mut schema = Schema::new();
-        // 10 padding tables before the target
-        for i in 0..10 {
+        for i in 0..15 {
             schema.add_table(Table::new(format!("a{i:02}")));
         }
-        // Target table with 8 columns (10 lines: header + 8 cols + close)
         let mut table = Table::new("target");
-        for i in 0..8 {
-            table.add_column(Column::new(format!("col{i}"), PgType::Text));
+        for i in 0..6 {
+            table.add_column(Column::new(format!("c{i}"), PgType::Text));
         }
         schema.add_table(table);
 
         let mut state = AppState::new(schema, String::new(), None);
-        state.expanded.insert("target".into());
         state.rebuild_doc();
-        let state = state.with_viewport_height(12);
+        state.viewport_height = 20;
+        state.viewport_offset = 0;
+        // Cursor on the collapsed "target" header, sitting low in the viewport.
+        state.cursor = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("target".into()))
+            .unwrap();
 
-        // Find the close brace position for "target"
-        let close_pos = state
+        // Expanding pushes the table body below the fold; focus pulls it back.
+        let state = state.toggle_expand();
+
+        let header = state
+            .doc
+            .iter()
+            .position(|l| l.target == FocusTarget::Table("target".into()))
+            .unwrap();
+        let close = state
             .doc
             .iter()
             .position(|l| l.target == FocusTarget::TableClose("target".into()))
             .unwrap();
-
-        // Jump to the close brace — centering cursor would clip the table header
-        let mut state = state.cursor_to(close_pos);
-        state = AppState {
-            cursor: state.cursor,
-            ..state
-        }
-        .scroll_to_focus();
-
-        // Node should be fully visible
-        let node_start = close_pos - 9; // header is 9 lines before close
-        assert!(state.viewport_offset <= node_start);
-        assert!(close_pos < state.viewport_offset + state.viewport_height);
+        assert!(state.viewport_offset > 0, "should have scrolled down");
+        assert!(
+            state.viewport_offset <= header,
+            "title line must stay visible"
+        );
+        assert!(
+            close < state.viewport_offset + state.viewport_height,
+            "the full table must be visible after expanding"
+        );
     }
 
     #[test]
-    fn scroll_to_focus_centers_cursor_for_large_node() {
-        use crate::schema::types::PgType;
-        use crate::schema::{Column, Table};
+    fn search_centers_offscreen_match() {
+        let mut state = collapsed_tables(100);
+        state.viewport_height = 20;
+        state.viewport_offset = 0;
+        state.cursor = 0;
+        state.in_doc_search = Some(InDocSearchState {
+            query: "t060".into(),
+            direction: SearchDirection::Forward,
+            matches: Vec::new(),
+            current: None,
+            origin_cursor: 0,
+        });
 
-        let mut schema = Schema::new();
-        // 5 padding tables
-        for i in 0..5 {
-            schema.add_table(Table::new(format!("a{i:02}")));
-        }
-        // Large table with 20 columns (22 lines: header + 20 cols + close)
-        let mut table = Table::new("big");
-        for i in 0..20 {
-            table.add_column(Column::new(format!("col{i:02}"), PgType::Text));
-        }
-        schema.add_table(table);
-
-        let mut state = AppState::new(schema, String::new(), None);
-        state.expanded.insert("big".into());
-        state.rebuild_doc();
-        let state = state.with_viewport_height(10);
-
-        // Find a column in the middle of the big table
-        let mid_col = state
-            .doc
-            .iter()
-            .position(|l| l.target == FocusTarget::Column("big".into(), "col10".into()))
-            .unwrap();
-
-        let mut state = state.cursor_to(mid_col);
-        state = AppState {
-            cursor: state.cursor,
-            ..state
-        }
-        .scroll_to_focus();
-
-        // Node is 22 lines, viewport is 10 — can't show full node
-        // Should center cursor: offset ≈ mid_col - 5
-        let expected = mid_col.saturating_sub(5);
-        assert_eq!(state.viewport_offset, expected);
+        let state = state.next_search_match();
+        // "t060" sits at line 60, offscreen — focus centers it: 60 - 20/2.
+        assert_eq!(state.cursor, 60);
+        assert_eq!(state.viewport_offset, 50);
     }
 
     // --- JumpList unit tests ---
