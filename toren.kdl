@@ -2,8 +2,8 @@ var dbname="inara-{{ ws.name }}"
 
 setup {
     copy src="target"
-    run "just boostrap" {
-        env PGDATABASE={{ vars.dbname }}
+    run "just bootstrap" {
+        env PGDATABASE="{{ vars.dbname }}"
     }
 }
 
